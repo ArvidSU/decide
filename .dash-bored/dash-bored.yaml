@@ -1,0 +1,394 @@
+schemaVersion: 4
+name: decisions
+icon: ./assets/icon.svg
+root:
+  id: cockpit
+  component: ./components/external/core/group
+  children:
+    axis: vertical
+    first:
+      node:
+        id: section-tabs
+        component: ./components/external/core/button
+        props:
+          variant: tabs
+          items:
+            - { name: Overview, action: "select:sections/overview" }
+            - { name: Decide, action: "select:sections/decide" }
+            - { name: Activity, action: "select:sections/activity" }
+            - { name: Develop, action: "select:sections/develop" }
+            - { name: Deploy, action: "select:sections/deploy" }
+    second:
+      node:
+        id: sections
+        component: ./components/external/core/selection
+        props: { defaultChild: overview }
+        children:
+          # ---------------------------------------------------------------- Overview
+          - metadata: { label: Overview }
+            node:
+              id: overview
+              component: ./components/external/core/group
+              children:
+                axis: vertical
+                first:
+                  node:
+                    id: health
+                    component: ./components/external/core/group
+                    props:
+                      title: Health
+                      description: Live checks against the Decisions API (DECISIONS_URL, default http://127.0.0.1:8787). Server is reachable, at least one resumer is heartbeating, the event log's hash chain verifies, and no webhook delivery has failed.
+                    children:
+                      axis: horizontal
+                      first:
+                        axis: horizontal
+                        first:
+                          node:
+                            id: server-status
+                            component: ./components/external/core/status
+                            props:
+                              label: Server
+                              source: { shell: python3 .dash-bored/scripts/decisions-api.py server, every: 10000, timeoutMs: 8000 }
+                        second:
+                          node:
+                            id: resumer-status
+                            component: ./components/external/core/status
+                            props:
+                              label: Resumer
+                              source: { shell: python3 .dash-bored/scripts/decisions-api.py resumer, every: 30000, timeoutMs: 8000 }
+                      second:
+                        axis: horizontal
+                        first:
+                          node:
+                            id: chain-status
+                            component: ./components/external/core/status
+                            props:
+                              label: Event log integrity
+                              source: { shell: python3 .dash-bored/scripts/decisions-api.py chain, every: 60000, timeoutMs: 12000 }
+                        second:
+                          node:
+                            id: delivery-status
+                            component: ./components/external/core/status
+                            props:
+                              label: Webhook deliveries
+                              source: { shell: python3 .dash-bored/scripts/decisions-api.py deliveries, every: 30000, timeoutMs: 8000 }
+                second:
+                  axis: horizontal
+                  ratio: 0.65
+                  first:
+                    node:
+                      id: open-decisions
+                      component: ./components/external/core/list
+                      props:
+                        title: Waiting on you
+                        sort: source-order
+                        source: { shell: python3 .dash-bored/scripts/decisions-api.py open, every: 15000, timeoutMs: 8000 }
+                        itemActions:
+                          - name: Open in browser
+                            action: { run: "component:open-decision:run", with: { url: "${item.url}" } }
+                          - name: Show summary
+                            action: { run: "component:show-decision:run", with: { decision: "${item.decision}" } }
+                          - name: Brief agent
+                            action: { run: agent:prompt, with: { prompt: "${item.prompt}" } }
+                  second:
+                    node:
+                      id: overview-actions
+                      component: ./components/external/core/group
+                      props:
+                        title: Quick actions
+                        description: Open decisions are amber; a triangle means the requester still owes attribute values. Use an item's actions to open it, print its summary below, or have the agent research it.
+                      children:
+                        axis: vertical
+                        first:
+                          node:
+                            id: quick-actions
+                            component: ./components/external/core/button
+                            props:
+                              items:
+                                - { name: Open GUI, action: "process:open-gui" }
+                                - { name: Verify log, action: "process:verify-log" }
+                                - { name: Resumer status, action: "process:resumer-check" }
+                        second:
+                          axis: vertical
+                          first:
+                            node:
+                              id: open-decision
+                              component: ./components/external/core/command
+                              props:
+                                label: Open selected decision
+                                command: 'open "$DASH_ITEM_URL"'
+                          second:
+                            node:
+                              id: show-decision
+                              component: ./components/external/core/command
+                              props:
+                                label: Selected decision summary
+                                command: 'decide get --markdown "$DASH_ITEM_DECISION"'
+          # ---------------------------------------------------------------- Decide
+          - metadata: { label: Decide }
+            node:
+              id: decide
+              component: ./components/external/core/group
+              children:
+                axis: vertical
+                first:
+                  node:
+                    id: decide-intro
+                    component: ./components/external/core/markdown
+                    props:
+                      content: |
+                        The Decisions GUI from the local server. Filter options, rule them out (`x`), select (`space`) and decide (`⌘↵`). If it is blank, the server is down: start it from **Develop → Serve**.
+                second:
+                  node:
+                    id: decisions-gui
+                    component: ./components/external/core/webview
+                    props:
+                      url: http://127.0.0.1:8787/
+          # ---------------------------------------------------------------- Activity
+          - metadata: { label: Activity }
+            node:
+              id: activity
+              component: ./components/external/core/group
+              children:
+                axis: vertical
+                first:
+                  node:
+                    id: activity-chart
+                    component: ./components/external/core/chart
+                    props:
+                      title: Decisions created and resolved per day (last 14 days)
+                      type: bar
+                      source: { shell: python3 .dash-bored/scripts/decisions-api.py activity, every: 60000, timeoutMs: 10000 }
+                second:
+                  axis: horizontal
+                  first:
+                    node:
+                      id: recent-panel
+                      component: ./components/external/core/group
+                      props:
+                        title: Recently decided
+                        description: Last 20 resolved or cancelled decisions with what was picked. A green check means the requesting agent session was resumed; a red cross means resuming failed.
+                      children:
+                        axis: vertical
+                        first:
+                          node:
+                            id: recent-decisions
+                            component: ./components/external/core/list
+                            props:
+                              sort: source-order
+                              source: { shell: python3 .dash-bored/scripts/decisions-api.py recent, every: 30000, timeoutMs: 10000 }
+                              itemActions:
+                                - name: Open in browser
+                                  action: { run: "component:open-recent:run", with: { url: "${item.url}" } }
+                                - name: Show summary
+                                  action: { run: "component:show-recent:run", with: { decision: "${item.decision}" } }
+                        second:
+                          axis: vertical
+                          first:
+                            node:
+                              id: open-recent
+                              component: ./components/external/core/command
+                              props:
+                                label: Open selected decision
+                                command: 'open "$DASH_ITEM_URL"'
+                          second:
+                            node:
+                              id: show-recent
+                              component: ./components/external/core/command
+                              props:
+                                label: Selected decision summary
+                                command: 'decide get --markdown "$DASH_ITEM_DECISION"'
+                  second:
+                    node:
+                      id: delivery-panel
+                      component: ./components/external/core/group
+                      props:
+                        title: Webhook deliveries
+                        description: Latest 30 deliveries. Amber means delivered but not yet acknowledged (or retrying); red means retries are exhausted. Redeliver re-fires one; Ack marks all of a decision's pending deliveries as handled.
+                      children:
+                        axis: vertical
+                        first:
+                          node:
+                            id: delivery-list
+                            component: ./components/external/core/list
+                            props:
+                              sort: source-order
+                              filterByTags: true
+                              source: { shell: python3 .dash-bored/scripts/decisions-api.py delivery-list, every: 30000, timeoutMs: 10000 }
+                              itemActions:
+                                - name: Redeliver
+                                  action: { run: "component:redeliver:run", with: { delivery: "${item.delivery}" } }
+                                - name: Ack decision
+                                  action: { run: "component:ack-decision:run", with: { decision: "${item.decision}" } }
+                        second:
+                          axis: vertical
+                          first:
+                            node:
+                              id: redeliver
+                              component: ./components/external/core/command
+                              props:
+                                label: Redeliver selected webhook
+                                command: 'curl -fsS -X POST -H "X-Actor: dashboard" ${DECISIONS_TOKEN:+-H "Authorization: Bearer $DECISIONS_TOKEN"} "${DECISIONS_URL:-http://127.0.0.1:8787}/api/deliveries/$DASH_ITEM_DELIVERY/redeliver" && echo && echo "Re-queued $DASH_ITEM_DELIVERY"'
+                          second:
+                            node:
+                              id: ack-decision
+                              component: ./components/external/core/command
+                              props:
+                                label: Ack deliveries for selected decision
+                                command: 'decide ack "$DASH_ITEM_DECISION"'
+          # ---------------------------------------------------------------- Develop
+          - metadata: { label: Develop }
+            node:
+              id: develop
+              component: ./components/external/core/group
+              children:
+                axis: horizontal
+                ratio: 0.45
+                first:
+                  node:
+                    id: dev-commands
+                    component: ./components/external/core/group
+                    props:
+                      title: Run, test, install
+                      description: Serve starts the GUI + API on :8787 (stop any other instance first). Tests need Python ≥ 3.11, so they run through uv. Seeding adds demo decisions to the live database. Reinstall refreshes the editable `decide` CLI, and the skill/resumer commands update this machine's agent integration.
+                    children:
+                      axis: vertical
+                      first:
+                        node:
+                          id: dev-actions
+                          component: ./components/external/core/button
+                          props:
+                            items:
+                              - { name: Run tests, action: "process:run-tests" }
+                              - { name: Serve, action: "process:serve" }
+                              - { name: Seed demo data, action: "process:seed" }
+                      second:
+                        axis: vertical
+                        first:
+                          axis: vertical
+                          first:
+                            node:
+                              id: run-tests
+                              component: ./components/external/core/command
+                              props:
+                                label: Run tests
+                                command: uv run --no-project --python '>=3.11' python -m unittest discover tests
+                          second:
+                            node:
+                              id: serve
+                              component: ./components/external/core/command
+                              props:
+                                label: Serve GUI + API (:8787)
+                                command: decide serve
+                        second:
+                          axis: vertical
+                          first:
+                            axis: vertical
+                            first:
+                              node:
+                                id: seed
+                                component: ./components/external/core/command
+                                props:
+                                  label: Seed demo decisions (writes to the live DB)
+                                  command: python3 examples/seed.py
+                            second:
+                              node:
+                                id: reinstall-cli
+                                component: ./components/external/core/command
+                                props:
+                                  label: Reinstall decide CLI (editable)
+                                  command: uv tool install --editable . --force
+                          second:
+                            axis: vertical
+                            first:
+                              node:
+                                id: install-skill
+                                component: ./components/external/core/command
+                                props:
+                                  label: Install Claude Code skill
+                                  command: decide skill install
+                            second:
+                              axis: vertical
+                              first:
+                                node:
+                                  id: resumer-check
+                                  component: ./components/external/core/command
+                                  props:
+                                    label: Resumer status
+                                    command: decide resumer status
+                              second:
+                                axis: vertical
+                                first:
+                                  node:
+                                    id: verify-log
+                                    component: ./components/external/core/command
+                                    props:
+                                      label: Verify event log
+                                      command: decide verify
+                                second:
+                                  node:
+                                    id: open-gui
+                                    component: ./components/external/core/command
+                                    props:
+                                      label: Open GUI in browser
+                                      command: 'open "${DECISIONS_URL:-http://127.0.0.1:8787}"'
+                second:
+                  node:
+                    id: readme
+                    component: ./components/external/core/markdown
+                    props:
+                      title: README — concepts, API, webhooks, configuration
+                      path: README.md
+          # ---------------------------------------------------------------- Deploy
+          - metadata: { label: Deploy }
+            node:
+              id: deploy
+              component: ./components/external/core/group
+              props:
+                title: Container deployment
+                description: Runs the server image from Dockerfile/compose.yaml. compose.yaml requires DECISIONS_TOKEN and DECISIONS_BASE_URL in a project-root .env. These commands need Docker, which is not currently installed on this machine. Resumers stay on the agent machines (Develop → Resumer status).
+              children:
+                axis: vertical
+                first:
+                  node:
+                    id: deploy-actions
+                    component: ./components/external/core/button
+                    props:
+                      items:
+                        - { name: Build & start, action: "process:compose-up" }
+                        - { name: Container status, action: "process:compose-ps" }
+                        - { name: Logs, action: "process:compose-logs" }
+                second:
+                  axis: vertical
+                  first:
+                    axis: vertical
+                    first:
+                      node:
+                        id: compose-up
+                        component: ./components/external/core/command
+                        props:
+                          label: docker compose up -d --build
+                          command: docker compose up -d --build
+                    second:
+                      node:
+                        id: compose-ps
+                        component: ./components/external/core/command
+                        props:
+                          label: docker compose ps
+                          command: docker compose ps
+                  second:
+                    axis: vertical
+                    first:
+                      node:
+                        id: compose-logs
+                        component: ./components/external/core/command
+                        props:
+                          label: docker compose logs -f
+                          command: docker compose logs -f --tail 200
+                    second:
+                      node:
+                        id: compose-down
+                        component: ./components/external/core/command
+                        props:
+                          label: docker compose down
+                          command: docker compose down

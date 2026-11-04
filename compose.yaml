@@ -1,0 +1,23 @@
+# docker compose up -d
+# Put DECISIONS_TOKEN (e.g. `openssl rand -base64 24`) and DECISIONS_BASE_URL in a .env file next to this one.
+services:
+  decisions:
+    build: .
+    image: decisions
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - decisions-data:/data
+    # Webhooks to agents on this same machine (`decide watch`) go to host.docker.internal.
+    # Docker Desktop provides that name; this line provides it on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DECISIONS_TOKEN: ${DECISIONS_TOKEN:?set DECISIONS_TOKEN in .env}
+      # The URL other machines and your browser use. Shown in links and in the install command.
+      DECISIONS_BASE_URL: ${DECISIONS_BASE_URL:?set DECISIONS_BASE_URL in .env, e.g. http://homeserver:8787}
+      DECISIONS_OWNER: ${DECISIONS_OWNER:-me}
+
+volumes:
+  decisions-data:

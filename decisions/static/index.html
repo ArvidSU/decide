@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Decisions</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%235b5bd6'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <a href="/" data-nav class="logo">Decisions</a>
+        <a href="/settings" data-nav class="icon-btn" title="Settings &amp; webhooks">⚙</a>
+      </header>
+      <div class="tabs" id="status-tabs"></div>
+      <input id="search" class="search" type="search" placeholder="Search decisions…">
+      <nav id="decision-list" class="decision-list"></nav>
+    </aside>
+    <main id="main" class="main"></main>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

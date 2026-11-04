@@ -1,0 +1,3 @@
+# Dash-bored manages these pinned checkouts; commit the lock file.
+/components/external/
+/themes/external/
