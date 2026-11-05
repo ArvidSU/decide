@@ -87,6 +87,9 @@ const ICONS = {
   webhook: '<path d="M18 16.98h-5.99c-1.1 0-1.95.94-2.48 1.9A4 4 0 0 1 2 17c.01-.7.2-1.4.57-2"/><path d="m6 17 3.13-5.78c.53-.97.1-2.18-.5-3.1a4 4 0 1 1 6.89-4.06"/><path d="m12 6 3.13 5.73C15.66 12.7 16.9 13 18 13a4 4 0 0 1 0 8"/>',
   undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
   chevron: '<path d="m9 18 6-6-6-6"/>',
+  "chevron-down": '<path d="m6 9 6 6 6-6"/>',
+  sort: '<path d="m7 15 5 5 5-5M7 9l5-5 5 5"/>',
+  wifi: '<path d="M12 20h.01M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 14 0M2 9.3a15 15 0 0 1 20 0"/>',
   play: '<path d="m6 3 14 9-14 9z"/>',
 };
 const icon = (name, size = 16) =>
@@ -162,12 +165,12 @@ const byDeadline = (a, b) => (a.due_at || "9999").localeCompare(b.due_at || "999
 
 // Errors stay until dismissed; actions are [{label, run}] (`undo` is shorthand for one "Undo" action).
 let toastTimer;
-function toast(msg, { undo, undoLabel, actions = [], error } = {}) {
+function toast(msg, { undo, undoLabel, actions = [], error, info } = {}) {
   const el = $("#toast");
   if (undo) actions = [{ label: undoLabel || "Undo", run: undo }, ...actions];
   el.className = "toast" + (error ? " error" : "");
   el.setAttribute("role", error ? "alert" : "status");
-  el.innerHTML = `<span class="msg">${error ? icon("ban", 15) : icon("check", 15)}${esc(msg)}</span>` +
+  el.innerHTML = `<span class="msg">${icon(error ? "ban" : info ? "help" : "check", 15)}${esc(msg)}</span>` +
     actions.map((a, i) => `<button data-i="${i}">${esc(a.label)}</button>`).join("") +
     (error ? `<button data-close aria-label="Dismiss">${icon("x", 15)}</button>` : "");
   el.hidden = false;
@@ -403,7 +406,7 @@ async function poll() {
   S.cursor = S.config.cursor;
   while (me === pollAbort) {
     try {
-      const r = await api("GET", `/api/events?after=${S.cursor}&wait=25&limit=500`);
+      const r = await api("GET", `/api/events?after=${S.cursor}&wait=${S.offline ? 0 : 25}&limit=500`);
       if (r.events.length) {
         S.cursor = r.cursor;
         await loadList();
@@ -412,7 +415,12 @@ async function poll() {
           else S.stale = true;
         }
       }
-    } catch { await new Promise((r) => setTimeout(r, 3000)); }
+      if (S.offline) { S.offline = false; $("#conn").hidden = true; await loadList(); if (S.d && !isTyping()) await loadDecision(S.d.id, { keepSelection: true }); }
+    } catch {
+      // Live updates stopped: say so instead of quietly showing stale data.
+      if (!S.offline) { S.offline = true; $("#conn").hidden = false; }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
   }
 }
 
@@ -423,9 +431,23 @@ function navigate(path, replace) {
   route();
 }
 
+function renderSkeleton() {
+  $("#main").innerHTML = `<div class="page" aria-busy="true" aria-label="Loading"><div class="skel skel-line" style="width:120px"></div>
+    <div class="skel skel-title"></div><div class="skel skel-line" style="width:40%"></div><div class="skel skel-line" style="width:70%;margin-top:24px"></div>
+    <div class="skel skel-line" style="width:62%"></div><div class="skel skel-block"></div></div>`;
+}
+function renderError(e, retry = "retry") {
+  $("#main").innerHTML = `<div class="page"><div class="empty-state error-state" role="alert"><span class="es-ic">${icon("wifi", 24)}</span>
+    <h2>${/fetch|network/i.test(e.message) ? "Can't reach the decisions server" : "Something went wrong"}</h2>
+    <p>${esc(e.message)}. Check that the server is running, then try again.</p>
+    <button class="btn primary" data-action="${retry}">${icon("rotate", 15)}Retry</button></div></div>`;
+}
+
 async function route() {
   const path = location.pathname;
   drawer(false);
+  const want = path.match(/^\/d\/([^/]+)/);
+  if (want && S.d?.id !== decodeURIComponent(want[1])) renderSkeleton();
   const m = path.match(/^\/d\/([^/]+)/);
   try {
     if (m) return await loadDecision(decodeURIComponent(m[1]));
@@ -436,7 +458,7 @@ async function route() {
     if (first) return navigate(`/d/${first.id}`, true);
     renderEmpty();
   } catch (e) {
-    $("#main").innerHTML = `<div class="page"><div class="empty-state error-state">${esc(e.message)}</div></div>`;
+    renderError(e);
   }
 }
 
@@ -700,6 +722,7 @@ function renderDecision() {
     main.scrollTop = scroll;
     bindDecision();
   });
+  syncPopModal();
 }
 
 // Closed decisions (resolved, expired, cancelled) lead with the outcome, followed by the full
@@ -782,7 +805,16 @@ function closedOptionsHtml(d) {
   const rank = (o) => (chosen.has(o.id) ? 0 : o.excluded ? 2 : 1);
   const opts = [...d.options].sort((a, b) => rank(a) - rank(b));
   const excludedCount = d.options.filter((o) => o.excluded).length;
-  return `<div class="block-head"><h2>Options</h2><span class="count">${d.options.length} considered${excludedCount ? `, ${excludedCount} ruled out` : ""}</span></div>
+  const head = `<div class="block-head"><h2>Options</h2><span class="count">${d.options.length} considered${excludedCount ? `, ${excludedCount} ruled out` : ""}</span></div>`;
+  if (narrow.matches) return head + `<div class="cards readonly">${opts.map((o) => `
+    <div class="card ${chosen.has(o.id) ? "selected" : ""} ${o.excluded ? "excluded" : ""}">
+      ${o.image ? `<img class="hero" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
+      <div class="body"><div class="top">${chosen.has(o.id) ? `<span class="picked" title="Picked">${icon("check-circle", 18)}</span>` : ""}<div class="opt-label">${esc(o.label)}${chosen.has(o.id) ? `<span class="sr-only"> (picked)</span>` : ""}</div></div>
+        ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}
+        ${o.excluded ? `<div class="opt-desc">Ruled out${o.exclude_reason ? `: ${esc(o.exclude_reason)}` : ""}</div>` : ""}
+        ${metas.length ? `<dl>${metas.map((m) => `<dt>${esc(m.label)}</dt><dd class="${o.attributes[m.key] == null ? "missing" : ""}">${cellHtml(o.attributes[m.key], m, o.attribute_meta[m.key])}</dd>`).join("")}</dl>` : ""}</div>
+    </div>`).join("")}</div>`;
+  return `${head}
     <div class="table-wrap"><table class="opts readonly">
       <thead><tr><th class="check"><span class="sr-only">Picked</span></th><th>Option</th>${metas.map((m) => `<th class="${m.type === "number" ? "num" : ""}" title="${esc(m.def.description || "")}">${esc(m.label)}</th>`).join("")}</tr></thead>
       <tbody>${opts.map((o) => `
@@ -827,9 +859,10 @@ function deadlineHtml(d) {
   if (d.status !== "open" || !d.due_at) return "";
   const who = esc(d.source || "the requester");
   const days = S.config?.deadline_days || 4;
-  return `<div class="callout deadline ${urgency(d)}">${icon("clock", 18)}
+  const u = urgency(d);
+  return `<div class="callout deadline ${u || "slim"}">${icon("clock", u ? 18 : 16)}
     <div class="callout-main"><div><span class="deadline-left">${until(d.due_at)} left</span> <span class="muted">· until</span> <span title="${esc(fullTime(d.due_at))}">${esc(whenTime(d.due_at))}</span></div>
-      <div class="small">If it's still undecided then, it expires and ${who} is notified.</div></div>
+      <div class="small">${u ? `If it's still undecided then, it expires and ${who} is notified.` : `· then it expires and ${who} is notified`}</div></div>
     <div class="callout-actions">
       <button class="btn small" data-action="extend" data-days="1" title="Move the deadline a day later">${icon("plus", 14)}1 day</button>
       <button class="btn small" data-action="extend" data-days="${days}" title="Move the deadline ${days} days later">${icon("plus", 14)}${days} days</button></div>
@@ -920,7 +953,7 @@ function filtersHtml({ metas, filtered, best }) {
       body = `<label class="lf">Contains<input class="field" type="text" data-filter="${k}" data-part="text" value="${esc(f.text ?? "")}"></label>`;
     }
     return `<details class="fpop ${on ? "on" : ""}" data-pop="${k}" ${S.pop === m.key ? "open" : ""}>
-      <summary class="fbtn" title="${esc(m.def.description || "")}">${icon(on ? "filter" : "plus", 14)}${esc(m.label)}${on ? `: <span class="val">${esc(filterSummary(m, f))}</span>` : ""}${m.requested ? ` <span class="dot" title="Requested from the agent"></span>` : ""}</summary>
+      <summary class="fbtn" title="${esc(m.def.description || `Filter by ${m.label}`)}" aria-haspopup="dialog">${esc(m.label)}${on ? `: <span class="val">${esc(filterSummary(m, f))}</span>` : ""}${m.requested ? ` <span class="dot" title="Requested from the agent"></span>` : ""}${icon("chevron-down", 14)}</summary>
       <div class="pop-scrim" data-action="close-pop"></div>
       <div class="pop" role="dialog" aria-label="Filter by ${esc(m.label)}"><div class="pop-title"><span>${esc(m.label)}${m.unit ? ` (${esc(m.unit)})` : ""}</span>${on ? `<button class="btn small ghost" data-action="clear-filter" data-key="${k}">Clear</button>` : ""}<button class="icon-btn" data-action="close-pop" aria-label="Close">${icon("x", 16)}</button></div>${body}
         <button class="btn primary pop-done" data-action="close-pop">Done</button></div>
@@ -932,7 +965,7 @@ function filtersHtml({ metas, filtered, best }) {
   ].filter(Boolean);
   return `<div class="toolbar">
       <div class="tsearch">${icon("search", 15)}<input type="search" id="opt-text" placeholder="Search options" aria-label="Search options" value="${esc(u.text)}"><span class="kbd" aria-hidden="true">/</span></div>
-      ${fs}
+      ${fs ? `<span class="tlabel">${icon("filter", 14)}${active.length ? `${active.length} filter${active.length > 1 ? "s" : ""}` : "Filter"}</span>${fs}` : ""}
       <span class="spacer"></span>
       ${Object.keys(best).length ? `<span class="legend"><span class="best-mark"></span>${chips.length ? "Best among shown" : "Best"}: ${esc(metas.filter((m) => best[m.key] !== undefined).map((m) => `${m.better === "lower" ? "lowest" : "highest"} ${m.label.toLowerCase()}`).join(", "))}</span>` : ""}
     </div>
@@ -951,7 +984,7 @@ function sortState(key) {
 }
 function sortHead(key, label, extra = "") {
   const st = sortState(key);
-  return `<button class="sortb" data-sort="${esc(key)}">${label}${extra}${st === "none" ? "" : icon(st === "ascending" ? "arrow-up" : "arrow-down", 13)}</button>`;
+  return `<button class="sortb" data-sort="${esc(key)}" title="Sort by ${esc(label.replace(/<[^>]+>/g, ""))}">${label}${extra}${icon(st === "none" ? "sort" : st === "ascending" ? "arrow-up" : "arrow-down", 13)}</button>`;
 }
 
 function bestTitle(m) { return `Best ${m.label.toLowerCase()} (${m.better} is better)`; }
@@ -976,7 +1009,7 @@ function tableHtml({ metas, visible, best }, single) {
           const cls = [v == null ? "missing" : "", typeof v === "number" ? "num" : "", isBest ? "best" : ""].join(" ");
           return `<td class="${cls}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? `<span class="best-mark" aria-hidden="true"></span>` : ""}${cellHtml(v, m, o.attribute_meta[m.key])}${isBest ? `<span class="sr-only"> (best)</span>` : ""}</td>`;
         }).join("")}
-        <td class="act"><button class="btn small ghost ruleout" data-action="exclude" data-id="${esc(o.id)}" aria-label="Rule out ${esc(o.label)}" title="Rule out (x). Alt-click to give a reason.">${icon("x", 14)}<span class="lbl">Rule out</span></button></td>
+        <td class="act">${optMenuHtml(o, false)}</td>
       </tr>`).join("")}</tbody></table></div>`;
 }
 
@@ -989,7 +1022,7 @@ function cardsHtml({ metas, visible, best }, single) {
       <div class="body">
         <div class="top"><span class="pick-hit"><input class="pick" type="${single ? "radio" : "checkbox"}" name="pick" data-pick="${esc(o.id)}" ${S.selection.has(o.id) ? "checked" : ""} aria-label="Select ${esc(o.label)}"></span>
           <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}</div>
-          <button class="icon-btn ruleout" data-action="exclude" data-id="${esc(o.id)}" aria-label="Rule out ${esc(o.label)}" title="Rule out (x). Alt-click to give a reason.">${icon("x", 15)}</button></div>
+          ${optMenuHtml(o, true)}</div>
         ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}
         ${cols.length ? `<dl>${cols.map((m) => {
           const v = o.attributes[m.key];
@@ -998,6 +1031,17 @@ function cardsHtml({ metas, visible, best }, single) {
         }).join("")}</dl>` : ""}
       </div>
     </div>`).join("")}</div>`;
+}
+
+// "Rule out" offers both the quick action and one with a reason, so neither depends on a hidden modifier.
+function optMenuHtml(o, compact) {
+  return `<details class="omenu ruleout" data-menu="${esc(o.id)}">
+    <summary class="omenu-btn ${compact ? "icon-only" : ""}" aria-label="Rule out ${esc(o.label)}" aria-haspopup="menu" title="Rule out">${compact ? icon("more", 16) : `${icon("x", 14)}Rule out${icon("chevron-down", 14)}`}</summary>
+    <div class="menu" role="menu">
+      <button role="menuitem" data-action="exclude" data-id="${esc(o.id)}">${icon("x", 15)}Rule out<span class="kbd">X</span></button>
+      <button role="menuitem" data-action="add-reason" data-id="${esc(o.id)}">${icon("pencil", 15)}Rule out with reason…</button>
+      ${o.url ? `<a role="menuitem" href="${esc(o.url)}" target="_blank" rel="noopener">${icon("external", 15)}Open link</a>` : ""}
+    </div></details>`;
 }
 
 function miniHtml(o, kind) {
@@ -1019,16 +1063,19 @@ function decideBarHtml(d, single, { visible }) {
   // Say which limit applies before the button refuses.
   const limit = single ? "" : n < min ? `${min - n} more needed` : max !== null ? (n >= max ? "limit reached" : `up to ${max}`) : "";
   const why = valid ? "" : n < min ? (min === 1 ? "Select an option first" : `Select at least ${min} options`) : `Select at most ${max} options`;
-  const sel = !n ? `<span>${need}</span>`
+  const sel = !n ? `<span class="need">${single ? "Select an option to decide" : need}</span>`
+    : !valid && n > (max ?? Infinity) ? `<span class="need warn">${why}</span>`
     : single ? `<span class="names" title="${esc(labels[0])}">${esc(labels[0])}</span>`
     : `<span class="count">${n} selected</span>${limit ? `<span class="limit">· ${limit}</span>` : ""}<span class="names" title="${esc(labels.join(", "))}">${esc(labels.join(", "))}</span>`;
   return `<div class="decide-bar ${n ? "has-sel" : ""} ${S.notes[d.id] ? "with-reason" : ""}" role="region" aria-label="Decide">
     <div class="sel" aria-live="polite">${sel}</div>
     <div class="reason-field"><label for="note">Reason</label><input id="note" placeholder="Optional, shown to ${esc(d.source || "the requester")}" value="${esc(S.notes[d.id] ?? "")}" autocomplete="off"></div>
     <button class="btn primary" data-action="resolve" ${valid && !S.resolving ? "" : "disabled"} title="${esc(why || "Decide (⌘↵)")}" aria-keyshortcuts="Meta+Enter Control+Enter">${S.resolving ? "Deciding…" : `${icon("check", 15)}Decide`}<span class="kbd" aria-hidden="true">⌘↵</span></button>
+    ${hidden.length ? `<div class="bar-note" role="status">${icon("help", 15)}<span>${hidden.length === 1 ? `“${esc(hidden[0].label)}” is selected but hidden by filters.` : `${esc(hidden.map((o) => o.label).join(", "))} are selected but hidden by filters.`}</span>
+      <button class="btn small ghost" data-action="clear-all-filters">Show</button><button class="btn small ghost" data-action="deselect-hidden">Deselect</button></div>` : ""}
+    ${S.resolveError?.id === d.id ? `<div class="bar-note bad" role="alert">${icon("ban", 15)}<span>Couldn't decide: ${esc(S.resolveError.message)}</span>
+      <button class="btn small" data-action="resolve" ${valid ? "" : "disabled"}>Retry</button></div>` : ""}
   </div>
-  ${hidden.length ? `<div class="selnote" role="status">${icon("help", 15)}${hidden.length === 1 ? `“${esc(hidden[0].label)}” is selected but hidden by filters.` : `${hidden.length} selected options are hidden by filters.`}
-    <button class="btn small ghost" data-action="clear-all-filters">Show</button><button class="btn small ghost" data-action="deselect-hidden">Deselect</button></div>` : ""}
   <div class="kbd-hint" aria-hidden="true"><span><span class="kbd">J</span><span class="kbd">K</span> move</span><span><span class="kbd">Space</span> select</span><span><span class="kbd">X</span> rule out</span>${attrKeys(d).length || d.options.length > 7 ? `<span><span class="kbd">/</span> search</span>` : ""}<span><span class="kbd">⌘</span><span class="kbd">↵</span> decide</span></div>`;
 }
 
@@ -1147,7 +1194,7 @@ function toggleSelect(id) {
   else {
     if (d.max_select === 1) S.selection.clear();
     else if (d.max_select !== null && S.selection.size >= d.max_select) {
-      toast(`You can pick at most ${d.max_select}. Deselect one first.`);
+      toast(`You can pick at most ${d.max_select}. Deselect one first.`, { info: true });
       return renderDecision();
     }
     S.selection.add(id);
@@ -1212,8 +1259,9 @@ function bindDecision() {
     if (el.open) {
       S.pop = el.dataset.pop;
       main.querySelectorAll("details[data-pop][open]").forEach((o) => o !== el && o.removeAttribute("open"));
-      if (!el.contains(document.activeElement)) el.querySelector(".pop input")?.focus();
+      if (!el.contains(document.activeElement) || el.querySelector("summary") === document.activeElement) el.querySelector(".pop input")?.focus();
     } else if (S.pop === el.dataset.pop) S.pop = null;
+    syncPopModal();
   }));
   const text = $("#opt-text");
   if (text) text.addEventListener("input", () => { u.text = text.value; saveUi(); renderDecision(); });
@@ -1261,17 +1309,33 @@ function bindComments(d) {
   };
 }
 
+// On phones the open filter is a bottom sheet: everything else is inert until it closes.
+let modalInert = [];
+function syncPopModal() {
+  modalInert.forEach((el) => (el.inert = false));
+  modalInert = [];
+  syncInert();
+  const open = narrow.matches && S.pop && document.querySelector(`details[data-pop="${CSS.escape(S.pop)}"][open]`);
+  if (!open) return;
+  for (let node = open.querySelector(".pop"); node.parentElement && node !== document.body; node = node.parentElement)
+    for (const sib of node.parentElement.children)
+      if (sib !== node && !sib.inert && !sib.matches(".pop-scrim, #toast, #conn, script")) { sib.inert = true; modalInert.push(sib); }
+}
+
 // Closes the open filter popover; `refocus` puts focus back on its button.
 function closePops(refocus) {
   if (!S.pop) return;
   const summary = document.querySelector(`details[data-pop="${CSS.escape(S.pop)}"] summary`);
   S.pop = null;
   document.querySelectorAll("details[data-pop][open]").forEach((o) => o.removeAttribute("open"));
+  syncPopModal();
   if (refocus) summary?.focus();
 }
 
 document.addEventListener("click", async (e) => {
   if (!e.target.closest(".fpop")) closePops();
+  document.querySelectorAll("details.omenu[open]").forEach((m) => !m.contains(e.target) && m.removeAttribute("open"));
+  if (e.target.closest(".omenu") && !e.target.closest("[data-action]")) return;
   const nav = e.target.closest("a[data-nav]");
   if (nav && !e.metaKey && !e.ctrlKey) { e.preventDefault(); return navigate(nav.getAttribute("href")); }
   const tab = e.target.closest("[data-status]");
@@ -1295,8 +1359,11 @@ document.addEventListener("click", async (e) => {
   switch (a.dataset.action) {
     case "drawer": return drawer();
     case "close-pop": return closePops(true);
+    case "palette": return palette();
+    case "retry": return route();
+    case "reload": return location.reload();
     case "view": ui().view = a.dataset.view; saveUi(); return renderDecision();
-    case "exclude": return e.altKey ? excludeWithReason(id) : exclude([id]);
+    case "exclude": a.closest("details")?.removeAttribute("open"); return e.altKey ? excludeWithReason(id) : exclude([id]);
     case "include": return act(() => api("POST", `/api/decisions/${d.id}/include`, { option_ids: [id] }), "Restored");
     case "exclude-filtered": {
       const { metas, filtered } = partition();
@@ -1307,7 +1374,7 @@ document.addEventListener("click", async (e) => {
       if (reason === null) return;
       return exclude(filtered.map((o) => o.id), reason || undefined, desc);
     }
-    case "add-reason": return excludeWithReason(id);
+    case "add-reason": a.closest("details")?.removeAttribute("open"); return excludeWithReason(id);
     case "deselect-hidden": {
       const vis = new Set(visibleIds());
       for (const s of [...S.selection]) if (!vis.has(s)) S.selection.delete(s);
@@ -1382,8 +1449,16 @@ async function resolve() {
   const told = (S.listeners || []).length + (d.resume ? 1 : 0) - silence.length;
   S.resolving = true;
   renderDecision();
-  const ok = await act(() => api("POST", `/api/decisions/${d.id}/resolve`, { selected: [...S.selection], note, filters, silence }),
-            `${d.id} decided${told > 0 ? ` · notifying ${told}` : ""}${silence.length ? ` · ${silence.length} not notified` : ""}`);
+  S.resolveError = null;
+  let ok = false;
+  try {
+    await api("POST", `/api/decisions/${d.id}/resolve`, { selected: [...S.selection], note, filters, silence });
+    ok = true;
+    S.resolving = false;
+    await loadDecision(d.id, { keepSelection: true });
+    toast(`${d.id} decided${told > 0 ? ` · notifying ${told}` : ""}${silence.length ? ` · ${silence.length} not notified` : ""}`);
+    loadList();
+  } catch (e) { S.resolveError = { id: d.id, message: e.message || String(e) }; fail(e); }
   S.resolving = false;
   if (ok) { delete S.notes[d.id]; S.silenced = new Set(); }
   if (S.d?.id === d.id) renderDecision();
@@ -1392,6 +1467,9 @@ async function resolve() {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.body.classList.contains("drawer-open")) return drawer(false);
   if (e.key === "Escape" && S.pop) return closePops(true);
+  const menu = document.querySelector("details.omenu[open]");
+  if (e.key === "Escape" && menu) { menu.removeAttribute("open"); return menu.querySelector("summary").focus(); }
+  if (S.pop || menu) return;
   if (!S.d || S.editing || S.d.status !== "open" || dialogOpen()) return;
   const el = document.activeElement;
   // Enter and space belong to a focused button, link or disclosure.
@@ -1440,14 +1518,68 @@ setInterval(() => {
 $("#search").addEventListener("input", (e) => { S.q = e.target.value; renderSidebar(); });
 window.addEventListener("popstate", route);
 
+// ------------------------------------------------------------------ command palette (⌘K)
+
+function palette() {
+  if (dialogOpen()) return;
+  const dlg = document.createElement("dialog");
+  dlg.className = "dialog palette";
+  dlg.setAttribute("aria-label", "Jump to");
+  dlg.innerHTML = `<div class="pal-search">${icon("search", 16)}<input type="text" placeholder="Jump to a decision or command…" aria-label="Search decisions and commands" role="combobox" aria-expanded="true" aria-controls="pal-list" autocomplete="off"><span class="kbd">esc</span></div>
+    <ul class="pal-list" id="pal-list" role="listbox"></ul>`;
+  document.body.append(dlg);
+  const input = dlg.querySelector("input"), list = dlg.querySelector("ul");
+  const commands = [
+    ...Object.entries(STATUS_NAMES).map(([k, v]) => ({ kind: "cmd", icon: "filter", label: `Show ${v.toLowerCase()} decisions`, run: () => { S.status = k; storage("status", k); renderSidebar(); drawer(true); } })),
+    { kind: "cmd", icon: "settings", label: "Settings", run: () => navigate("/settings") },
+    ...(S.d ? [{ kind: "cmd", icon: "copy", label: `Copy link to ${S.d.id}`, run: () => copy(`[${S.d.id}: ${S.d.title}](${S.d.url})`, "link") }] : []),
+  ];
+  const decisions = [...S.list.filter((d) => d.status === "open").sort(byDeadline), ...S.list.filter((d) => d.status !== "open")]
+    .map((d) => ({ kind: "decision", d, label: d.title, run: () => navigate(`/d/${d.id}`) }));
+  let items = [], at = 0;
+  const draw = () => {
+    const q = input.value.trim().toLowerCase();
+    const hit = (t) => q.split(/\s+/).every((w) => t.toLowerCase().includes(w));
+    items = [...decisions.filter((x) => !q || hit(`${x.d.id} ${x.d.title} ${x.d.source || ""} ${x.d.status}`)).slice(0, 12), ...commands.filter((c) => !q || hit(c.label))];
+    at = Math.min(at, Math.max(0, items.length - 1));
+    list.innerHTML = items.length ? items.map((x, i) => `<li role="option" id="pal-${i}" aria-selected="${i === at}" class="${i === at ? "on" : ""}" data-i="${i}">
+      ${x.kind === "decision" ? `${statusIcon(x.d)}<span class="pal-label">${esc(x.d.title)}</span><span class="pal-meta">${esc(x.d.id)}${x.d.status === "open" && x.d.due_at ? ` · ${until(x.d.due_at)}` : ` · ${esc(x.d.status)}`}</span>`
+                              : `${icon(x.icon, 15)}<span class="pal-label">${esc(x.label)}</span>`}</li>`).join("")
+      : `<li class="pal-empty">No matches</li>`;
+    input.setAttribute("aria-activedescendant", items.length ? `pal-${at}` : "");
+    list.querySelector(".on")?.scrollIntoView({ block: "nearest" });
+  };
+  const go = (i) => { const x = items[i]; if (!x) return; dlg.close(); x.run(); };
+  input.addEventListener("input", () => { at = 0; draw(); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); at = Math.min(items.length - 1, at + 1); draw(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); at = Math.max(0, at - 1); draw(); }
+    else if (e.key === "Enter") { e.preventDefault(); go(at); }
+  });
+  list.addEventListener("click", (e) => { const li = e.target.closest("[data-i]"); if (li) go(+li.dataset.i); });
+  list.addEventListener("mousemove", (e) => { const li = e.target.closest("[data-i]"); if (li && +li.dataset.i !== at) { at = +li.dataset.i; draw(); } });
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
+  dlg.addEventListener("close", () => dlg.remove());
+  draw();
+  dlg.showModal();
+  input.focus();
+}
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); palette(); }
+}, true);
+
 // ------------------------------------------------------------------ boot
 
 (async function boot() {
   $("#drawer-btn").innerHTML = icon("menu", 20);
+  $("#conn").innerHTML = `${icon("wifi", 15)}Reconnecting… live updates paused<button class="btn small ghost" data-action="reload">Reload</button>`;
+  $("#decision-list").innerHTML = Array.from({ length: 5 }, () => `<div class="skel skel-item"></div>`).join("");
+  renderSkeleton();
   $("#mb-settings").innerHTML = icon("settings", 18);
   $("#settings-btn").innerHTML = icon("settings", 16);
   $("#logo-mark").innerHTML = icon("check", 14);
   $("#search-wrap").insertAdjacentHTML("afterbegin", icon("search", 15));
+  $("#search-wrap").insertAdjacentHTML("beforeend", `<button class="kbd pal-hint" data-action="palette" title="Jump to anything (⌘K)" aria-label="Open command palette">⌘K</button>`);
   syncInert();
   // Live updates that arrived while typing are applied once you leave the field.
   document.addEventListener("focusout", () => setTimeout(() => {
@@ -1459,6 +1591,6 @@ window.addEventListener("popstate", route);
     await route();
     poll();
   } catch (e) {
-    $("#main").innerHTML = `<div class="page"><div class="empty-state error-state">Could not load: ${esc(e.message)}</div></div>`;
+    renderError(e, "reload");
   }
 })();
