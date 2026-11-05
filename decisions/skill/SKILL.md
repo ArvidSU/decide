@@ -88,4 +88,4 @@ Then run the `to keep waiting: …` command from the previous `decide wait` outp
 
 `decide get D-12 --json` returns `resolution.selected` (option IDs), `selected_options`, and `resolution.note`. The note is the user's rationale or extra instructions; follow it. Where you act on the decision (commit, PR, Linear comment, a written summary), reference it as `[D-12: title](url)`.
 
-The user may revise a decision later (another `decision.resolved`, or `decision.reopened`). The latest resolution is authoritative.
+The user may revise a decision later (another `decision.resolved`, or `decision.reopened`). The latest resolution is authoritative. A revision may skip notifying you (e.g. a typo fix), so check `decide get` before acting on an older one.

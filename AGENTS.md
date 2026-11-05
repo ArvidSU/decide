@@ -26,3 +26,4 @@ A change to behaviour usually touches several of these. Update all that apply in
 - Zero dependencies: Python ≥ 3.11 stdlib, SQLite, vanilla JS.
 - Every mutation appends to the hash-chained event log. Never update or delete events.
 - Run the tests with `python3 -m unittest discover tests`.
+- Always commit your changes.
