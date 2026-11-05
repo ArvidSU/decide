@@ -46,8 +46,8 @@ Base: `http://127.0.0.1:8787/api`. JSON in and out. Send `X-Actor: <name>` so th
 
 | Method & path | |
 |---|---|
-| `POST /decisions` | Create. Body: `title`, `context`, `source`, `options[]`, `attributes{}`, `min_select`, `max_select`, `links[]`, `tags[]`, `metadata{}`, `due_at` (ISO 8601; default now + `deadline_days`), `idempotency_key`, `webhooks[]`. Returns 201, or 200 with the existing decision if `idempotency_key` matches. |
-| `GET /decisions?status=open&q=&tag=&source=` | List (`status`: `open`, `resolved`, `cancelled`, `expired`, `all`) |
+| `POST /decisions` | Create. Body: `title`, `context`, `source`, `options[]`, `attributes{}`, `min_select`, `max_select`, `links[]`, `tags[]`, `metadata{}`, `due_at` (ISO 8601; default now + the space's `deadline_days`), `idempotency_key` (per space), `webhooks[]`, `space` (default: the token's space, or `default` for the admin token). Returns 201, or 200 with the existing decision if `idempotency_key` matches. |
+| `GET /decisions?status=open&q=&tag=&source=&space=` | List (`status`: `open`, `resolved`, `cancelled`, `expired`, `all`), limited to the token's spaces |
 | `GET /decisions/{id}` | Full decision incl. options, resolution, `selected_options`, `pending_attribute_requests` |
 | `PATCH /decisions/{id}` | Edit any field (`metadata` merges; `null` removes a key) |
 | `GET /decisions/{id}/markdown` | Markdown summary |
@@ -60,8 +60,8 @@ Base: `http://127.0.0.1:8787/api`. JSON in and out. Send `X-Actor: <name>` so th
 | `POST /decisions/{id}/reopen` · `/cancel` · `/comments` | |
 | `GET /decisions/{id}/wait?timeout=60&types=…&after=…` | Long-poll until resolved/cancelled/expired (or other event types). Returns immediately if already in one of those states. |
 | `GET /decisions/{id}/events` · `GET /events?after=N&wait=30` | Event log; the global feed can be long-polled instead of using webhooks |
-| `GET /events/verify` | Verify the hash chain |
-| `POST /decisions/{id}/webhooks` · `GET/POST /webhooks` · `PATCH/DELETE /webhooks/{id}` | Per-decision or global subscriptions |
+| `GET /events/verify` | Verify each space's hash chain: `{ok, events, chains: {space: {ok, events, head, broken_at?}}}` (`*` = webhooks covering every space) |
+| `POST /decisions/{id}/webhooks` · `GET/POST /webhooks` · `PATCH/DELETE /webhooks/{id}` | Per-decision or global subscriptions. A global one covers the token's space, or `space` if given; from the admin token without `space`, every space |
 | `GET /deliveries?decision=` · `GET /deliveries/{id}/attempts` | Delivery status and immutable attempt log |
 | `POST /deliveries/{id}/ack` · `POST /decisions/{id}/ack` · `POST /deliveries/{id}/redeliver` | |
 

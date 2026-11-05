@@ -81,7 +81,9 @@ def resumer():
 def chain():
     v = get("/events/verify", timeout=8)
     if v.get("ok"):
-        out({"state": "healthy", "detail": "%d events, hash chain intact · head %s…" % (v.get("events", 0), (v.get("head") or "")[:12])})
+        chains = v.get("chains", {})
+        out({"state": "healthy", "detail": "%d events in %d hash chain%s (%s), all intact" % (
+            v.get("events", 0), len(chains), "" if len(chains) == 1 else "s", ", ".join(chains) or "none yet")})
     else:
         out({"state": "error", "detail": "Chain broken: %s" % json.dumps({k: x for k, x in v.items() if k != "ok"})[:300]})
 
