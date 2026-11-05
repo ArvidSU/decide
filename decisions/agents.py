@@ -35,8 +35,6 @@ AGENTS = {a.name: a for a in [
           "codex resume {session}", "~/.agents/skills"),
 ]}
 
-# Decisions created before resume targets named their agent all came from Claude Code.
-LEGACY_AGENT = "claude-code"
 # The cross-agent skills location, for agents not listed above.
 SHARED_SKILLS_DIR = "~/.agents/skills"
 
@@ -55,8 +53,7 @@ def detect_agent() -> str | None:
     return os.environ.get("DECISIONS_AGENT") or (s[0] if (s := detect_session()) else None)
 
 
-def resume_command(agent: str | None, overrides: dict[str, str] | None = None) -> str | None:
-    agent = agent or LEGACY_AGENT
+def resume_command(agent: str, overrides: dict[str, str] | None = None) -> str | None:
     if overrides and agent in overrides:
         return overrides[agent]
     return AGENTS[agent].resume_command if agent in AGENTS else None
@@ -66,7 +63,7 @@ def manual_command(resume: dict | None) -> str | None:
     """`cd <cwd> && <agent> resume <session>`, for the GUI's "Copy resume command"."""
     if not resume:
         return None
-    a = AGENTS.get(resume.get("agent") or LEGACY_AGENT)
+    a = AGENTS.get(resume["agent"])
     if not a:
         return None
     cmd = a.manual_command.format(session=shlex.quote(resume["session_id"]))

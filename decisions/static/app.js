@@ -74,6 +74,23 @@ function ago(iso) {
   return new Date(iso).toLocaleDateString();
 }
 const fullTime = (iso) => iso ? new Date(iso).toLocaleString() : "";
+const whenTime = (iso) => new Date(iso).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+
+// Time left until an ISO timestamp, coarse: "3d 4h", "5h 12m", "12m" (negative = passed).
+function until(iso) {
+  const s = Math.max(0, (new Date(iso).getTime() - Date.now()) / 1000);
+  if (s >= 86400) return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+  if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.max(1, Math.floor(s / 60))}m`;
+}
+// How pressing an open decision's deadline is: "urgent" under 6h, "soon" under a day.
+function urgency(d) {
+  if (d.status !== "open" || !d.due_at) return "";
+  const s = (new Date(d.due_at).getTime() - Date.now()) / 1000;
+  return s < 6 * 3600 ? "urgent" : s < 86400 ? "soon" : "";
+}
+const closed = (d) => d.status === "cancelled" || d.status === "expired";
+const byDeadline = (a, b) => (a.due_at || "9999").localeCompare(b.due_at || "9999");
 
 let toastTimer;
 function toast(msg, { undo, error, undoLabel } = {}) {
@@ -248,7 +265,7 @@ function valueHtml(v, m) {
 
 async function loadList() {
   const all = (await api("GET", "/api/decisions?status=all&limit=500")).decisions;
-  S.counts = { open: 0, resolved: 0, cancelled: 0, all: all.length };
+  S.counts = { open: 0, resolved: 0, expired: 0, cancelled: 0, all: all.length };
   for (const d of all) S.counts[d.status]++;
   S.list = all;
   renderSidebar();
@@ -310,7 +327,7 @@ async function route() {
     S.d = null;
     renderSidebar();
     if (path === "/settings") return await renderSettings();
-    const first = S.list.find((d) => d.status === "open");
+    const first = S.list.filter((d) => d.status === "open").sort(byDeadline)[0];
     if (first) return navigate(`/d/${first.id}`, true);
     renderEmpty();
   } catch (e) {
@@ -321,24 +338,39 @@ async function route() {
 // ------------------------------------------------------------------ sidebar
 
 function renderSidebar() {
-  const tabs = ["open", "resolved", "cancelled", "all"];
+  const tabs = ["open", "resolved", "expired", "cancelled", "all"];
+  const names = { open: "Open", resolved: "Resolved", expired: "Expired", cancelled: "Cancelled", all: "All" };
   $("#status-tabs").innerHTML = tabs.map((t) =>
-    `<button class="tab ${S.status === t ? "active" : ""}" data-status="${t}">${t[0].toUpperCase() + t.slice(1)}<span class="n">${S.counts[t] ?? ""}</span></button>`).join("");
+    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && S.counts.open ? "has-open" : ""}" data-status="${t}">${names[t]}<span class="n">${S.counts[t] ?? ""}</span></button>`).join("");
+  const open = S.list.filter((d) => d.status === "open").sort(byDeadline);
+  document.title = (open.length ? `(${open.length}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : "Decisions");
+  $("#attention").innerHTML = open.length
+    ? `<a href="/d/${open[0].id}" data-nav class="attention ${urgency(open[0])}" title="Undecided decisions expire at their deadline, and the requester is told it wasn't important">
+        <strong>${open.length} decision${open.length > 1 ? "s" : ""} waiting on you</strong>
+        <span>${open[0].due_at ? `next expires in ${until(open[0].due_at)}: ${esc(open[0].id)}` : `oldest: ${esc(open[0].id)}`}</span></a>`
+    : `<div class="attention clear"><strong>Nothing to decide</strong></div>`;
   const q = S.q.toLowerCase();
-  const items = S.list.filter((d) => (S.status === "all" || d.status === S.status) &&
+  let items = S.list.filter((d) => (S.status === "all" || d.status === S.status) &&
     (!q || d.title.toLowerCase().includes(q) || d.id.toLowerCase().includes(q) || (d.source || "").toLowerCase().includes(q)));
+  // Most urgent first: open decisions by deadline, ahead of everything else.
+  items = [...items.filter((d) => d.status === "open").sort(byDeadline), ...items.filter((d) => d.status !== "open")];
   $("#decision-list").innerHTML = items.length ? items.map((d) => {
     const pending = Object.keys(d.pending_attribute_requests || {}).length;
-    return `<a href="/d/${d.id}" data-nav class="dl-item ${S.d && S.d.id === d.id ? "active" : ""}">
-      <div class="dl-top"><span class="dl-id">${d.id}</span><span class="dl-title">${esc(d.title)}</span></div>
+    const due = d.status === "open" && d.due_at;
+    const left = due ? Math.max(0, Math.min(1, (new Date(d.due_at) - Date.now()) / (new Date(d.due_at) - new Date(d.created_at)))) : 0;
+    return `<a href="/d/${d.id}" data-nav class="dl-item ${S.d && S.d.id === d.id ? "active" : ""} ${d.status} ${urgency(d)}">
+      <div class="dl-top"><span class="dl-id">${d.id}</span><span class="dl-title">${esc(d.title)}</span>
+        ${due ? `<span class="dl-due" title="Expires ${esc(fullTime(d.due_at))} unless decided">${until(d.due_at)}</span>` : ""}
+        ${d.status === "expired" ? `<span class="dl-due" title="Expired ${esc(fullTime(d.due_at))}: nobody decided in time">expired</span>` : ""}</div>
       <div class="dl-meta">
         ${d.source ? `<span>${esc(d.source)}</span>` : ""}
         <span>${d.option_count - d.excluded_count}/${d.option_count} options</span>
         ${pending ? `<span title="Waiting for requested attributes"><span class="dot"></span>attrs</span>` : ""}
         ${["pending", "failed"].includes(d.resume_state?.status) && d.status === "resolved" ? `<span title="The requesting agent hasn't been resumed" style="color:var(--bad)"><span class="dot" style="background:var(--bad)"></span>not resumed</span>` : ""}
         <span>${ago(d.created_at)}</span>
-      </div></a>`;
-  }).join("") : `<div class="muted small" style="padding:12px">No ${S.status === "all" ? "" : S.status} decisions.</div>`;
+      </div>
+      ${due ? `<div class="dl-time" title="Time left before it expires"><i style="width:${(left * 100).toFixed(1)}%"></i></div>` : ""}</a>`;
+  }).join("") : `<div class="muted small" style="padding:12px">No ${S.status === "all" ? "" : esc(names[S.status].toLowerCase())} decisions.</div>`;
 }
 
 // ------------------------------------------------------------------ empty / settings
@@ -346,7 +378,7 @@ function renderSidebar() {
 function renderEmpty() {
   const base = S.config?.base_url || location.origin;
   $("#main").innerHTML = `<div class="page"><div class="empty">
-    <h2 style="color:var(--text);margin-bottom:8px">No open decisions</h2>
+    <h2 style="color:var(--text);margin-bottom:8px">Nothing to decide</h2>
     <p>Agents and apps create decisions through the API. Try:</p>
 <pre>curl -X POST ${esc(base)}/api/decisions \\
   -H 'Content-Type: application/json' -H 'X-Actor: my-agent' \\
@@ -442,7 +474,6 @@ function webhookTable(hooks) {
 
 function renderDecision() {
   const d = S.d;
-  document.title = `${d.id} · ${d.title}`;
   if (d.status === "resolved" && d.resolution) return renderResolved(d);
   const u = ui();
   const parts = partition();
@@ -455,6 +486,7 @@ function renderDecision() {
   main.innerHTML = `<div class="page">
     ${headerHtml(d)}
     ${bannerHtml(d)}
+    <div id="deadline-card">${deadlineHtml(d)}</div>
     <div id="resume-card">${resumeHtml(d)}</div>
     <section class="block">
       <div class="block-head">
@@ -469,7 +501,7 @@ function renderDecision() {
         <div class="mini-opts">${filtered.map((o) => miniHtml(o, "filtered")).join("")}</div></details>` : ""}
       ${excluded.length ? `<details class="subtle-list" ${u.openExcluded ? "open" : ""} data-key="openExcluded"><summary>Excluded (${excluded.length})</summary>
         <div class="mini-opts">${excluded.map((o) => miniHtml(o, "excluded")).join("")}</div></details>` : ""}
-      ${d.options.length && d.status !== "cancelled" ? decideBarHtml(d, single) : ""}
+      ${d.options.length && !closed(d) ? decideBarHtml(d, single) : ""}
     </section>
     <div class="cols">
       <section class="block">${attrRequestHtml(d, metas)}</section>
@@ -564,7 +596,6 @@ function headerHtml(d) {
           <span class="chip status ${d.status}">${d.status}</span>
           ${d.source ? `<span>from <strong>${esc(d.source)}</strong></span>` : ""}
           <span title="${esc(fullTime(d.created_at))}">created ${ago(d.created_at)}</span>
-          ${d.due_at ? `<span title="${esc(fullTime(d.due_at))}">due ${esc(new Date(d.due_at).toLocaleString())}</span>` : ""}
           ${d.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}
         </div>
       </div>
@@ -585,8 +616,33 @@ function bannerHtml(d) {
       ${d.resolution.note ? `<div class="note">“${esc(d.resolution.note)}”</div>` : ""}</div>
       <span class="muted small">Change the selection below to revise.</span></div>`;
   }
-  if (d.status === "cancelled") return `<div class="banner cancelled"><div><strong style="color:var(--muted)">Cancelled.</strong> Reopen to decide after all.</div></div>`;
+  if (d.status === "cancelled") {
+    const ev = [...S.events].reverse().find((e) => e.type === "decision.cancelled");
+    return `<div class="banner cancelled"><div><strong style="color:var(--muted)">Cancelled${ev ? ` by ${esc(ev.actor)}` : ""}.</strong>
+      ${ev?.data.note ? `“${esc(ev.data.note)}” ` : ""}Reopen to decide after all.</div></div>`;
+  }
+  if (d.status === "expired") {
+    const days = S.config?.deadline_days;
+    return `<div class="banner expired"><div><strong>Expired unanswered</strong>${d.due_at ? ` <span title="${esc(fullTime(d.due_at))}">${ago(d.due_at)}</span>` : ""}.
+      Nobody decided before the deadline, so it was closed as not important enough to block on.
+      <div class="note">Reopen to decide after all${days ? `; that starts a new ${days}-day deadline` : ""}.</div></div>
+      <button class="btn small" data-action="reopen">Reopen</button></div>`;
+  }
   return "";
+}
+
+// Open decisions expire at their deadline. Keep the countdown and its consequence in plain view.
+function deadlineHtml(d) {
+  if (d.status !== "open" || !d.due_at) return "";
+  const who = esc(d.source || "the requester");
+  return `<div class="deadline ${urgency(d)}">
+    <div class="deadline-main"><span class="deadline-left">${until(d.due_at)}</span>
+      <div>left to decide, until <strong title="${esc(fullTime(d.due_at))}">${esc(whenTime(d.due_at))}</strong>.
+        <div class="small muted">If nobody decides by then, it expires and ${who} is told it wasn't important.</div></div></div>
+    <div class="deadline-actions">
+      <button class="btn small" data-action="extend" data-days="1" title="Move the deadline a day later">+1 day</button>
+      <button class="btn small" data-action="extend" data-days="${S.config?.deadline_days || 4}">+${S.config?.deadline_days || 4} days</button></div>
+  </div>`;
 }
 
 // Sessions are resumed by the resumer on the machine they ran on.
@@ -601,20 +657,21 @@ function resumeHtml(d) {
   const online = rs.online ? `<span class="live on"></span> resumer${where} online` : `<span class="live off"></span> resumer${where} <strong>offline</strong>${rs.last_seen ? ` (last seen ${ago(rs.last_seen)})` : ""}`;
   const copyBtn = `<button class="btn small" data-action="copy-resume">${d.resume_command ? "Copy resume command" : "Copy session ID"}</button>`;
   const stale = st && st.status === "pending" && (Date.now() - new Date(st.since).getTime() > 60000 || !rs.online);
+  const expired = st?.trigger === "decision.expired";
   let cls = "", body;
   switch (st?.status) {
     case "armed":
       cls = rs.online ? "" : "warn";
-      body = rs.online ? `When you decide, ${who} resumes automatically.`
+      body = rs.online ? `When you decide (or it expires), ${who} resumes automatically.`
                        : `${who} is waiting on this, but the resumer is offline, so it <strong>won't resume automatically</strong>. Start it with <code>decide resumer run</code> (or <code>install</code>), or resume it yourself after deciding.`;
       break;
     case "pending":
       cls = stale ? "bad" : "";
-      body = stale ? `<strong>Not resumed.</strong> ${who} hasn't been picked up${rs.online ? "" : " because the resumer is offline"}. Resume it yourself:`
-                   : `Resuming ${who}…`;
+      body = stale ? `<strong>Not resumed.</strong> ${who} hasn't been picked up${expired ? " to hear that this expired" : ""}${rs.online ? "" : " because the resumer is offline"}. Resume it yourself:`
+                   : expired ? `Telling ${who} it expired…` : `Resuming ${who}…`;
       break;
-    case "started": body = `Resumed ${who} ${ago(st.since)}; it's working now.`; break;
-    case "finished": cls = "ok"; body = `Resumed ${who} ${ago(st.since)}; it finished.`; break;
+    case "started": body = `Resumed ${who} ${ago(st.since)}${expired ? " to tell it this expired" : ""}; it's working now.`; break;
+    case "finished": cls = "ok"; body = `Resumed ${who} ${ago(st.since)}${expired ? " and told it this expired" : ""}; it finished.`; break;
     case "failed":
       cls = "bad";
       body = `<strong>Resume failed</strong> ${ago(st.since)}${st.detail?.exit_code != null ? ` (exit ${st.detail.exit_code})` : ""}${st.detail?.error ? `: ${esc(st.detail.error)}` : ""}. Resume it yourself:`;
@@ -768,7 +825,7 @@ function webhooksHtml(d) {
 
 const EVENT_ICONS = {
   "decision.created": "✦", "decision.updated": "✎", "decision.resolved": "✔", "decision.reopened": "↺",
-  "decision.cancelled": "⊘", "decision.commented": "❝", "options.added": "+", "options.updated": "✎",
+  "decision.cancelled": "⊘", "decision.expired": "⌛", "decision.commented": "❝", "options.added": "+", "options.updated": "✎",
   "option.removed": "−", "options.excluded": "✕", "options.included": "↺", "attributes.requested": "?",
   "attributes.request_cancelled": "⊘",
 };
@@ -779,9 +836,15 @@ function eventText(e) {
   const x = e.data;
   switch (e.type) {
     case "decision.created": return `created this decision with ${x.decision.options.length} options`;
-    case "decision.updated": return `updated ${Object.keys(x.changes).join(", ")}`;
+    case "decision.updated": {
+      const due = x.changes.due_at?.[1];
+      const rest = Object.keys(x.changes).filter((k) => k !== "due_at");
+      return [due ? `set the deadline to <strong title="${esc(fullTime(due))}">${esc(whenTime(due))}</strong>` : "",
+              rest.length ? `updated ${esc(rest.join(", "))}` : ""].filter(Boolean).join(", ");
+    }
     case "decision.resolved": return `${x.previous_status === "resolved" ? "changed the decision to" : "decided"} <strong>${esc(x.resolution.selected.map(label).join(", "))}</strong>${x.resolution.note ? ` — “${esc(x.resolution.note)}”` : ""}${x.resolution.filters ? `<div class="muted small">filters: ${esc(x.resolution.filters)}</div>` : ""}`;
-    case "decision.reopened": return `reopened${x.note ? ` — “${esc(x.note)}”` : ""}`;
+    case "decision.reopened": return `reopened${x.due_at ? ` with a new deadline, <span title="${esc(fullTime(x.due_at))}">${esc(whenTime(x.due_at))}</span>` : ""}${x.note ? ` — “${esc(x.note)}”` : ""}`;
+    case "decision.expired": return `expired it: nobody decided before the deadline`;
     case "decision.cancelled": return `cancelled${x.note ? ` — “${esc(x.note)}”` : ""}`;
     case "decision.commented": return `<div class="comment">${esc(x.text)}</div>`;
     case "options.added": return `added ${x.options.map((o) => `<strong>${esc(o.label)}</strong>`).join(", ")}`;
@@ -914,7 +977,7 @@ document.addEventListener("click", async (e) => {
   const d = S.d;
   if (!a) {
     const opt = e.target.closest("[data-option]");
-    if (opt && d && d.status !== "cancelled") toggleSelect(opt.dataset.option);
+    if (opt && d && !closed(d)) toggleSelect(opt.dataset.option);
     return;
   }
   e.stopPropagation();
@@ -950,6 +1013,11 @@ document.addEventListener("click", async (e) => {
       if (note === null) return;
       return act(() => api("POST", `/api/decisions/${d.id}/cancel`, { note }), "Cancelled");
     }
+    case "extend": {
+      const from = Math.max(Date.now(), new Date(d.due_at || 0).getTime());
+      const due = new Date(from + Number(a.dataset.days) * 86400000).toISOString();
+      return act(() => api("PATCH", `/api/decisions/${d.id}`, { due_at: due }), `Deadline moved to ${whenTime(due)}`);
+    }
     case "edit": S.editing = true; return renderDecision();
     case "cancel-edit": S.editing = false; return renderDecision();
     case "copy-install": copy(installCommand(S.config), "install command"); return;
@@ -977,7 +1045,7 @@ document.addEventListener("click", async (e) => {
 
 function markResumed() {
   const d = S.d;
-  return act(() => api("POST", `/api/decisions/${d.id}/resume-events`, { status: "manual", resolution_seq: d.resume_state?.resolution_seq }), "Marked as resumed");
+  return act(() => api("POST", `/api/decisions/${d.id}/resume-events`, { status: "manual", trigger_seq: d.resume_state?.trigger_seq }), "Marked as resumed");
 }
 
 async function resolve() {
@@ -990,7 +1058,7 @@ async function resolve() {
 }
 
 document.addEventListener("keydown", (e) => {
-  if (!S.d || S.editing || S.d.status === "resolved") return;
+  if (!S.d || S.editing || S.d.status === "resolved" || closed(S.d)) return;
   const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
     const btn = $('[data-action="resolve"]');
@@ -1020,6 +1088,14 @@ setInterval(async () => {
     if (card) card.innerHTML = resumeHtml(S.d);
   } catch {}
 }, 5000);
+
+// Countdowns tick without waiting for an event.
+setInterval(() => {
+  if (document.hidden) return;
+  renderSidebar();
+  const card = $("#deadline-card");
+  if (card && S.d) card.innerHTML = deadlineHtml(S.d);
+}, 30000);
 
 $("#search").addEventListener("input", (e) => { S.q = e.target.value; renderSidebar(); });
 window.addEventListener("popstate", route);

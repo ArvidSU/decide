@@ -171,7 +171,7 @@ class Handler(BaseHTTPRequestHandler):
     def config(self):
         c = self.cfg
         return {"base_url": c.public_url, "owner": c.owner, "auth": bool(c.token), "version": __version__,
-                "callback_host": c.callback_host or None,
+                "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
                 "default_webhook_events": DEFAULT_WEBHOOK_EVENTS, "cursor": self.store.cursor(),
                 "webhook": {"timeout": c.webhook_timeout, "max_attempts": c.webhook_max_attempts,
@@ -225,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
         after = g("after")
         return self.store.wait_decision(
-            did, _types(self.qs, ["decision.resolved", "decision.cancelled"]),
+            did, _types(self.qs, ["decision.resolved", "decision.cancelled", "decision.expired"]),
             int(after) if after not in (None, "") else None,
             min(float(g("timeout", 60)), MAX_WAIT), self.actor)
 

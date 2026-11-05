@@ -16,6 +16,9 @@ def decision_markdown(d: dict) -> str:
     if d["source"]:
         meta.append(f"**Source:** {d['source']}")
     meta.append(f"**Created:** {d['created_at'][:16].replace('T', ' ')} UTC")
+    if d.get("due_at") and d["status"] in ("open", "expired"):
+        label = "Expires" if d["status"] == "open" else "Expired"
+        meta.append(f"**{label}:** {d['due_at'][:16].replace('T', ' ')} UTC")
     lines += [" · ".join(meta), ""]
     if d["context"]:
         lines += [d["context"].strip(), ""]

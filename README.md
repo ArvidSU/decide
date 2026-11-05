@@ -18,7 +18,8 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 
 | | |
 |---|---|
-| **Decision** | `D-12`: title, context (markdown), source, options, `min_select`/`max_select` (default: pick exactly one; `"max_select": null` = any number), links, tags, metadata. Status `open` → `resolved` / `cancelled`. Nothing is locked: you can edit, re-resolve or reopen at any time; every change is logged. |
+| **Decision** | `D-12`: title, context (markdown), source, options, `min_select`/`max_select` (default: pick exactly one; `"max_select": null` = any number), links, tags, metadata, `due_at`. Status `open` → `resolved` / `cancelled` / `expired`. Nothing is locked: you can edit, re-resolve or reopen at any time; every change is logged. |
+| **Deadline** | Every open decision has a `due_at`, by default 4 days after it's created (`deadline_days`). If nobody decides by then, it **expires**: status `expired`, event `decision.expired` (actor `deadline`). That's distinct from `cancelled`, which someone does on purpose. If nobody took action, it wasn't very important. Its waiters, webhooks and resumer are notified, the same as for a resolution. Extend it with `PATCH {"due_at": …}` or the GUI's +1 day / +4 days. Reopening an expired decision starts a new deadline. |
 | **Option** | `label`, `description`, `url`, `image`, `attributes` (any JSON). The ID is yours (e.g. a SKU) or auto-assigned (`1`, `2`, …). |
 | **Attribute defs** | Optional hints per attribute key: `label`, `type` (`number`/`boolean`/`enum`/`tags`/`text`/`url`), `unit`, `better` (`lower`/`higher`), `description`. Without them the GUI infers types from the values. |
 | **Attribute request** | You ask for a new attribute in the GUI. The decision's `pending_attribute_requests` lists which options are missing it, and an `attributes.requested` webhook fires. The requester PATCHes the values in. |
@@ -30,7 +31,8 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 
 ## GUI
 
-* Sidebar: Open / Resolved / Cancelled, search.
+* Sidebar: what's waiting on you and when the next one expires, then Open (most urgent first, with a countdown) / Resolved / Expired / Cancelled, search. The tab title shows the open count.
+* Open decisions show how long is left and what happens at the deadline. The card turns amber under a day and red under 6 hours.
 * Per-attribute filters: number ranges, yes/no, value chips, text contains, plus free-text search. "Keep options with unknown values" stops best-effort gaps from hiding options.
 * Best value per attribute is highlighted when `better` is set. Click column headers to sort. Table or card view (cards when options have images).
 * Keyboard: `j`/`k` move, `space` select, `x` rule out, `/` search, `⌘/Ctrl+Enter` decide. Alt-click ✕ to give a reason. Undo is offered after every exclusion.
@@ -43,8 +45,8 @@ Base: `http://127.0.0.1:8787/api`. JSON in and out. Send `X-Actor: <name>` so th
 
 | Method & path | |
 |---|---|
-| `POST /decisions` | Create. Body: `title`, `context`, `source`, `options[]`, `attributes{}`, `min_select`, `max_select`, `links[]`, `tags[]`, `metadata{}`, `due_at`, `idempotency_key`, `webhooks[]`. Returns 201, or 200 with the existing decision if `idempotency_key` matches. |
-| `GET /decisions?status=open&q=&tag=&source=` | List |
+| `POST /decisions` | Create. Body: `title`, `context`, `source`, `options[]`, `attributes{}`, `min_select`, `max_select`, `links[]`, `tags[]`, `metadata{}`, `due_at` (ISO 8601; default now + `deadline_days`), `idempotency_key`, `webhooks[]`. Returns 201, or 200 with the existing decision if `idempotency_key` matches. |
+| `GET /decisions?status=open&q=&tag=&source=` | List (`status`: `open`, `resolved`, `cancelled`, `expired`, `all`) |
 | `GET /decisions/{id}` | Full decision incl. options, resolution, `selected_options`, `pending_attribute_requests` |
 | `PATCH /decisions/{id}` | Edit any field (`metadata` merges; `null` removes a key) |
 | `GET /decisions/{id}/markdown` | Markdown summary |
@@ -55,7 +57,7 @@ Base: `http://127.0.0.1:8787/api`. JSON in and out. Send `X-Actor: <name>` so th
 | `POST /decisions/{id}/attribute-requests` | `{key, description}` (normally done from the GUI) |
 | `POST /decisions/{id}/resolve` | `{selected: [ids], note?}` |
 | `POST /decisions/{id}/reopen` · `/cancel` · `/comments` | |
-| `GET /decisions/{id}/wait?timeout=60&types=…&after=…` | Long-poll until resolved/cancelled (or other event types). Returns immediately if already resolved. |
+| `GET /decisions/{id}/wait?timeout=60&types=…&after=…` | Long-poll until resolved/cancelled/expired (or other event types). Returns immediately if already in one of those states. |
 | `GET /decisions/{id}/events` · `GET /events?after=N&wait=30` | Event log; the global feed can be long-polled instead of using webhooks |
 | `GET /events/verify` | Verify the hash chain |
 | `POST /decisions/{id}/webhooks` · `GET/POST /webhooks` · `PATCH/DELETE /webhooks/{id}` | Per-decision or global subscriptions |
@@ -64,7 +66,7 @@ Base: `http://127.0.0.1:8787/api`. JSON in and out. Send `X-Actor: <name>` so th
 
 ### Webhooks
 
-Subscription: `{url, secret?, events?, require_ack?, max_attempts?, refire_interval?}`. Default events: `decision.resolved`, `decision.reopened`, `decision.cancelled`, `attributes.requested`. Use `["*"]` or `["decision.*"]` for more. If you omit `secret`, one is generated; it is returned only in the creating response.
+Subscription: `{url, secret?, events?, require_ack?, max_attempts?, refire_interval?}`. Default events: `decision.resolved`, `decision.reopened`, `decision.cancelled`, `decision.expired`, `attributes.requested`. Use `["*"]` or `["decision.*"]` for more. If you omit `secret`, one is generated; it is returned only in the creating response.
 
 ```http
 POST <your url>
@@ -87,7 +89,7 @@ Decisions are async. There are three ways to act when one is made:
 **1. Block during a session (long-poll, no inbound port):**
 ```sh
 decide wait D-12 --timeout 3600   # exit 0 when a watched event happens (first line names it) · 124 timeout · 1 error
-decide wait D-12 --on decision.resolved,attributes.requested   # also wake for attribute requests
+decide wait D-12 --on decision.resolved,decision.expired,attributes.requested   # also wake for attribute requests
 ```
 Agents that can run commands in the background (e.g. Claude Code's `run_in_background`) are re-invoked when it exits, so they can keep working meanwhile.
 
@@ -100,7 +102,7 @@ decide watch D-12 --exec '…'      # …or runs a command (see below) and exits
 
 **3. Resume a session days later, after it has ended (the "walk away for the weekend" path):**
 
-Decisions can carry a **resume target**: `"resume": {"session_id", "cwd", "agent", "prompt"?}`. `decide create` fills it in automatically when it runs inside a supported agent, from the agent's session env var and the current directory (`--no-resume` to opt out). Agents don't need to start anything.
+Decisions can carry a **resume target**: `"resume": {"session_id", "agent", "machine", "cwd", "prompt"?}`. `decide create` fills it in automatically when it runs inside a supported agent, from the agent's session env var and the current directory (`--no-resume` to opt out). Agents don't need to start anything.
 
 | Agent | Detected from | Resumed with |
 |---|---|---|
@@ -115,7 +117,7 @@ You install the **resumer** once:
 decide resumer install     # launchd (macOS) / systemd --user (Linux): starts at login, restarted if it dies
 decide resumer status      # online? (exit 1 if not)
 ```
-When a decision with a resume target is resolved, the resumer runs that agent's resume command (above) in the session's `cwd`. Replace or add one with `--agent-command NAME='…'` (repeatable), or use a single `--command` for every agent. Commands get `RESUME_SESSION_ID`, `RESUME_PROMPT`, `RESUME_CWD`, `RESUME_AGENT` and the `DECISION_*` env vars. A decision whose agent has no command is marked `resume.failed`, so the GUI shows it wasn't resumed. The session can't prompt for permissions, so you decide here, not the agent, what a resumed session is allowed to do. Each step is logged as `resume.started` / `resume.finished` / `resume.failed`, and the output is kept in `~/.local/state/decisions/resume-logs/`.
+When a decision with a resume target is resolved, or expires undecided, the resumer runs that agent's resume command (above) in the session's `cwd`. Replace or add one with `--agent-command NAME='…'` (repeatable), or use a single `--command` for every agent. Commands get `RESUME_SESSION_ID`, `RESUME_PROMPT`, `RESUME_CWD`, `RESUME_AGENT` and the `DECISION_*` env vars. An expired decision's prompt tells the agent nobody decided in time, so it should carry on with its own judgement or drop that part (`--no-expired` on `resumer run`/`install` turns this off). A decision whose agent has no command is marked `resume.failed`, so the GUI shows it wasn't resumed. The session can't prompt for permissions, so you decide here, not the agent, what a resumed session is allowed to do. Each step is logged as `resume.started` / `resume.finished` / `resume.failed`, and the output is kept in `~/.local/state/decisions/resume-logs/`.
 
 It's built to be hard to miss:
 * **Nothing is lost while it's down.** It reads the event feed from a persisted cursor, so decisions resolved while it (or the laptop) was off are resumed when it comes back, up to `--max-age-days`, default 14.
@@ -172,6 +174,7 @@ token = ""                 # set to require Authorization: Bearer <token>
 base_url = ""              # public URL for links/ack_url if behind a proxy/tunnel
 owner = "me"               # actor name for GUI actions
 callback_host = ""         # how the server reaches its own machine for webhooks (Docker: host.docker.internal)
+deadline_days = 4          # undecided decisions expire this long after creation (0 = only if they set due_at)
 
 [webhook]
 timeout = 10

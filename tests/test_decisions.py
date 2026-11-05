@@ -415,7 +415,7 @@ class DecisionsTest(unittest.TestCase):
         env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT, "DECISIONS_MACHINE": "laptop",
                             "DECISIONS_STATE_DIR": os.path.join(self.tmp, "state")}
         mk = lambda machine: self.call("POST", "/api/decisions", {"title": machine, "options": ["A"], "resume": {
-            "session_id": f"s-{machine}", "cwd": self.tmp, "machine": machine}}, expect=201)["id"]
+            "session_id": f"s-{machine}", "cwd": self.tmp, "agent": "claude-code", "machine": machine}}, expect=201)["id"]
         mine, theirs = mk("laptop"), mk("desktop")
         resumer = subprocess.Popen([sys.executable, "-m", "decisions", "resumer", "run", "--command",
                                     f'echo "$RESUME_SESSION_ID" >> {out}'],
@@ -437,6 +437,93 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual(open(out).read().split(), ["s-laptop"])
         self.assertEqual(self.call("GET", f"/api/decisions/{theirs}")["resume_state"]["status"], "pending")
         self.assertEqual([r["machine"] for r in self.call("GET", "/api/resumer")["resumers"]], ["laptop"])
+
+    # ---------------------------------------------------------------- deadlines
+
+    def past(self, seconds=1):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
+
+    def test_decisions_get_a_default_deadline(self):
+        d = self.create()
+        due = time.mktime(time.strptime(d["due_at"][:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        self.assertAlmostEqual(due - time.time(), 4 * 86400, delta=60)
+        own = self.create(due_at="2030-01-02T03:04:05+02:00")
+        self.assertEqual(own["due_at"], "2030-01-02T01:04:05.000Z")
+        self.call("POST", "/api/decisions", {"title": "x", "due_at": "friday"}, expect=400)
+        self.call("PATCH", f"/api/decisions/{d['id']}", {"due_at": None}, expect=400)
+        self.assertIn("Expires:", self.call("GET", f"/api/decisions/{d['id']}/markdown"))
+
+    def test_expiry_is_distinct_from_cancelling_and_notifies(self):
+        rx = Receiver()
+        self.call("POST", "/api/webhooks", {"url": rx.url}, expect=201)  # default events
+        overdue, cancelled, later = self.create(), self.create(), self.create()
+        self.call("POST", f"/api/decisions/{cancelled['id']}/cancel", {"note": "moot"}, actor="me")
+        res = {}
+        waiter = threading.Thread(target=lambda: res.update(
+            self.call("GET", f"/api/decisions/{overdue['id']}/wait?timeout=10")))
+        waiter.start()
+        time.sleep(0.2)
+        self.call("PATCH", f"/api/decisions/{overdue['id']}", {"due_at": self.past()})
+        self.assertEqual(self.store.expire_due(), [overdue["id"]])
+        waiter.join(10)
+        self.assertEqual(res["event"]["type"], "decision.expired")
+        self.assertEqual(res["event"]["actor"], "deadline")
+        statuses = {d["id"]: d["status"] for d in self.call("GET", "/api/decisions?status=all")["decisions"]}
+        self.assertEqual([statuses[x["id"]] for x in (overdue, cancelled, later)], ["expired", "cancelled", "open"])
+        self.assertEqual([d["id"] for d in self.call("GET", "/api/decisions?status=expired")["decisions"]],
+                         [overdue["id"]])
+        self.assertTrue(rx.wait_for(2))
+        types = sorted(json.loads(b)["event"]["type"] for _, b in rx.received)
+        self.assertEqual(types, ["decision.cancelled", "decision.expired"])
+        # Only open decisions expire, and only once.
+        self.assertEqual(self.store.expire_due(), [])
+        # A webhook registered later still hears about it.
+        rx2 = Receiver()
+        self.call("POST", f"/api/decisions/{overdue['id']}/webhooks", {"url": rx2.url}, expect=201)
+        self.assertTrue(rx2.wait_for(1))
+        self.assertEqual(json.loads(rx2.received[0][1])["event"]["type"], "decision.expired")
+
+    def test_dispatcher_expires_in_the_background_and_reopen_restarts_the_deadline(self):
+        self.dispatcher.expire_interval = 0.05
+        d = self.create(due_at=self.past())
+        deadline = time.time() + 5
+        while self.call("GET", f"/api/decisions/{d['id']}")["status"] != "expired" and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.call("GET", f"/api/decisions/{d['id']}")["status"], "expired")
+        r = self.call("POST", f"/api/decisions/{d['id']}/reopen", {}, actor="me")
+        self.assertEqual(r["status"], "open")
+        self.assertGreater(r["due_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3 * 86400)))
+        time.sleep(0.3)
+        self.assertEqual(self.call("GET", f"/api/decisions/{d['id']}")["status"], "open")
+
+    def test_resumer_resumes_expired_decisions(self):
+        state = os.path.join(self.tmp, "state")
+        out = os.path.join(self.tmp, "resumed.txt")
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT, "DECISIONS_STATE_DIR": state,
+                            "CLAUDE_CODE_SESSION_ID": "sess-x"}
+        run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,
+                                        capture_output=True, text=True)
+        did = run("create", "--title", "Nobody cares", "-o", "A", "--due", "2h", "-q").stdout.strip()
+        self.assertIn("expires in 1h 5", run("get", did).stdout)
+        resumer = subprocess.Popen(
+            [sys.executable, "-m", "decisions", "resumer", "run", "--command",
+             f'echo "$DECISION_EVENT|$RESUME_PROMPT" >> {out}'],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            resumer.stdout.readline()
+            self.call("PATCH", f"/api/decisions/{did}", {"due_at": self.past()})
+            self.store.expire_due()
+            deadline = time.time() + 10
+            while self.call("GET", f"/api/decisions/{did}")["resume_state"]["status"] != "finished" \
+                    and time.time() < deadline:
+                time.sleep(0.1)
+            st = self.call("GET", f"/api/decisions/{did}")["resume_state"]
+            self.assertEqual((st["status"], st["trigger"]), ("finished", "decision.expired"))
+        finally:
+            resumer.terminate(); resumer.wait()
+        line = open(out).read()
+        self.assertTrue(line.startswith("decision.expired|[decisions] "))
+        self.assertIn("expired", line)
 
 
 class RemoteTest(unittest.TestCase):

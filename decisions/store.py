@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .agents import manual_command
 from .config import Config
@@ -133,9 +133,16 @@ DEFAULT_WEBHOOK_EVENTS = [
     "decision.resolved",
     "decision.reopened",
     "decision.cancelled",
+    "decision.expired",
     "attributes.requested",
 ]
-STATUSES = ("open", "resolved", "cancelled")
+STATUSES = ("open", "resolved", "cancelled", "expired")
+# The event that put a decision in each closed status. `expired` = nobody decided before due_at;
+# `cancelled` = somebody closed it on purpose.
+TERMINAL_EVENTS = {"resolved": "decision.resolved", "cancelled": "decision.cancelled", "expired": "decision.expired"}
+# Events that wake the requesting agent's session (via the resumer).
+RESUME_TRIGGERS = {"resolved": "decision.resolved", "expired": "decision.expired"}
+DEADLINE_ACTOR = "deadline"
 GENESIS = "0" * 64
 
 
@@ -147,7 +154,29 @@ class ApiError(Exception):
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return iso(datetime.now(timezone.utc))
+
+
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def parse_ts(value) -> datetime | None:
+    """ISO 8601 timestamp as an aware datetime (naive = UTC), or None if it isn't one."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _due_at(value) -> str:
+    dt = parse_ts(value)
+    if dt is None:
+        raise ApiError(400, "due_at must be an ISO 8601 timestamp, e.g. 2026-11-09T17:00:00Z")
+    return iso(dt)
 
 
 def canonical(value) -> str:
@@ -200,9 +229,10 @@ def _resume(value) -> dict | None:
     """How to pick the requesting agent back up once the decision is made."""
     if value is None:
         return None
-    if not isinstance(value, dict) or not isinstance(value.get("session_id"), str) or not value["session_id"].strip():
-        raise ApiError(400, "resume must be an object with a 'session_id' (and usually 'cwd')")
-    for k in ("cwd", "agent", "prompt", "machine"):
+    required = ("session_id", "agent", "machine")
+    if not isinstance(value, dict) or not all(isinstance(value.get(k), str) and value[k].strip() for k in required):
+        raise ApiError(400, "resume must be an object with 'session_id', 'agent' and 'machine' (and usually 'cwd')")
+    for k in ("cwd", "prompt"):
         if k in value and not isinstance(value[k], str):
             raise ApiError(400, f"resume.{k} must be a string")
     return {k: value[k] for k in ("session_id", "cwd", "agent", "prompt", "machine") if k in value}
@@ -221,17 +251,16 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
-        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(options)")}
-        if "attribute_meta" not in cols:  # migrate databases created before attribute_meta existed
-            self.conn.execute("ALTER TABLE options ADD COLUMN attribute_meta TEXT NOT NULL DEFAULT '{}'")
-        if "resume" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(decisions)")}:
-            self.conn.execute("ALTER TABLE decisions ADD COLUMN resume TEXT")
         # Last heartbeat per machine from resumer daemons (`decide resumer run`). In memory only.
         self.resumers: dict[str, dict] = {}
         # Who is long-polling which decision right now: (decision, actor, types) -> info. In memory only.
         self.waiters: dict[tuple, dict] = {}
 
     # ------------------------------------------------------------------ plumbing
+
+    def default_due_at(self) -> str | None:
+        days = self.cfg.deadline_days
+        return iso(datetime.now(timezone.utc) + timedelta(days=days)) if days > 0 else None
 
     @contextmanager
     def tx(self):
@@ -312,7 +341,7 @@ class Store:
     def _replay_terminal(self, sub_id: str, decision_id: str):
         """A webhook registered after the decision was already made still hears about it."""
         row = self._decision_row(decision_id)
-        terminal = {"resolved": "decision.resolved", "cancelled": "decision.cancelled"}.get(row["status"])
+        terminal = TERMINAL_EVENTS.get(row["status"])
         sub = self.conn.execute("SELECT * FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
         if not terminal or not event_matches(json.loads(sub["events"]), terminal):
             return
@@ -390,18 +419,19 @@ class Store:
         return out
 
     def _resume_state(self, did: str, row) -> dict | None:
-        """Where the requester's resumption stands for the latest resolution."""
+        """Where the requester's resumption stands for the latest resolution (or expiry)."""
         if not row["resume"]:
             return None
-        res = self.conn.execute(
-            "SELECT seq, ts FROM events WHERE decision_id=? AND type='decision.resolved' ORDER BY seq DESC LIMIT 1",
-            (did,)).fetchone()
-        if row["status"] != "resolved" or not res:
+        trigger = RESUME_TRIGGERS.get(row["status"])
+        res = trigger and self.conn.execute(
+            "SELECT seq, ts FROM events WHERE decision_id=? AND type=? ORDER BY seq DESC LIMIT 1",
+            (did, trigger)).fetchone()
+        if not res:
             return {"status": "armed"}
         ev = self.conn.execute(
             "SELECT * FROM events WHERE decision_id=? AND type LIKE 'resume.%' AND seq>? ORDER BY seq DESC LIMIT 1",
             (did, res["seq"])).fetchone()
-        state = {"status": "pending", "resolution_seq": res["seq"], "since": res["ts"]}
+        state = {"status": "pending", "trigger": trigger, "trigger_seq": res["seq"], "since": res["ts"]}
         if ev:
             state |= {"status": ev["type"].split(".", 1)[1], "since": ev["ts"], "actor": ev["actor"],
                       "detail": json.loads(ev["data"])}
@@ -451,7 +481,8 @@ class Store:
                 (did, num, title, _opt_type(body, "context", str, ""),
                  _opt_type(body, "source", str, actor), min_select, max_select, canonical(defs),
                  canonical(_links(body.get("links"))), canonical(_opt_type(body, "tags", list, [])),
-                 canonical(_opt_type(body, "metadata", dict, {})), _opt_type(body, "due_at", str),
+                 canonical(_opt_type(body, "metadata", dict, {})),
+                 _due_at(body["due_at"]) if body.get("due_at") is not None else self.default_due_at(),
                  key, ts, ts, canonical(r) if (r := _resume(body.get("resume"))) else None),
             )
             self._insert_options(did, _opt_type(body, "options", list, []))
@@ -526,6 +557,10 @@ class Store:
                     val = _opt_type(body, field, kinds)
                     if field == "title" and not (val or "").strip():
                         raise ApiError(400, "title cannot be empty")
+                    if field == "due_at":
+                        if val is None and self.cfg.deadline_days > 0:
+                            raise ApiError(400, "decisions can't go without a deadline; set a later due_at instead")
+                        val = None if val is None else _due_at(val)
                     if val != row[field]:
                         changes[field] = [row[field], val]
                         sets[field] = val
@@ -613,12 +648,36 @@ class Store:
         with self.tx():
             row = self._decision_row(did)
             previous = json.loads(row["resolution"]) if row["resolution"] else None
+            data = {"note": note, "previous_status": row["status"], "previous_resolution": previous}
+            due_at = row["due_at"]
+            if status == "open":
+                # Reopening restarts a passed (or missing) deadline; otherwise it would expire again at once.
+                due = parse_ts(due_at)
+                if (due is None and self.cfg.deadline_days > 0) or (due and due <= datetime.now(timezone.utc)):
+                    due_at = data["due_at"] = self.default_due_at()
             self.conn.execute(
-                "UPDATE decisions SET status=?, resolution=NULL, resolved_at=NULL, updated_at=? WHERE id=?",
-                (status, now_iso(), did))
-            self._event(did, etype, actor,
-                        {"note": note, "previous_status": row["status"], "previous_resolution": previous})
+                "UPDATE decisions SET status=?, resolution=NULL, resolved_at=NULL, due_at=?, updated_at=? WHERE id=?",
+                (status, due_at, now_iso(), did))
+            self._event(did, etype, actor, data)
             return self._decision_dict(did)
+
+    def expire_due(self) -> list[str]:
+        """Close every open decision whose deadline has passed as `expired` (not `cancelled`):
+        nobody decided in time, so it wasn't important enough. Its listeners and resumer are notified."""
+        now = datetime.now(timezone.utc)
+        expired = []
+        with self.tx():
+            for row in self.conn.execute(
+                    "SELECT id, due_at FROM decisions WHERE status='open' AND due_at IS NOT NULL").fetchall():
+                due = parse_ts(row["due_at"])
+                if due is None or due > now:
+                    continue
+                self.conn.execute("UPDATE decisions SET status='expired', updated_at=? WHERE id=?",
+                                  (now_iso(), row["id"]))
+                self._event(row["id"], "decision.expired", DEADLINE_ACTOR,
+                            {"due_at": row["due_at"], "previous_status": "open"})
+                expired.append(row["id"])
+        return expired
 
     def comment(self, raw_id: str, body: dict, actor: str) -> dict:
         did = norm_id(raw_id)
@@ -935,7 +994,7 @@ class Store:
             d = self._decision_dict(did)
             if after is None:
                 # Already in a terminal state the caller cares about? Return immediately.
-                terminal = {"resolved": "decision.resolved", "cancelled": "decision.cancelled"}.get(d["status"])
+                terminal = TERMINAL_EVENTS.get(d["status"])
                 if terminal and event_matches(types, terminal):
                     ev = self.q1("SELECT * FROM events WHERE decision_id=? AND type=? ORDER BY seq DESC LIMIT 1",
                                  did, terminal)

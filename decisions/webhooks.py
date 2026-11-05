@@ -1,4 +1,4 @@
-"""Background dispatcher that delivers, retries and re-fires webhooks."""
+"""Background dispatcher that delivers, retries and re-fires webhooks, and expires overdue decisions."""
 from __future__ import annotations
 
 import hashlib
@@ -23,10 +23,12 @@ def verify(secret: str, body: bytes, header: str | None) -> bool:
 
 
 class Dispatcher(threading.Thread):
-    def __init__(self, store: Store, workers: int = 4, poll_interval: float = 0.5):
+    def __init__(self, store: Store, workers: int = 4, poll_interval: float = 0.5, expire_interval: float = 15):
         super().__init__(daemon=True, name="webhook-dispatcher")
         self.store = store
         self.poll_interval = poll_interval
+        self.expire_interval = expire_interval
+        self.last_expiry = 0.0
         self.stopping = threading.Event()
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="webhook")
         self.in_flight: set[str] = set()
@@ -39,6 +41,11 @@ class Dispatcher(threading.Thread):
     def run(self):
         while not self.stopping.is_set():
             try:
+                # Expiring fans out its own webhook deliveries, so do it before picking up due ones.
+                if time.monotonic() - self.last_expiry >= self.expire_interval:
+                    self.last_expiry = time.monotonic()
+                    for did in self.store.expire_due():
+                        print(f"[deadline] {did} expired: nobody decided before its due_at", flush=True)
                 for delivery in self.store.due_deliveries():
                     with self.in_flight_lock:
                         if delivery["id"] in self.in_flight:

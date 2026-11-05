@@ -10,6 +10,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -18,7 +19,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from datetime import datetime
+from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -87,9 +88,25 @@ def _print(obj):
     print(json.dumps(obj, indent=2, ensure_ascii=False))
 
 
+def _until(iso: str) -> str:
+    """'in 3d 4h' / '2h ago' for an ISO timestamp."""
+    try:
+        s = datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() - time.time()
+    except ValueError:
+        return iso
+    a = abs(s)
+    text = (f"{int(a // 86400)}d {int(a % 86400 // 3600)}h" if a >= 86400 else
+            f"{int(a // 3600)}h {int(a % 3600 // 60)}m" if a >= 3600 else f"{int(a // 60)}m")
+    return f"in {text}" if s >= 0 else f"{text} ago"
+
+
 def _summary(d: dict) -> str:
     by_id = {o["id"]: o for o in d["options"]}
     lines = [f"{d['id']}  [{d['status']}]  {d['title']}", f"  {d['url']}"]
+    if d.get("due_at") and d["status"] == "open":
+        lines.append(f"  expires {_until(d['due_at'])} ({d['due_at']}) unless decided")
+    elif d["status"] == "expired":
+        lines.append(f"  expired {_until(d['due_at']) if d.get('due_at') else ''}: nobody decided before the deadline")
     if d.get("resolution"):
         r = d["resolution"]
         chosen = ", ".join(f"{s}: {by_id[s]['label']}" if s in by_id else s for s in r["selected"])
@@ -188,6 +205,8 @@ def cmd_create(args):
         body.setdefault("webhooks", []).append({"url": args.webhook, **({"require_ack": True} if args.require_ack else {})})
     if args.meta:
         body.setdefault("metadata", {}).update(dict(m.split("=", 1) for m in args.meta))
+    if args.due:
+        body["due_at"] = _parse_due(args.due)
     # Inside an agent session, remember how to resume it once the decision is made.
     detected = (args.agent or agents.detect_agent() or "agent", args.session) if args.session \
         else agents.detect_session()
@@ -199,6 +218,16 @@ def cmd_create(args):
         print(d["id"])
     else:
         _print(d)
+
+
+def _parse_due(raw: str) -> str:
+    """'36h', '2d', '90m', '1w' from now, or an ISO timestamp as is."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([mhdw])\s*", raw)
+    if not m:
+        return raw
+    seconds = float(m.group(1)) * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+    return datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z")
 
 
 def cmd_get(args):
@@ -214,7 +243,8 @@ def cmd_get(args):
 def cmd_list(args):
     for d in Client().call("GET", f"/api/decisions?status={args.status}&limit={args.limit}")["decisions"]:
         pending = " (attributes requested)" if d["pending_attribute_requests"] else ""
-        print(f"{d['id']:>7}  {d['status']:<9} {d['title']}{pending}")
+        due = f"  [expires {_until(d['due_at'])}]" if d.get("due_at") and d["status"] == "open" else ""
+        print(f"{d['id']:>7}  {d['status']:<9} {d['title']}{pending}{due}")
 
 
 def cmd_wait(args):
@@ -447,9 +477,15 @@ SERVER_SERVICE = "com.decisions.server"
 
 
 def _resume_prompt(d: dict) -> str:
+    instruction = d["resume"].get("prompt") or "Continue the task that was waiting on this decision."
+    if d["status"] == "expired":
+        return (f'[decisions] {d["id"]} "{d["title"]}" expired: the user didn\'t decide before its deadline '
+                f'({d.get("due_at")}), so it was closed unanswered. Treat it as not important enough to block on: '
+                f'continue without it, using your own best judgement where the task needs an answer (or drop '
+                f'that part), and say in your final message what you chose and why. {instruction} '
+                f'Full details: `decide get {d["id"]} --json`.')
     r = d["resolution"]
     labels = "; ".join(o["label"] for o in d["selected_options"]) or "(nothing)"
-    instruction = d["resume"].get("prompt") or "Continue the task that was waiting on this decision."
     return (f'[decisions] {d["id"]} "{d["title"]}" was resolved by {r["resolved_by"]}: {labels}. '
             f'Note: {r.get("note") or "(none)"}. {instruction} '
             f'Full details: `decide get {d["id"]} --json`.')
@@ -468,19 +504,20 @@ def _agent_commands(args) -> dict[str, str]:
 
 def _resume_one(client: Client, d: dict, command: str | None, log_dir: str):
     state = d["resume_state"]
-    seq = state["resolution_seq"]
+    seq = state["trigger_seq"]
     cwd = d["resume"].get("cwd") or os.path.expanduser("~")
-    agent = d["resume"].get("agent") or agents.LEGACY_AGENT
+    agent = d["resume"]["agent"]
     error = (f"cwd does not exist: {cwd}" if not os.path.isdir(cwd) else
              f"no resume command for agent {agent!r}; give the resumer --agent-command {agent}=..."
              if not command else None)
     if error:
         client.call("POST", f"/api/decisions/{d['id']}/resume-events",
-                    {"status": "failed", "resolution_seq": seq, "error": error})
+                    {"status": "failed", "trigger_seq": seq, "error": error})
         print(f"[resumer] {d['id']}: {error}", flush=True)
         return
     log = os.path.join(log_dir, f"{d['id']}-{seq}.log")
-    payload = {"event": {"type": "decision.resolved", "seq": seq}, "delivery": {"id": ""}, "decision": d}
+    payload = {"event": {"type": state.get("trigger", "decision.resolved"), "seq": seq}, "delivery": {"id": ""},
+               "decision": d}
     env = os.environ | _payload_env(payload, "") | {
         "RESUME_SESSION_ID": d["resume"]["session_id"], "RESUME_CWD": cwd, "RESUME_AGENT": agent,
         "RESUME_PROMPT": _resume_prompt(d)}
@@ -488,21 +525,21 @@ def _resume_one(client: Client, d: dict, command: str | None, log_dir: str):
         proc = subprocess.Popen(command, shell=True, cwd=cwd, env=env, stdout=fh, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL)
         client.call("POST", f"/api/decisions/{d['id']}/resume-events",
-                    {"status": "started", "resolution_seq": seq, "pid": proc.pid, "log": log})
+                    {"status": "started", "trigger_seq": seq, "pid": proc.pid, "log": log})
         print(f"[resumer] {d['id']}: resuming {agent} session {d['resume']['session_id']} (pid {proc.pid}, log {log})",
               flush=True)
         code = proc.wait()
     with open(log) as fh:
         tail = fh.read()[-1500:]
     client.call("POST", f"/api/decisions/{d['id']}/resume-events",
-                {"status": "finished" if code == 0 else "failed", "resolution_seq": seq,
+                {"status": "finished" if code == 0 else "failed", "trigger_seq": seq,
                  "exit_code": code, "log": log, "output_tail": tail})
     print(f"[resumer] {d['id']}: exited {code}", flush=True)
 
 
 def cmd_resumer_run(args):
     """Long-running: resume the requesting agent session whenever a decision with a resume target
-    is resolved. Pulls the event feed with a persisted cursor, so nothing is missed while it (or the
+    is resolved, or expires undecided (unless --no-expired). Pulls the event feed with a persisted cursor, so nothing is missed while it (or the
     machine) is down; heartbeats so the GUI can warn you when it isn't running."""
     client = Client(actor=os.environ.get("DECISIONS_ACTOR") or "resumer")
     me = machine_name()
@@ -520,7 +557,8 @@ def cmd_resumer_run(args):
     overrides = _agent_commands(args)
     described = args.command or "; ".join(f"{a}: {agents.resume_command(a, overrides)}"
                                           for a in dict.fromkeys([*agents.AGENTS, *overrides]))
-    print(f"[resumer] {me}: watching {client.url} from event {cursor}; commands: {described}", flush=True)
+    types = "decision.resolved" + ("" if args.no_expired else ",decision.expired")
+    print(f"[resumer] {me}: watching {client.url} from event {cursor} for {types}; commands: {described}", flush=True)
     last_beat = 0.0
     while True:
         if time.monotonic() - last_beat > 30:
@@ -533,7 +571,7 @@ def cmd_resumer_run(args):
                 time.sleep(10)
                 continue
         try:
-            res = client.call("GET", f"/api/events?after={cursor}&wait=25&types=decision.resolved", timeout=60)
+            res = client.call("GET", f"/api/events?after={cursor}&wait=25&types={types}", timeout=60)
         except SystemExit as exc:
             print(f"[resumer] {exc}", flush=True)
             time.sleep(10)
@@ -543,15 +581,14 @@ def cmd_resumer_run(args):
             state = d.get("resume_state") or {}
             target = d.get("resume") or {}
             # Sessions live on one machine; leave other machines' decisions to their own resumer.
-            # (Older decisions don't say which machine: take them if the directory exists here.)
-            mine = target.get("machine") == me if target.get("machine") else os.path.isdir(target.get("cwd") or "/")
+            mine = target.get("machine") == me
             age = time.time() - datetime.fromisoformat(ev["ts"].replace("Z", "+00:00")).timestamp()
             # Only the latest resolution, only if nobody (e.g. you, manually) already resumed it.
-            if mine and state.get("status") == "pending" and state.get("resolution_seq") == ev["seq"]:
+            if mine and state.get("status") == "pending" and state.get("trigger_seq") == ev["seq"]:
                 if age > max_age:
-                    print(f"[resumer] {d['id']}: skipping, resolved {age / 86400:.1f} days ago", flush=True)
+                    print(f"[resumer] {d['id']}: skipping, {d['status']} {age / 86400:.1f} days ago", flush=True)
                 else:
-                    command = args.command or agents.resume_command(target.get("agent"), overrides)
+                    command = args.command or agents.resume_command(target["agent"], overrides)
                     threading.Thread(target=_resume_one, args=(client, d, command, log_dir),
                                      daemon=True).start()
             cursor = ev["seq"]
@@ -649,7 +686,8 @@ def cmd_resumer_install(args):
               "resuming will fail until one is installed (or pass --agent-command)", file=sys.stderr)
     Client().call("GET", "/api/config")  # fail now, not in the background, if the server is unreachable
     os.makedirs(STATE_DIR, exist_ok=True)
-    argv = [decide, "resumer", "run", *(["--command", args.command] if args.command else [])]
+    argv = [decide, "resumer", "run", *(["--command", args.command] if args.command else []),
+            *(["--no-expired"] if args.no_expired else [])]
     for item in args.agent_command or []:
         argv += ["--agent-command", item]
     _install_service(RESUMER_SERVICE, argv, _service_env(decide, *found.values()),
@@ -773,6 +811,8 @@ def main(argv=None):
     s.add_argument("--webhook", help="webhook URL to notify")
     s.add_argument("--require-ack", action="store_true", help="re-fire webhook until acked")
     s.add_argument("--meta", action="append", help="metadata key=value (repeatable)")
+    s.add_argument("--due", help="deadline, after which the undecided decision expires: 36h, 2d, 1w, or an ISO "
+                                 "timestamp (default: the server's deadline_days, normally 4 days)")
     s.add_argument("--json", help="read the request body from a file, or - for stdin")
     s.add_argument("--quiet", "-q", action="store_true", help="print only the decision id")
     s.add_argument("--no-resume", action="store_true",
@@ -795,7 +835,7 @@ def main(argv=None):
 
     s = sub.add_parser("wait", help="block until a decision is resolved (long-poll; no inbound port needed)")
     s.add_argument("id")
-    s.add_argument("--on", default="decision.resolved,decision.cancelled",
+    s.add_argument("--on", default="decision.resolved,decision.cancelled,decision.expired",
                    help="comma-separated event types to wake on, e.g. add attributes.requested")
     s.add_argument("--after", type=int, help="only events after this cursor (from a previous wait)")
     s.add_argument("--timeout", type=float, default=0, help="seconds; 0 = wait forever")
@@ -815,7 +855,7 @@ def main(argv=None):
 
     s = sub.add_parser("watch", help="wait for a decision via its own throwaway webhook; optionally run a command")
     s.add_argument("id")
-    s.add_argument("--on", default="decision.resolved,decision.cancelled",
+    s.add_argument("--on", default="decision.resolved,decision.cancelled,decision.expired",
                    help="comma-separated event types, e.g. add attributes.requested")
     s.add_argument("--exec", help="shell command to run on the event; decision data is in DECISION_* env vars")
     s.add_argument("--forever", action="store_true", help="keep handling events instead of exiting after one")
@@ -839,11 +879,14 @@ def main(argv=None):
     agent_help = "NAME=COMMAND: resume command for one agent, adding or replacing a built-in one (repeatable)"
     r.add_argument("--command", help=resume_help)
     r.add_argument("--agent-command", action="append", help=agent_help)
+    expired_help = "don't resume sessions whose decision expired undecided (default: resume them, saying so)"
     r.add_argument("--max-age-days", type=float, default=14, help="don't resume decisions resolved longer ago")
+    r.add_argument("--no-expired", action="store_true", help=expired_help)
     r.set_defaults(fn=cmd_resumer_run)
     r = rsub.add_parser("install", help="install as a background service (launchd / systemd --user)")
     r.add_argument("--command", help=resume_help)
     r.add_argument("--agent-command", action="append", help=agent_help)
+    r.add_argument("--no-expired", action="store_true", help=expired_help)
     r.set_defaults(fn=cmd_resumer_install)
     r = rsub.add_parser("uninstall", help="remove the background service")
     r.set_defaults(fn=cmd_resumer_uninstall)

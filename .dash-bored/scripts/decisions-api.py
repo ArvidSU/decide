@@ -123,7 +123,7 @@ def open_list():
             bits.append("waiting on requester for: " + ", ".join(sorted(pending)))
         bits += ["from " + (d.get("source") or "unknown"), "opened " + ago(d.get("created_at"))]
         if d.get("due_at"):
-            bits.append("due " + d["due_at"][:10])
+            bits.append("expires " + d["due_at"][:16].replace("T", " ") + " UTC")
         items.append({
             "id": d["id"],
             "title": "%s · %s" % (d["id"], d["title"]),
@@ -140,14 +140,14 @@ def open_list():
 
 
 def recent_list():
-    ds = get("/decisions?status=resolved")["decisions"] + get("/decisions?status=cancelled")["decisions"]
+    ds = [d for status in ("resolved", "cancelled", "expired") for d in get("/decisions?status=" + status)["decisions"]]
     ds.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
     items = []
     for d in ds[:20]:
         rs = d.get("resume_state") or {}
         res = d.get("resolution") or {}
-        if d["status"] == "cancelled":
-            state, what = "closed", "cancelled"
+        if d["status"] in ("cancelled", "expired"):
+            state, what = "closed", d["status"] + (" (nobody decided in time)" if d["status"] == "expired" else "")
         else:
             picked = ", ".join(res.get("selected") or []) or "nothing"
             what = "picked " + picked
@@ -189,7 +189,7 @@ def activity():
     created = dict.fromkeys(labels, 0)
     resolved = dict.fromkeys(labels, 0)
     ds = []
-    for status in ("open", "resolved", "cancelled"):
+    for status in ("open", "resolved", "cancelled", "expired"):
         ds += get("/decisions?status=" + status)["decisions"]
     for d in ds:
         c, r = parse_ts(d.get("created_at")), parse_ts(d.get("resolved_at"))

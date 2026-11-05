@@ -167,7 +167,7 @@ root:
                       component: ./components/external/core/group
                       props:
                         title: Recently decided
-                        description: Last 20 resolved or cancelled decisions with what was picked. A green check means the requesting agent session was resumed; a red cross means resuming failed.
+                        description: Last 20 resolved, cancelled or expired decisions with what was picked. A green check means the requesting agent session was resumed; a red cross means resuming failed.
                       children:
                         axis: vertical
                         first:

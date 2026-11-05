@@ -21,6 +21,9 @@ class Config:
     # How the server reaches its own machine, for webhooks to agents there (`decide watch` against
     # localhost). Empty = 127.0.0.1. The Docker image sets host.docker.internal.
     callback_host: str = ""
+    # Open decisions expire (are closed as `expired`) this many days after they're created unless
+    # they set their own due_at. 0 = decisions without a due_at never expire.
+    deadline_days: float = 4
     webhook_timeout: float = 10
     # Give up after this many failed attempts (0 = retry forever).
     webhook_max_attempts: int = 25
