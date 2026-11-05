@@ -24,6 +24,8 @@ const S = {
   silenced: new Set(), // listener ids the next resolve won't notify ("resumer", "poll:<actor>", webhook id)
   focus: -1,
   editing: false,
+  notes: {},          // unsent reason per decision id
+  stale: false,       // a live update arrived while you were typing; applied when you leave the field
   ui: {},             // per-decision UI state: filters, view, sort, keepUnknown, text
 };
 
@@ -183,8 +185,9 @@ function ask({ title, body = "", field, value = "", placeholder = "", type = "te
   return new Promise((done) => {
     const dlg = document.createElement("dialog");
     dlg.className = "dialog";
+    dlg.setAttribute("aria-labelledby", "dlg-title");
     dlg.innerHTML = `<form method="dialog">
-      <h3>${esc(title)}</h3>
+      <h3 id="dlg-title">${esc(title)}</h3>
       ${body ? `<div class="dialog-body">${body}</div>` : ""}
       ${field !== undefined ? `<label class="dialog-field">${esc(field)}
         <input class="input" name="v" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off"></label>` : ""}
@@ -406,6 +409,7 @@ async function poll() {
         await loadList();
         if (S.d && r.events.some((e) => e.decision_id === S.d.id)) {
           if (!isTyping()) await loadDecision(S.d.id, { keepSelection: true });
+          else S.stale = true;
         }
       }
     } catch { await new Promise((r) => setTimeout(r, 3000)); }
@@ -498,12 +502,22 @@ function renderSidebar() {
   }).join("") : `<div class="list-empty">${q ? `No decisions match “${esc(S.q)}”.` : `No ${S.status === "all" ? "" : esc(STATUS_NAMES[S.status].toLowerCase()) + " "}decisions.`}</div>`);
 }
 
-// The sidebar is a drawer on narrow screens.
+// The sidebar is a drawer on narrow screens: while closed it's inert; while open, the page behind it is.
+const narrow = matchMedia("(max-width: 860px)");
 function drawer(open = !document.body.classList.contains("drawer-open")) {
+  const was = document.body.classList.contains("drawer-open");
   document.body.classList.toggle("drawer-open", open);
   $("#drawer-btn")?.setAttribute("aria-expanded", open);
-  if (open) $(".dl-item.active, .dl-item")?.focus();
+  syncInert();
+  if (open && !was) ($(".dl-item.active") || $("#search"))?.focus();
+  if (!open && was) $("#drawer-btn")?.focus({ preventScroll: true });
 }
+function syncInert() {
+  const open = document.body.classList.contains("drawer-open");
+  $("#sidebar").inert = narrow.matches && !open;
+  $("#main").inert = $(".mobile-bar").inert = narrow.matches && open;
+}
+narrow.addEventListener("change", () => { if (!narrow.matches) document.body.classList.remove("drawer-open"); syncInert(); });
 
 // ------------------------------------------------------------------ empty / settings
 
@@ -898,7 +912,7 @@ function filtersHtml({ metas, filtered, best }) {
           <label class="lf">Max<input class="field" type="number" step="any" inputmode="decimal" data-filter="${k}" data-part="max" value="${esc(f.max ?? "")}"></label></div>
         ${m.min !== null ? `<p class="hint">Options range from ${m.min.toLocaleString()} to ${m.max.toLocaleString()}${m.unit ? " " + esc(m.unit) : ""}.</p>` : ""}`;
     } else if (m.type === "boolean") {
-      body = `<div class="choices" role="radiogroup">${["any", "yes", "no"].map((v) => `<label class="choice"><input type="radio" name="bool-${k}" data-filter="${k}" data-part="bool" value="${v}" ${(f.bool || "any") === v ? "checked" : ""}>${v === "any" ? "Any" : v === "yes" ? "Yes" : "No"}</label>`).join("")}</div>`;
+      body = `<div class="choices" role="radiogroup" aria-label="${esc(m.label)}">${["any", "yes", "no"].map((v) => `<label class="choice"><input type="radio" name="bool-${k}" data-filter="${k}" data-part="bool" value="${v}" ${(f.bool || "any") === v ? "checked" : ""}>${v === "any" ? "Any" : v === "yes" ? "Yes" : "No"}</label>`).join("")}</div>`;
     } else if ((m.type === "enum" || m.type === "tags") && m.distinct.length) {
       const count = (v) => live.filter((o) => [].concat(o.attributes[m.key] ?? []).map(String).includes(v)).length;
       body = `<div class="choices">${m.distinct.map((v) => `<label class="choice"><input type="checkbox" data-set="${k}" value="${esc(v)}" ${(f.set || []).includes(v) ? "checked" : ""}>${esc(v)}<span class="ct">${count(v)}</span></label>`).join("")}</div>`;
@@ -907,7 +921,9 @@ function filtersHtml({ metas, filtered, best }) {
     }
     return `<details class="fpop ${on ? "on" : ""}" data-pop="${k}" ${S.pop === m.key ? "open" : ""}>
       <summary class="fbtn" title="${esc(m.def.description || "")}">${icon(on ? "filter" : "plus", 14)}${esc(m.label)}${on ? `: <span class="val">${esc(filterSummary(m, f))}</span>` : ""}${m.requested ? ` <span class="dot" title="Requested from the agent"></span>` : ""}</summary>
-      <div class="pop"><div class="pop-title"><span>${esc(m.label)}${m.unit ? ` (${esc(m.unit)})` : ""}</span>${on ? `<button class="btn small ghost" data-action="clear-filter" data-key="${k}">Clear</button>` : ""}</div>${body}</div>
+      <div class="pop-scrim" data-action="close-pop"></div>
+      <div class="pop" role="dialog" aria-label="Filter by ${esc(m.label)}"><div class="pop-title"><span>${esc(m.label)}${m.unit ? ` (${esc(m.unit)})` : ""}</span>${on ? `<button class="btn small ghost" data-action="clear-filter" data-key="${k}">Clear</button>` : ""}<button class="icon-btn" data-action="close-pop" aria-label="Close">${icon("x", 16)}</button></div>${body}
+        <button class="btn primary pop-done" data-action="close-pop">Done</button></div>
     </details>`;
   }).join("");
   const chips = [
@@ -918,7 +934,7 @@ function filtersHtml({ metas, filtered, best }) {
       <div class="tsearch">${icon("search", 15)}<input type="search" id="opt-text" placeholder="Search options" aria-label="Search options" value="${esc(u.text)}"><span class="kbd" aria-hidden="true">/</span></div>
       ${fs}
       <span class="spacer"></span>
-      ${Object.keys(best).length ? `<span class="legend" title="Best value in each column, for attributes where lower or higher is better"><span class="best-mark"></span>Best in column</span>` : ""}
+      ${Object.keys(best).length ? `<span class="legend"><span class="best-mark"></span>${chips.length ? "Best among shown" : "Best"}: ${esc(metas.filter((m) => best[m.key] !== undefined).map((m) => `${m.better === "lower" ? "lowest" : "highest"} ${m.label.toLowerCase()}`).join(", "))}</span>` : ""}
     </div>
     ${chips.length ? `<div class="active-filters" role="status">
       ${chips.join("")}
@@ -950,7 +966,7 @@ function tableHtml({ metas, visible, best }, single) {
       <th><span class="sr-only">Actions</span></th></tr></thead>
     <tbody>${visible.map((o, i) => `
       <tr class="opt ${S.selection.has(o.id) ? "selected" : ""} ${S.focus === i ? "focus" : ""}" data-option="${esc(o.id)}">
-        <td class="check"><input class="pick" type="${single ? "radio" : "checkbox"}" name="pick" data-pick="${esc(o.id)}" ${S.selection.has(o.id) ? "checked" : ""} aria-label="Select ${esc(o.label)}"></td>
+        <td class="check"><span class="pick-hit"><input class="pick" type="${single ? "radio" : "checkbox"}" name="pick" data-pick="${esc(o.id)}" ${S.selection.has(o.id) ? "checked" : ""} aria-label="Select ${esc(o.label)}"></span></td>
         <td>${o.image ? `<img class="thumb" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
           <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}</div>
           ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}</td>
@@ -971,15 +987,15 @@ function cardsHtml({ metas, visible, best }, single) {
     <div class="card ${S.selection.has(o.id) ? "selected" : ""} ${S.focus === i ? "focus" : ""}" data-option="${esc(o.id)}">
       ${o.image ? `<img class="hero" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
       <div class="body">
-        <div class="top"><input class="pick" type="${single ? "radio" : "checkbox"}" name="pick" data-pick="${esc(o.id)}" ${S.selection.has(o.id) ? "checked" : ""} aria-label="Select ${esc(o.label)}">
-          <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}</div></div>
+        <div class="top"><span class="pick-hit"><input class="pick" type="${single ? "radio" : "checkbox"}" name="pick" data-pick="${esc(o.id)}" ${S.selection.has(o.id) ? "checked" : ""} aria-label="Select ${esc(o.label)}"></span>
+          <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}</div>
+          <button class="icon-btn ruleout" data-action="exclude" data-id="${esc(o.id)}" aria-label="Rule out ${esc(o.label)}" title="Rule out (x). Alt-click to give a reason.">${icon("x", 15)}</button></div>
         ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}
         ${cols.length ? `<dl>${cols.map((m) => {
           const v = o.attributes[m.key];
           const isBest = best[m.key] !== undefined && v === best[m.key];
           return `<dt>${esc(m.label)}</dt><dd class="${v == null ? "missing" : ""} ${isBest ? "best" : ""}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? `<span class="best-mark" aria-hidden="true"></span>` : ""}${cellHtml(v, m, o.attribute_meta[m.key])}${isBest ? `<span class="sr-only"> (best)</span>` : ""}</dd>`;
         }).join("")}</dl>` : ""}
-        <div class="foot"><button class="btn small ghost ruleout" data-action="exclude" data-id="${esc(o.id)}" aria-label="Rule out ${esc(o.label)}" title="Rule out (x). Alt-click to give a reason.">${icon("x", 14)}<span class="lbl">Rule out</span></button></div>
       </div>
     </div>`).join("")}</div>`;
 }
@@ -987,24 +1003,29 @@ function cardsHtml({ metas, visible, best }, single) {
 function miniHtml(o, kind) {
   return `<div class="mini-opt ${kind}"><span class="opt-label">${esc(o.label)}</span>
     <span class="why">${kind === "excluded" ? esc(o.exclude_reason || "") : ""}</span>
+    ${kind === "excluded" && !o.exclude_reason ? `<button class="btn small ghost" data-action="add-reason" data-id="${esc(o.id)}">${icon("pencil", 14)}Add reason</button>` : ""}
     ${kind === "excluded" ? `<button class="btn small ghost" data-action="include" data-id="${esc(o.id)}">${icon("undo", 14)}Restore</button>`
                           : `<button class="btn small ghost" data-action="exclude" data-id="${esc(o.id)}">${icon("x", 14)}Rule out</button>`}</div>`;
 }
 
 function decideBarHtml(d, single, { visible }) {
   const n = S.selection.size;
-  const valid = n >= d.min_select && (d.max_select === null || n <= d.max_select);
+  const min = d.min_select, max = d.max_select;
+  const valid = n >= min && (max === null || n <= max);
   const chosen = d.options.filter((o) => S.selection.has(o.id));
   const labels = chosen.map((o) => o.label);
   const hidden = chosen.filter((o) => !visible.includes(o));
-  const need = single ? "Pick an option" : d.max_select === null ? `Pick at least ${d.min_select}` : d.min_select === d.max_select ? `Pick ${d.min_select}` : `Pick ${d.min_select}–${d.max_select}`;
+  const need = single ? "Pick an option" : max === null ? `Pick at least ${min}` : min === max ? `Pick ${min}` : `Pick ${min}–${max}`;
+  // Say which limit applies before the button refuses.
+  const limit = single ? "" : n < min ? `${min - n} more needed` : max !== null ? (n >= max ? "limit reached" : `up to ${max}`) : "";
+  const why = valid ? "" : n < min ? (min === 1 ? "Select an option first" : `Select at least ${min} options`) : `Select at most ${max} options`;
   const sel = !n ? `<span>${need}</span>`
     : single ? `<span class="names" title="${esc(labels[0])}">${esc(labels[0])}</span>`
-    : `<span class="count">${n} selected</span><span class="names" title="${esc(labels.join(", "))}">${esc(labels.join(", "))}</span>`;
-  return `<div class="decide-bar" role="region" aria-label="Decide">
+    : `<span class="count">${n} selected</span>${limit ? `<span class="limit">· ${limit}</span>` : ""}<span class="names" title="${esc(labels.join(", "))}">${esc(labels.join(", "))}</span>`;
+  return `<div class="decide-bar ${n ? "has-sel" : ""} ${S.notes[d.id] ? "with-reason" : ""}" role="region" aria-label="Decide">
     <div class="sel" aria-live="polite">${sel}</div>
-    <div class="reason-field"><label for="note">Reason</label><input id="note" placeholder="Optional, shown to ${esc(d.source || "the requester")}" value="${esc(S.noteDraft ?? "")}" autocomplete="off"></div>
-    <button class="btn primary" data-action="resolve" ${valid && !S.resolving ? "" : "disabled"} aria-keyshortcuts="Meta+Enter Control+Enter">${S.resolving ? "Deciding…" : `${icon("check", 15)}Decide`}<span class="kbd" aria-hidden="true">⌘↵</span></button>
+    <div class="reason-field"><label for="note">Reason</label><input id="note" placeholder="Optional, shown to ${esc(d.source || "the requester")}" value="${esc(S.notes[d.id] ?? "")}" autocomplete="off"></div>
+    <button class="btn primary" data-action="resolve" ${valid && !S.resolving ? "" : "disabled"} title="${esc(why || "Decide (⌘↵)")}" aria-keyshortcuts="Meta+Enter Control+Enter">${S.resolving ? "Deciding…" : `${icon("check", 15)}Decide`}<span class="kbd" aria-hidden="true">⌘↵</span></button>
   </div>
   ${hidden.length ? `<div class="selnote" role="status">${icon("help", 15)}${hidden.length === 1 ? `“${esc(hidden[0].label)}” is selected but hidden by filters.` : `${hidden.length} selected options are hidden by filters.`}
     <button class="btn small ghost" data-action="clear-all-filters">Show</button><button class="btn small ghost" data-action="deselect-hidden">Deselect</button></div>` : ""}
@@ -1125,9 +1146,12 @@ function toggleSelect(id) {
   if (S.selection.has(id)) S.selection.delete(id);
   else {
     if (d.max_select === 1) S.selection.clear();
+    else if (d.max_select !== null && S.selection.size >= d.max_select) {
+      toast(`You can pick at most ${d.max_select}. Deselect one first.`);
+      return renderDecision();
+    }
     S.selection.add(id);
   }
-  S.noteDraft = $("#note")?.value || S.noteDraft;
   renderDecision();
 }
 
@@ -1158,9 +1182,10 @@ async function exclude(ids, reason, filters) {
 async function excludeWithReason(id) {
   const d = S.d;
   const label = d.options.find((o) => o.id === id)?.label || id;
-  const reason = await ask({ title: `Rule out ${label}?`, field: "Why isn't it viable? (recorded in the log)", ok: "Rule out" });
+  const already = d.options.find((o) => o.id === id)?.excluded;
+  const reason = await ask({ title: already ? `Why was ${label} ruled out?` : `Rule out ${label}?`, field: "Why isn't it viable? (recorded in the log)", ok: already ? "Save reason" : "Rule out" });
   if (reason === null) return;
-  if (!d.options.find((o) => o.id === id)?.excluded) return exclude([id], reason || undefined);
+  if (!already) return exclude([id], reason || undefined);
   if (reason) act(() => api("POST", `/api/decisions/${d.id}/exclude`, { option_ids: [id], reason }), "Reason recorded");
 }
 
@@ -1201,7 +1226,10 @@ function bindDecision() {
     saveUi(); renderDecision();
   });
   const note = $("#note");
-  if (note) note.addEventListener("input", () => (S.noteDraft = note.value));
+  if (note) note.addEventListener("input", () => {
+    S.notes[d.id] = note.value;
+    note.closest(".decide-bar").classList.toggle("with-reason", !!note.value);
+  });
 
   const attrForm = $("#attr-form");
   if (attrForm) attrForm.onsubmit = (e) => {
@@ -1233,10 +1261,13 @@ function bindComments(d) {
   };
 }
 
-function closePops() {
+// Closes the open filter popover; `refocus` puts focus back on its button.
+function closePops(refocus) {
   if (!S.pop) return;
+  const summary = document.querySelector(`details[data-pop="${CSS.escape(S.pop)}"] summary`);
   S.pop = null;
   document.querySelectorAll("details[data-pop][open]").forEach((o) => o.removeAttribute("open"));
+  if (refocus) summary?.focus();
 }
 
 document.addEventListener("click", async (e) => {
@@ -1263,14 +1294,20 @@ document.addEventListener("click", async (e) => {
   const id = a.dataset.id;
   switch (a.dataset.action) {
     case "drawer": return drawer();
+    case "close-pop": return closePops(true);
     case "view": ui().view = a.dataset.view; saveUi(); return renderDecision();
     case "exclude": return e.altKey ? excludeWithReason(id) : exclude([id]);
     case "include": return act(() => api("POST", `/api/decisions/${d.id}/include`, { option_ids: [id] }), "Restored");
     case "exclude-filtered": {
       const { metas, filtered } = partition();
       const desc = describeFilters(metas);
-      return exclude(filtered.map((o) => o.id), `filtered out: ${desc}`, desc);
+      const reason = await ask({ title: `Rule out ${filtered.length} hidden option${filtered.length === 1 ? "" : "s"}?`,
+        body: `<p>${filtered.map((o) => esc(o.label)).join(", ")} will be recorded as ruled out in the log. You can restore them later.</p>`,
+        field: "Reason", value: `filtered out: ${desc}`, ok: "Rule out" });
+      if (reason === null) return;
+      return exclude(filtered.map((o) => o.id), reason || undefined, desc);
     }
+    case "add-reason": return excludeWithReason(id);
     case "deselect-hidden": {
       const vis = new Set(visibleIds());
       for (const s of [...S.selection]) if (!vis.has(s)) S.selection.delete(s);
@@ -1338,8 +1375,7 @@ function markResumed() {
 async function resolve() {
   const d = S.d;
   if (S.resolving) return;
-  S.noteDraft = $("#note")?.value ?? S.noteDraft;
-  const note = S.noteDraft || "";
+  const note = S.notes[d.id] || "";
   const { metas } = partition();
   const filters = describeFilters(metas) || undefined;
   const silence = [...S.silenced];
@@ -1349,13 +1385,13 @@ async function resolve() {
   const ok = await act(() => api("POST", `/api/decisions/${d.id}/resolve`, { selected: [...S.selection], note, filters, silence }),
             `${d.id} decided${told > 0 ? ` · notifying ${told}` : ""}${silence.length ? ` · ${silence.length} not notified` : ""}`);
   S.resolving = false;
-  if (ok) { S.noteDraft = undefined; S.silenced = new Set(); }
+  if (ok) { delete S.notes[d.id]; S.silenced = new Set(); }
   if (S.d?.id === d.id) renderDecision();
 }
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.body.classList.contains("drawer-open")) return drawer(false);
-  if (e.key === "Escape" && S.pop) { const pop = S.pop; closePops(); document.querySelector(`details[data-pop="${CSS.escape(pop)}"] summary`)?.focus(); return; }
+  if (e.key === "Escape" && S.pop) return closePops(true);
   if (!S.d || S.editing || S.d.status !== "open" || dialogOpen()) return;
   const el = document.activeElement;
   // Enter and space belong to a focused button, link or disclosure.
@@ -1367,6 +1403,9 @@ document.addEventListener("keydown", (e) => {
   }
   if (isTyping()) { if (e.key === "Escape") el.blur(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
+  // Option shortcuts apply when nothing in particular has focus, or an option does; other controls keep their keys.
+  const inOptions = !el || el === document.body || el.id === "main" || !!el.closest?.("[data-option]");
+  if (!inOptions && e.key !== "/") return;
   const ids = visibleIds();
   // A focused option control is the cursor.
   const at = el?.dataset?.pick ? ids.indexOf(el.dataset.pick) : S.focus;
@@ -1409,6 +1448,11 @@ window.addEventListener("popstate", route);
   $("#settings-btn").innerHTML = icon("settings", 16);
   $("#logo-mark").innerHTML = icon("check", 14);
   $("#search-wrap").insertAdjacentHTML("afterbegin", icon("search", 15));
+  syncInert();
+  // Live updates that arrived while typing are applied once you leave the field.
+  document.addEventListener("focusout", () => setTimeout(() => {
+    if (S.stale && S.d && !isTyping()) { S.stale = false; loadDecision(S.d.id, { keepSelection: true }); }
+  }, 0));
   try {
     S.config = await api("GET", "/api/config");
     await loadList();
