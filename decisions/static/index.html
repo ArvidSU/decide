@@ -4,25 +4,33 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Decisions</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%235b5bd6'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%235451d6'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
   <div class="app">
-    <aside class="sidebar">
+    <header class="mobile-bar">
+      <button class="icon-btn" data-action="drawer" aria-label="Show decisions" aria-controls="sidebar" aria-expanded="false" id="drawer-btn"></button>
+      <div class="mb-title" id="mb-title">Decisions</div>
+      <a href="/settings" data-nav class="icon-btn" aria-label="Settings" id="mb-settings"></a>
+    </header>
+    <aside class="sidebar" id="sidebar" aria-label="Decisions">
       <header class="brand">
-        <a href="/" data-nav class="logo">Decisions</a>
-        <a href="/settings" data-nav class="icon-btn" title="Settings &amp; webhooks">⚙</a>
+        <a href="/" data-nav class="logo"><span class="logo-mark" id="logo-mark"></span>Decisions</a>
+        <a href="/settings" data-nav class="icon-btn" id="settings-btn" title="Settings &amp; webhooks" aria-label="Settings"></a>
       </header>
-      <div class="tabs spaces" id="space-tabs" hidden></div>
+      <div class="tabs spaces" id="space-tabs" role="group" aria-label="Space" hidden></div>
       <div id="attention"></div>
-      <div class="tabs" id="status-tabs"></div>
-      <input id="search" class="search" type="search" placeholder="Search decisions…">
-      <nav id="decision-list" class="decision-list"></nav>
+      <div class="tabs" id="status-tabs" role="group" aria-label="Status"></div>
+      <div class="search-wrap" id="search-wrap">
+        <input id="search" class="search" type="search" placeholder="Search decisions" aria-label="Search decisions">
+      </div>
+      <nav id="decision-list" class="decision-list" aria-label="Decision list"></nav>
     </aside>
+    <div class="scrim" data-action="drawer"></div>
     <main id="main" class="main"></main>
   </div>
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="/static/app.js"></script>
 </body>
 </html>

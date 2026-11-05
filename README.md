@@ -32,14 +32,14 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 
 ## GUI
 
-* Sidebar: what's waiting on you and when the next one expires, then Open (most urgent first, with a countdown) / Resolved / Expired / Cancelled, search. The tab title shows the open count.
-* Open decisions show how long is left and what happens at the deadline. The card turns amber under a day and red under 6 hours.
-* Per-attribute filters: number ranges, yes/no, value chips, text contains, plus free-text search. "Keep options with unknown values" stops best-effort gaps from hiding options. Short lists without attributes skip the filters.
-* Best value per attribute is highlighted when `better` is set. Click column headers to sort. Table or card view (cards when options have images).
-* Keyboard: `j`/`k` move, `space` select, `x` rule out, `/` search, `⌘/Ctrl+Enter` decide (listed under the options). Alt-click ✕ to give a reason. Undo is offered after every exclusion.
-* Resolved, expired and cancelled decisions open as a read-only record: the outcome, rationale, every option considered and the log. Reopen to change one. "Next" jumps to the most urgent open decision.
+* Sidebar: what's waiting on you and when the next one expires, then Open (most urgent first, with a countdown) / Resolved / Expired / Cancelled, search. The tab title shows the open count. On phones it's a drawer behind the menu button.
+* Open decisions show how long is left and what happens at the deadline. The callout turns amber under a day and red under 6 hours.
+* Filters sit in a toolbar: one button per attribute opens a popover (min/max, yes/no, value checkboxes with counts, text contains), plus free-text search. Active filters show as removable chips, with "Keep options with unknown values" so best-effort gaps don't hide options, and "Rule out N hidden" to record the filter as the reason. Short lists without attributes skip the filters.
+* Best value per attribute is marked when `better` is set. Click column headers to sort. Table or card view (cards when options have images, and on phones).
+* Keyboard: `j`/`k` move, `space` select, `x` rule out, `/` search, `⌘/Ctrl+Enter` decide (listed under the options). Every rule-out offers Undo and Add reason; Alt-click Rule out to give the reason up front.
+* Resolved, expired and cancelled decisions open as a read-only record: the outcome and its reason, every option considered and the log. Reopen to change one. "Next open" jumps to the most urgent open decision.
 * Live: new options and attribute values appear as the agent adds them.
-* ⚙ Settings: global webhooks, delivery policy, log integrity.
+* Settings: connect a machine, global webhooks (pick the events), delivery policy, log integrity.
 
 ## API
 
@@ -152,7 +152,7 @@ Data lives in the `decisions-data` volume (`/data/decisions.db`). Both variables
 ```sh
 curl -fsSL http://server:8787/install.sh | sh -s -- --token <token>
 ```
-The command is also in the GUI under ⚙ Settings → *Connect a machine*. The installer:
+The command is also in the GUI under Settings → *Connect a machine*. The installer:
 1. installs `decide` from a wheel the server builds from its own code (via uv, pipx or pip; uv can even fetch Python). Re-run it to update after you update the server.
 2. runs `decide connect <url> --token …`, which checks the token and saves both to `~/.config/decisions/client.toml` (mode 600).
 3. runs `decide skill install` (see above).
