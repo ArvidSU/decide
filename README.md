@@ -34,9 +34,10 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 
 * Sidebar: what's waiting on you and when the next one expires, then Open (most urgent first, with a countdown) / Resolved / Expired / Cancelled, search. The tab title shows the open count.
 * Open decisions show how long is left and what happens at the deadline. The card turns amber under a day and red under 6 hours.
-* Per-attribute filters: number ranges, yes/no, value chips, text contains, plus free-text search. "Keep options with unknown values" stops best-effort gaps from hiding options.
+* Per-attribute filters: number ranges, yes/no, value chips, text contains, plus free-text search. "Keep options with unknown values" stops best-effort gaps from hiding options. Short lists without attributes skip the filters.
 * Best value per attribute is highlighted when `better` is set. Click column headers to sort. Table or card view (cards when options have images).
-* Keyboard: `j`/`k` move, `space` select, `x` rule out, `/` search, `⌘/Ctrl+Enter` decide. Alt-click ✕ to give a reason. Undo is offered after every exclusion.
+* Keyboard: `j`/`k` move, `space` select, `x` rule out, `/` search, `⌘/Ctrl+Enter` decide (listed under the options). Alt-click ✕ to give a reason. Undo is offered after every exclusion.
+* Resolved, expired and cancelled decisions open as a read-only record: the outcome, rationale, every option considered and the log. Reopen to change one. "Next" jumps to the most urgent open decision.
 * Live: new options and attribute values appear as the agent adds them.
 * ⚙ Settings: global webhooks, delivery policy, log integrity.
 

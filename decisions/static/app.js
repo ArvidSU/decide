@@ -51,12 +51,16 @@ function saveUi() { storage("ui." + S.d.id, JSON.stringify(ui())); }
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+let tokenAsk = null;
 async function api(method, path, body) {
   const headers = { "Content-Type": "application/json", "X-Actor": S.config?.owner || "me" };
   if (S.token) headers.Authorization = "Bearer " + S.token;
   const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   if (res.status === 401) {
-    const t = prompt("API token for this decisions server:");
+    // Requests fired together share one sign-in dialog.
+    tokenAsk ||= ask({ title: "Sign in", body: "<p>This decisions server needs its API token.</p>", field: "Token", type: "password", ok: "Sign in", cancel: "" })
+      .finally(() => (tokenAsk = null));
+    const t = await tokenAsk;
     if (t) { S.token = t; storage("token", t); return api(method, path, body); }
     throw new Error("unauthorized");
   }
@@ -78,12 +82,14 @@ function ago(iso) {
 const fullTime = (iso) => iso ? new Date(iso).toLocaleString() : "";
 const whenTime = (iso) => new Date(iso).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 
-// Time left until an ISO timestamp, coarse: "3d 4h", "5h 12m", "12m" (negative = passed).
+// Time left until an ISO timestamp, coarse: "3d 4h", "5h 12m", "12m", "<1m", or "now" once it has passed.
 function until(iso) {
-  const s = Math.max(0, (new Date(iso).getTime() - Date.now()) / 1000);
+  const s = (new Date(iso).getTime() - Date.now()) / 1000;
+  if (s <= 0) return "now";
+  if (s < 60) return "<1m";
   if (s >= 86400) return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
   if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-  return `${Math.max(1, Math.floor(s / 60))}m`;
+  return `${Math.floor(s / 60)}m`;
 }
 // How pressing an open decision's deadline is: "urgent" under 6h, "soon" under a day.
 function urgency(d) {
@@ -91,7 +97,6 @@ function urgency(d) {
   const s = (new Date(d.due_at).getTime() - Date.now()) / 1000;
   return s < 6 * 3600 ? "urgent" : s < 86400 ? "soon" : "";
 }
-const closed = (d) => d.status === "cancelled" || d.status === "expired";
 const byDeadline = (a, b) => (a.due_at || "9999").localeCompare(b.due_at || "9999");
 
 let toastTimer;
@@ -106,9 +111,34 @@ function toast(msg, { undo, error, undoLabel } = {}) {
 }
 const fail = (e) => toast(e.message || String(e), { error: true });
 
+// In-page replacement for prompt()/confirm(). Resolves to the field's text ("" without a field),
+// or null when dismissed. `body` is HTML.
+function ask({ title, body = "", field, value = "", placeholder = "", type = "text", ok = "OK", cancel = "Cancel", danger = false }) {
+  return new Promise((done) => {
+    const dlg = document.createElement("dialog");
+    dlg.className = "dialog";
+    dlg.innerHTML = `<form method="dialog">
+      <h3>${esc(title)}</h3>
+      ${body ? `<div class="dialog-body">${body}</div>` : ""}
+      ${field !== undefined ? `<label class="dialog-field">${esc(field)}
+        <input class="input" name="v" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off"></label>` : ""}
+      <div class="dialog-actions">
+        ${cancel ? `<button type="button" class="btn" data-close>${esc(cancel)}</button>` : ""}
+        <button class="btn ${danger ? "danger-fill" : "primary"}" value="ok">${esc(ok)}</button></div>
+    </form>`;
+    document.body.append(dlg);
+    const input = dlg.querySelector("input");
+    dlg.querySelector("[data-close]")?.addEventListener("click", () => dlg.close());
+    dlg.addEventListener("close", () => { done(dlg.returnValue === "ok" ? (input?.value.trim() ?? "") : null); dlg.remove(); });
+    dlg.showModal();
+    if (input) { input.focus(); input.select(); }
+  });
+}
+const dialogOpen = () => !!document.querySelector("dialog[open]");
+
 async function copy(text, what) {
   try { await navigator.clipboard.writeText(text); toast(`Copied ${what}`); }
-  catch { prompt("Copy:", text); }
+  catch { await ask({ title: `Copy ${what}`, field: "The browser blocked the clipboard. Copy it from here:", value: text, ok: "Done", cancel: "" }); }
 }
 
 function md(src) {
@@ -160,7 +190,7 @@ function attrMeta(d, key) {
   const nums = values.filter((v) => typeof v === "number");
   return {
     key, type, def,
-    label: def.label || key,
+    label: def.label || key.replace(/[_-]+/g, " ").replace(/^./, (c) => c.toUpperCase()),
     unit: def.unit || "",
     better: def.better,
     requested: !!def.requested,
@@ -357,7 +387,8 @@ function renderSidebar() {
   const tabs = ["open", "resolved", "expired", "cancelled", "all"];
   const names = { open: "Open", resolved: "Resolved", expired: "Expired", cancelled: "Cancelled", all: "All" };
   $("#status-tabs").innerHTML = tabs.map((t) =>
-    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && S.counts.open ? "has-open" : ""}" data-status="${t}">${names[t]}<span class="n">${S.counts[t] ?? ""}</span></button>`).join("");
+    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && S.counts.open ? "has-open" : ""}" data-status="${t}" title="${S.counts[t]} ${names[t].toLowerCase()}">${names[t]}${t === "open" && S.counts.open ? `<span class="n">${S.counts.open}</span>` : ""}</button>`).join("");
+  $(".brand .icon-btn").classList.toggle("active", location.pathname === "/settings");
   const open = list.filter((d) => d.status === "open").sort(byDeadline);
   document.title = (open.length ? `(${open.length}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : "Decisions");
   $("#attention").innerHTML = open.length
@@ -375,16 +406,16 @@ function renderSidebar() {
     const due = d.status === "open" && d.due_at;
     const left = due ? Math.max(0, Math.min(1, (new Date(d.due_at) - Date.now()) / (new Date(d.due_at) - new Date(d.created_at)))) : 0;
     return `<a href="/d/${d.id}" data-nav class="dl-item ${S.d && S.d.id === d.id ? "active" : ""} ${d.status} ${urgency(d)}">
-      <div class="dl-top"><span class="dl-id">${d.id}</span><span class="dl-title">${esc(d.title)}</span>
-        ${due ? `<span class="dl-due" title="Expires ${esc(fullTime(d.due_at))} unless decided">${until(d.due_at)}</span>` : ""}
-        ${d.status === "expired" ? `<span class="dl-due" title="Expired ${esc(fullTime(d.due_at))}: nobody decided in time">expired</span>` : ""}</div>
+      <div class="dl-top"><span class="dl-id">${d.id}</span><span class="dl-title">${esc(d.title)}</span></div>
       <div class="dl-meta">
         ${multiSpace() && !S.space ? `<span class="dl-space">${esc(d.space)}</span>` : ""}
-        ${d.source ? `<span>${esc(d.source)}</span>` : ""}
-        <span>${d.option_count - d.excluded_count}/${d.option_count} options</span>
+        ${d.source ? `<span class="dl-source">${esc(d.source)}</span>` : ""}
+        <span title="${d.option_count - d.excluded_count} of ${d.option_count} options still in play">${d.excluded_count ? `${d.option_count - d.excluded_count}/` : ""}${d.option_count} option${d.option_count === 1 ? "" : "s"}</span>
         ${pending ? `<span title="Waiting for requested attributes"><span class="dot"></span>attrs</span>` : ""}
         ${["pending", "failed"].includes(d.resume_state?.status) && d.status === "resolved" ? `<span title="The requesting agent hasn't been resumed" style="color:var(--bad)"><span class="dot" style="background:var(--bad)"></span>not resumed</span>` : ""}
-        <span>${ago(d.created_at)}</span>
+        ${due ? "" : `<span title="Created ${esc(fullTime(d.created_at))}">${ago(d.created_at)}</span>`}
+        ${due ? `<span class="dl-due" title="Expires ${esc(fullTime(d.due_at))} unless decided">${until(d.due_at)} left</span>` : ""}
+        ${d.status === "expired" ? `<span class="dl-due" title="Expired ${esc(fullTime(d.due_at))}: nobody decided in time">expired</span>` : ""}
       </div>
       ${due ? `<div class="dl-time" title="Time left before it expires"><i style="width:${(left * 100).toFixed(1)}%"></i></div>` : ""}</a>`;
   }).join("") : `<div class="muted small" style="padding:12px">No ${S.status === "all" ? "" : esc(names[S.status].toLowerCase())} decisions.</div>`;
@@ -448,14 +479,14 @@ async function renderSettings() {
       <div class="panel small">
         Retries with exponential backoff (${w.backoff_base}s × 2ⁿ, max ${w.backoff_max}s), up to ${w.max_attempts || "∞"} attempts, ${w.timeout}s timeout.
         ${w.require_ack ? "Deliveries re-fire" : "Webhooks created with <code>require_ack</code> re-fire"} every ${w.refire_interval}s until acknowledged via <code>ack_url</code>.
-        <p class="hint">Change these in <code>decisions.toml</code> or <code>DECISIONS_WEBHOOK_*</code> env vars.</p>
+        <p class="hint">Change these in the server config (<code>~/.config/decisions/config.toml</code>) or <code>DECISIONS_WEBHOOK_*</code> env vars.</p>
       </div>
     </section>
     <section class="block">
       <div class="block-head"><h2>Audit log</h2></div>
       <div class="panel small">
-        ${Object.entries(verify.chains).map(([space, c]) => `<div>${multiSpace() || space === "*" ? `<strong>${space === "*" ? "server" : esc(space)}</strong> · ` : ""}${c.ok
-          ? `<span class="badge ok">intact</span> ${c.events} events in an unbroken SHA-256 hash chain. Head <code>${esc(c.head.slice(0, 16))}…</code>`
+        ${Object.entries(verify.chains).map(([space, c], _, all) => `<div>${multiSpace() || all.length > 1 ? `<strong>${space === "*" ? "server" : esc(space)}</strong> · ` : ""}${c.ok
+          ? `<span class="badge ok">intact</span> ${c.events} event${c.events === 1 ? "" : "s"} in an unbroken SHA-256 hash chain. Head <code>${esc(c.head.slice(0, 16))}…</code>`
           : `<span class="badge failed">broken</span> chain fails verification at event #${c.broken_at}.`}</div>`).join("") || `<span class="muted">No events yet.</span>`}
         <p class="hint">Events are append-only: the database rejects updates and deletes on the log. Each space has its own chain.</p>
       </div>
@@ -470,7 +501,9 @@ async function renderSettings() {
     if (S.space) body.space = S.space;  // otherwise it hears every space this token sees
     try {
       const sub = await api("POST", "/api/webhooks", body);
-      prompt("Webhook created. Signing secret (shown once):", sub.secret);
+      const copyIt = await ask({ title: "Webhook created", body: `<p>Its signing secret is shown only this once. Verify <code>X-Decisions-Signature</code> with it.</p>
+        <pre class="install-cmd">${esc(sub.secret)}</pre>`, ok: "Copy secret", cancel: "Close" });
+      if (copyIt !== null) copy(sub.secret, "signing secret");
       renderSettings();
     } catch (err) { fail(err); }
   };
@@ -495,7 +528,7 @@ function webhookTable(hooks) {
 
 function renderDecision() {
   const d = S.d;
-  if (d.status === "resolved" && d.resolution) return renderResolved(d);
+  if (d.status !== "open") return renderClosed(d);
   const u = ui();
   const parts = partition();
   const { metas, visible, filtered, excluded } = parts;
@@ -506,7 +539,6 @@ function renderDecision() {
   const scroll = main.scrollTop;
   main.innerHTML = `<div class="page">
     ${headerHtml(d)}
-    ${bannerHtml(d)}
     <div id="deadline-card">${deadlineHtml(d)}</div>
     <div id="resume-card">${resumeHtml(d)}</div>
     <section class="block">
@@ -522,7 +554,7 @@ function renderDecision() {
         <div class="mini-opts">${filtered.map((o) => miniHtml(o, "filtered")).join("")}</div></details>` : ""}
       ${excluded.length ? `<details class="subtle-list" ${u.openExcluded ? "open" : ""} data-key="openExcluded"><summary>Excluded (${excluded.length})</summary>
         <div class="mini-opts">${excluded.map((o) => miniHtml(o, "excluded")).join("")}</div></details>` : ""}
-      ${d.options.length && !closed(d) ? decideBarHtml(d, single) : ""}
+      ${d.options.length ? decideBarHtml(d, single) : ""}
     </section>
     <div class="cols">
       <section class="block">${attrRequestHtml(d, metas)}</section>
@@ -534,51 +566,73 @@ function renderDecision() {
   bindDecision();
 }
 
-// Resolved decisions lead with a summary (what, which option, why), followed by the full
-// record read-only: context, every option with its attributes, and the activity log.
-function renderResolved(d) {
+// Closed decisions (resolved, expired, cancelled) lead with the outcome, followed by the full
+// record read-only: context, every option with its attributes, and the activity log. Reopen to change it.
+function renderClosed(d) {
   const r = d.resolution;
-  const picked = d.selected_options.map((o) => `<strong>${esc(o.label)}</strong>`).join(", ") || "<em>nothing</em>";
-  const links = d.links.map((l) => `<a class="chip" href="${esc(l.url)}" target="_blank" rel="noopener">↗ ${esc(l.title || l.url.replace(/^https?:\/\//, "").slice(0, 50))}</a>`).join("");
-  const meta = Object.entries(d.metadata).filter(([, v]) => typeof v !== "object").slice(0, 8)
-    .map(([k, v]) => `<span class="chip" title="metadata">${esc(k)}: ${esc(String(v).slice(0, 40))}</span>`).join("");
+  const others = S.list.filter((x) => x.status === "open" && x.id !== d.id && inSpace(x)).sort(byDeadline);
   const main = $("#main");
   const scroll = main.scrollTop;
-  main.innerHTML = `<div class="page"><div class="resolved-view">
-    <div class="d-sub"><span class="chip id" data-action="copy-ref" title="Copy a markdown reference for Slack / Linear">${d.id} ⧉</span><span class="chip status resolved">resolved</span>
-      <span title="${esc(fullTime(r.resolved_at))}">${esc(r.resolved_by)} · ${ago(r.resolved_at)}</span>
-      ${spaceChip(d)}
-      ${d.source ? `<span>from <strong>${esc(d.source)}</strong></span>` : ""}
-      <span title="${esc(fullTime(d.created_at))}">created ${ago(d.created_at)}</span>
-      ${d.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}</div>
+  main.innerHTML = `<div class="page"><div class="closed-view">
     <h1 class="d-title">${esc(d.title)}</h1>
-    <div class="banner"><div>Picked ${picked}</div></div>
-    <div class="rationale">${r.note ? md(r.note) : `<span class="muted">No rationale given.</span>`}</div>
+    <div class="d-sub">${subHtml(d)}</div>
+    ${outcomeHtml(d)}
     <div id="resume-card">${resumeHtml(d)}</div>
-    <div class="form-row">
-      <button class="btn primary" data-action="copy-provenance">Copy for provenance</button>
+    <div class="form-row closed-actions">
+      ${r ? `<button class="btn primary" data-action="copy-provenance" title="Copy the choice, rationale and link">Copy for provenance</button>` : ""}
       <button class="btn" data-action="copy-md" title="Copy a markdown summary with the options table">Copy summary</button>
-      <button class="btn" data-action="reopen">Reopen</button>
+      <button class="btn ${r ? "" : "primary"}" data-action="reopen">Reopen</button>
+      <span class="spacer"></span>
+      ${others.length ? `<a class="btn ghost" href="/d/${esc(others[0].id)}" data-nav title="${esc(others[0].title)}">Next: ${esc(others[0].id)} →</a>` : ""}
     </div>
-    ${d.context || links || meta ? `<section class="block"><div class="block-head"><h2>Context</h2></div>
-      ${d.context ? `<div class="context">${md(d.context)}</div>` : ""}
-      ${links || meta ? `<div class="links">${links}${meta}</div>` : ""}</section>` : ""}
-    ${d.options.length ? `<section class="block">${resolvedOptionsHtml(d)}</section>` : ""}
+    ${d.context || linksHtml(d) ? `<section class="block"><div class="block-head"><h2>Context</h2></div>
+      ${d.context ? `<div class="context">${md(d.context)}</div>` : ""}${linksHtml(d)}</section>` : ""}
+    ${d.options.length ? `<section class="block">${closedOptionsHtml(d)}</section>` : ""}
     <section class="block">${activityHtml(d)}</section>
   </div></div>`;
   main.scrollTop = scroll;
-  const commentForm = $("#comment-form");
-  commentForm.onsubmit = (e) => {
-    e.preventDefault();
-    const t = new FormData(commentForm).get("text").trim();
-    if (t) act(() => api("POST", `/api/decisions/${d.id}/comments`, { text: t }));
-  };
+  bindComments(d);
+}
+
+function outcomeHtml(d) {
+  if (d.status === "resolved" && d.resolution) {
+    const r = d.resolution;
+    const picked = d.selected_options.map((o) => `<strong>${esc(o.label)}</strong>`).join(", ") || "<em>nothing</em>";
+    return `<div class="banner"><div>Picked ${picked}
+      <div class="note" title="${esc(fullTime(r.resolved_at))}">by ${esc(r.resolved_by)} · ${ago(r.resolved_at)}</div></div></div>
+      <div class="rationale">${r.note ? md(r.note) : `<span class="muted">No rationale given.</span>`}</div>`;
+  }
+  if (d.status === "cancelled") {
+    const ev = [...S.events].reverse().find((e) => e.type === "decision.cancelled");
+    return `<div class="banner cancelled"><div><strong>Cancelled${ev ? ` by ${esc(ev.actor)}` : ""}${ev ? ` <span class="note" title="${esc(fullTime(ev.ts))}">${ago(ev.ts)}</span>` : ""}</strong>
+      ${ev?.data.note ? `<div class="note">“${esc(ev.data.note)}”</div>` : ""}</div></div>`;
+  }
+  const days = S.config?.deadline_days;
+  return `<div class="banner expired"><div><strong>Expired unanswered</strong>${d.due_at ? ` <span title="${esc(fullTime(d.due_at))}">${ago(d.due_at)}</span>` : ""}.
+    Nobody decided before the deadline, so it was closed as not important enough to block on.
+    <div class="note">Reopen to decide after all${days ? `; that starts a new ${days}-day deadline` : ""}.</div></div></div>`;
+}
+
+function subHtml(d) {
+  return `<span class="chip id" data-action="copy-ref" title="Copy a markdown reference for Slack / Linear">${d.id} ⧉</span>
+    <span class="chip status ${d.status}">${d.status}</span>
+    ${spaceChip(d)}
+    ${d.source ? `<span>from <strong>${esc(d.source)}</strong></span>` : ""}
+    <span title="${esc(fullTime(d.created_at))}">created ${ago(d.created_at)}</span>
+    ${d.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}`;
+}
+
+function linksHtml(d) {
+  const links = d.links.map((l) => `<a class="chip" href="${esc(l.url)}" target="_blank" rel="noopener">↗ ${esc(l.title || l.url.replace(/^https?:\/\//, "").slice(0, 50))}</a>`).join("");
+  const meta = Object.entries(d.metadata).filter(([, v]) => typeof v !== "object").slice(0, 8)
+    .map(([k, v]) => `<span class="chip" title="metadata">${esc(k)}: ${esc(String(v).slice(0, 40))}</span>`).join("");
+  return links || meta ? `<div class="links">${links}${meta}</div>` : "";
 }
 
 // Read-only comparison: picked options first, then the rest, then ruled-out ones with their reason.
-function resolvedOptionsHtml(d) {
+function closedOptionsHtml(d) {
   const metas = attrKeys(d).map((k) => attrMeta(d, k)).filter((m) => m.type !== "image");
-  const chosen = new Set(d.resolution.selected);
+  const chosen = new Set(d.resolution?.selected || []);
   const rank = (o) => (chosen.has(o.id) ? 0 : o.excluded ? 2 : 1);
   const opts = [...d.options].sort((a, b) => rank(a) - rank(b));
   const excludedCount = d.options.filter((o) => o.excluded).length;
@@ -600,9 +654,6 @@ function resolvedOptionsHtml(d) {
 }
 
 function headerHtml(d) {
-  const links = d.links.map((l) => `<a class="chip" href="${esc(l.url)}" target="_blank" rel="noopener">↗ ${esc(l.title || l.url.replace(/^https?:\/\//, "").slice(0, 50))}</a>`).join("");
-  const meta = Object.entries(d.metadata).filter(([, v]) => typeof v !== "object").slice(0, 8)
-    .map(([k, v]) => `<span class="chip" title="metadata">${esc(k)}: ${esc(String(v).slice(0, 40))}</span>`).join("");
   if (S.editing) {
     return `<form class="edit-form" id="edit-form">
       <input class="input" name="title" value="${esc(d.title)}" style="font-size:18px;font-weight:600">
@@ -613,45 +664,16 @@ function headerHtml(d) {
   return `<div class="d-head">
       <div>
         <h1 class="d-title">${esc(d.title)}</h1>
-        <div class="d-sub">
-          <span class="chip id" data-action="copy-ref" title="Copy a markdown reference for Slack / Linear">${d.id} ⧉</span>
-          <span class="chip status ${d.status}">${d.status}</span>
-          ${spaceChip(d)}
-          ${d.source ? `<span>from <strong>${esc(d.source)}</strong></span>` : ""}
-          <span title="${esc(fullTime(d.created_at))}">created ${ago(d.created_at)}</span>
-          ${d.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}
-        </div>
+        <div class="d-sub">${subHtml(d)}</div>
       </div>
       <div class="d-actions">
         <button class="btn small" data-action="copy-md" title="Copy a markdown summary with the options table">Copy summary</button>
         <button class="btn small ghost" data-action="edit">Edit</button>
-        ${d.status === "open" ? `<button class="btn small ghost danger" data-action="cancel-decision">Cancel</button>` : `<button class="btn small ghost" data-action="reopen">Reopen</button>`}
+        <button class="btn small ghost danger" data-action="cancel-decision" title="Withdraw it without picking anything">Cancel decision</button>
       </div>
     </div>
     ${d.context ? `<div class="context">${md(d.context)}</div>` : ""}
-    ${links || meta ? `<div class="links">${links}${meta}</div>` : ""}`;
-}
-
-function bannerHtml(d) {
-  if (d.status === "resolved" && d.resolution) {
-    const labels = d.selected_options.map((o) => `<strong>${esc(o.label)}</strong>`).join(", ") || "<em>nothing</em>";
-    return `<div class="banner"><div>Decided ${labels} <span class="muted small">· ${esc(d.resolution.resolved_by)} · ${ago(d.resolution.resolved_at)}</span>
-      ${d.resolution.note ? `<div class="note">“${esc(d.resolution.note)}”</div>` : ""}</div>
-      <span class="muted small">Change the selection below to revise.</span></div>`;
-  }
-  if (d.status === "cancelled") {
-    const ev = [...S.events].reverse().find((e) => e.type === "decision.cancelled");
-    return `<div class="banner cancelled"><div><strong style="color:var(--muted)">Cancelled${ev ? ` by ${esc(ev.actor)}` : ""}.</strong>
-      ${ev?.data.note ? `“${esc(ev.data.note)}” ` : ""}Reopen to decide after all.</div></div>`;
-  }
-  if (d.status === "expired") {
-    const days = S.config?.deadline_days;
-    return `<div class="banner expired"><div><strong>Expired unanswered</strong>${d.due_at ? ` <span title="${esc(fullTime(d.due_at))}">${ago(d.due_at)}</span>` : ""}.
-      Nobody decided before the deadline, so it was closed as not important enough to block on.
-      <div class="note">Reopen to decide after all${days ? `; that starts a new ${days}-day deadline` : ""}.</div></div>
-      <button class="btn small" data-action="reopen">Reopen</button></div>`;
-  }
-  return "";
+    ${linksHtml(d)}`;
 }
 
 // Open decisions expire at their deadline. Keep the countdown and its consequence in plain view.
@@ -729,13 +751,15 @@ function filtersHtml(metas, filtered) {
     return `<div class="filter ${on ? "active" : ""}">${head}${body}</div>`;
   }).join("");
   const desc = describeFilters(metas);
+  // A short list without attributes is quicker to scan than to filter.
+  if (!fs && S.d.options.length <= 7 && !desc) return "";
   return `<div class="filters">
       <div class="filter search-f ${u.text.trim() ? "active" : ""}"><label>Search options</label><input type="text" id="opt-text" placeholder="Type to narrow…  ( / )" value="${esc(u.text)}"></div>
       ${fs}
     </div>
     <div class="filter-summary">
-      ${desc ? `<span>Filtering: ${esc(desc)}</span>` : `<span>Filter by any attribute to rule options out.</span>`}
-      <label style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="keep-unknown" ${u.keepUnknown ? "checked" : ""}> keep options with unknown values</label>
+      ${desc ? `<span>Filtering: ${esc(desc)}</span>` : fs ? `<span>Filter by any attribute to rule options out.</span>` : ""}
+      ${fs ? `<label style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="keep-unknown" ${u.keepUnknown ? "checked" : ""}> keep options with unknown values</label>` : ""}
       ${desc ? `<button class="btn small ghost" data-action="clear-all-filters">Clear filters</button>` : ""}
       ${filtered.length ? `<button class="btn small" data-action="exclude-filtered" title="Persist: mark the ${filtered.length} hidden options as excluded in the log">Exclude ${filtered.length} hidden</button>` : ""}
     </div>`;
@@ -748,7 +772,7 @@ function tableHtml({ metas, visible, best }, single) {
   const cols = metas.filter((m) => m.type !== "image");
   return `<div class="table-wrap"><table class="opts">
     <thead><tr><th></th><th data-sort="__label">Option${arrow("__label")}</th>
-      ${cols.map((m) => `<th data-sort="${esc(m.key)}" title="${esc(m.def.description || "")}">${esc(m.label)}${m.requested ? ' <span class="req" title="Requested">●</span>' : ""}${m.better ? (m.better === "lower" ? " ↧" : " ↥") : ""}${arrow(m.key)}</th>`).join("")}
+      ${cols.map((m) => `<th data-sort="${esc(m.key)}" title="${esc([m.def.description, m.better && `${m.better} is better`, "click to sort"].filter(Boolean).join(" · "))}">${esc(m.label)}${m.requested ? ' <span class="req" title="Requested">●</span>' : ""}${m.better ? (m.better === "lower" ? " ↧" : " ↥") : ""}${arrow(m.key)}</th>`).join("")}
       <th></th></tr></thead>
     <tbody>${visible.map((o, i) => `
       <tr class="opt ${S.selection.has(o.id) ? "selected" : ""} ${S.focus === i ? "focus" : ""}" data-option="${esc(o.id)}">
@@ -795,13 +819,13 @@ function decideBarHtml(d, single) {
   const n = S.selection.size;
   const valid = n >= d.min_select && (d.max_select === null || n <= d.max_select);
   const labels = d.options.filter((o) => S.selection.has(o.id)).map((o) => o.label);
-  const same = d.resolution && n === d.resolution.selected.length && d.resolution.selected.every((s) => S.selection.has(s));
-  const verb = d.status === "resolved" ? (same ? "Decided" : "Update decision") : "Decide";
+  const need = single ? "Pick an option" : d.max_select === null ? `Pick at least ${d.min_select}` : d.min_select === d.max_select ? `Pick ${d.min_select}` : `Pick ${d.min_select}–${d.max_select}`;
   return `<div class="decide-bar">
-    <div class="sel">${n ? `<strong>${esc(labels.join(", "))}</strong>` : `Select ${single ? "an option" : "options"} <span class="kbd">space</span>`}</div>
-    <input id="note" placeholder="Note / rationale (optional)" value="${esc(S.noteDraft ?? (same ? d.resolution.note : "") ?? "")}">
-    <button class="btn primary" data-action="resolve" ${valid && !same ? "" : "disabled"} title="⌘/Ctrl + Enter">${verb}</button>
-  </div>`;
+    <div class="sel">${n ? `<strong>${esc(labels.join(", "))}</strong>` : need}</div>
+    <input id="note" placeholder="Why? (optional, shown to ${esc(d.source || "the requester")})" value="${esc(S.noteDraft ?? "")}">
+    <button class="btn primary" data-action="resolve" ${valid ? "" : "disabled"} title="⌘/Ctrl + Enter">Decide</button>
+  </div>
+  <div class="kbd-hint"><span class="kbd">j</span><span class="kbd">k</span> move · <span class="kbd">space</span> select · <span class="kbd">x</span> rule out (alt-click ✕ to give a reason)${attrKeys(d).length || d.options.length > 7 ? ` · <span class="kbd">/</span> search` : ""} · <span class="kbd">⌘</span><span class="kbd">↵</span> decide</div>`;
 }
 
 function attrRequestHtml(d, metas) {
@@ -833,9 +857,7 @@ function webhooksHtml(d) {
         ${x.next_attempt_at ? `<div class="muted">next ${new Date(x.next_attempt_at).toLocaleTimeString()}</div>` : ""}</td>
       <td style="text-align:right"><button class="btn small ghost" data-action="redeliver" data-id="${x.id}" title="Fire again now">Re-fire</button></td></tr>`).join("");
   // The eye lets you resolve without telling this listener (say, to fix a typo). Global webhooks always hear.
-  const canSilence = !closed(d);
   const eye = (id) => {
-    if (!canSilence) return "";
     const off = S.silenced.has(id);
     return `<button class="eye ${off ? "off" : ""}" data-action="toggle-silence" data-id="${esc(id)}"
       title="${off ? "Won't be notified when you decide. Click to notify." : "Will be notified when you decide. Click to skip it."}">${off ? EYE_OFF : EYE}</button>`;
@@ -848,7 +870,7 @@ function webhooksHtml(d) {
          <span class="muted">waiting (long-poll) since ${ago(l.since)} for ${esc(l.events.join(", "))}</span>`)
     : row(l.scope === "global" ? null : l.id, `<span class="live on hook"></span><strong>${l.scope === "global" ? "global webhook" : "webhook"}</strong>
          <span class="mono small">${esc(l.url)}</span> <span class="muted">· ${esc(l.events.join(", "))}${l.require_ack ? " · re-fires until acked" : ""}</span>`)).join("");
-  return `<div class="block-head"><h2>Listening</h2><span class="spacer"></span><span class="muted small">${(S.listeners || []).length + (d.resume && S.resumer?.online ? 1 : 0) || "nobody"}</span></div>
+  return `<div class="block-head"><h2>Listening</h2><span class="spacer"></span><span class="muted small">${(S.listeners || []).length + (d.resume ? 1 : 0) || "nobody"}</span></div>
     <div class="panel">
       ${listeners || `<div class="muted small">Nobody is listening for this decision right now. It will still be recorded; the requester can check later.</div>`}
       ${rows ? `<div class="hint" style="margin-top:12px">Webhook deliveries</div><table class="plain"><tr><th>Event</th><th>Status</th><th>Attempts</th><th></th></tr>${rows}</table>` : ""}
@@ -901,7 +923,7 @@ function eventText(e) {
 
 function activityHtml(d) {
   const evs = [...S.events].reverse();
-  return `<div class="block-head"><h2>Activity & provenance</h2><span class="spacer"></span><span class="muted small">${S.events.length} immutable events</span></div>
+  return `<div class="block-head"><h2>Activity & provenance</h2><span class="spacer"></span><span class="muted small">${S.events.length} immutable event${S.events.length === 1 ? "" : "s"}</span></div>
     <div class="panel">
       <form class="form-row" id="comment-form"><input name="text" class="grow" placeholder="Add a comment to the log…"><button class="btn">Comment</button></form>
       <ul class="timeline">${evs.map((e) => `<li>
@@ -979,18 +1001,22 @@ function bindDecision() {
     const key = f.get("key").trim();
     act(() => api("POST", `/api/decisions/${d.id}/attribute-requests`, { key, description: f.get("description").trim() }), `Asked for "${key}"`);
   };
-  const commentForm = $("#comment-form");
-  commentForm.onsubmit = (e) => {
-    e.preventDefault();
-    const t = new FormData(commentForm).get("text").trim();
-    if (t) act(() => api("POST", `/api/decisions/${d.id}/comments`, { text: t }));
-  };
+  bindComments(d);
   const editForm = $("#edit-form");
   if (editForm) editForm.onsubmit = (e) => {
     e.preventDefault();
     const f = new FormData(editForm);
     S.editing = false;
     act(() => api("PATCH", `/api/decisions/${d.id}`, { title: f.get("title"), context: f.get("context") }), "Saved");
+  };
+}
+
+function bindComments(d) {
+  const form = $("#comment-form");
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const t = new FormData(form).get("text").trim();
+    if (t) act(() => api("POST", `/api/decisions/${d.id}/comments`, { text: t }));
   };
 }
 
@@ -1014,7 +1040,7 @@ document.addEventListener("click", async (e) => {
   const d = S.d;
   if (!a) {
     const opt = e.target.closest("[data-option]");
-    if (opt && d && !closed(d)) toggleSelect(opt.dataset.option);
+    if (opt && d?.status === "open") toggleSelect(opt.dataset.option);
     return;
   }
   e.stopPropagation();
@@ -1022,8 +1048,10 @@ document.addEventListener("click", async (e) => {
   switch (a.dataset.action) {
     case "view": ui().view = a.dataset.view; saveUi(); return renderDecision();
     case "exclude": {
-      const reason = e.altKey ? prompt("Why is this not viable?") || undefined : undefined;
-      return exclude([id], reason);
+      if (!e.altKey) return exclude([id]);
+      const label = d.options.find((o) => o.id === id)?.label || id;
+      const reason = await ask({ title: `Rule out ${label}?`, field: "Why isn't it viable? (recorded in the log)", ok: "Rule out" });
+      return reason === null ? undefined : exclude([id], reason || undefined);
     }
     case "include": return act(() => api("POST", `/api/decisions/${d.id}/include`, { option_ids: [id] }));
     case "exclude-filtered": {
@@ -1047,12 +1075,17 @@ document.addEventListener("click", async (e) => {
       return;
     }
     case "reopen": {
-      const note = prompt("Reopen — note (optional):");
+      // The server restarts a deadline that has already passed.
+      const days = S.config?.deadline_days;
+      const restarts = days && (!d.due_at || new Date(d.due_at) <= Date.now());
+      const note = await ask({ title: `Reopen ${d.id}?`, body: `<p>It goes back to open${restarts ? ` with a new ${days}-day deadline` : ""}, and its listeners hear <code>decision.reopened</code>.</p>`,
+        field: "Note (optional)", ok: "Reopen" });
       if (note === null) return;
       return act(() => api("POST", `/api/decisions/${d.id}/reopen`, { note }), "Reopened");
     }
     case "cancel-decision": {
-      const note = prompt("Cancel this decision — note (optional):");
+      const note = await ask({ title: `Cancel ${d.id}?`, body: `<p>${esc(d.source || "The requester")} is told it was withdrawn without a choice. You can reopen it later.</p>`,
+        field: "Note (optional)", ok: "Cancel decision", cancel: "Keep open", danger: true });
       if (note === null) return;
       return act(() => api("POST", `/api/decisions/${d.id}/cancel`, { note }), "Cancelled");
     }
@@ -1082,7 +1115,7 @@ document.addEventListener("click", async (e) => {
     case "cancel-attr": return act(() => api("DELETE", `/api/decisions/${d.id}/attribute-requests/${encodeURIComponent(a.dataset.key)}`));
     case "redeliver": return act(async () => { await api("POST", `/api/deliveries/${id}/redeliver`); return null; }, "Re-firing").then(() => d && loadDecision(d.id, { keepSelection: true }));
     case "toggle-hook": try { await api("PATCH", `/api/webhooks/${id}`, { active: a.dataset.active !== "true" }); renderSettings(); } catch (err) { fail(err); } return;
-    case "delete-hook": if (confirm("Delete this webhook?")) { try { await api("DELETE", `/api/webhooks/${id}`); renderSettings(); } catch (err) { fail(err); } } return;
+    case "delete-hook": if (await ask({ title: "Delete this webhook?", body: `<p>It stops receiving events and its pending retries are cancelled. Past deliveries stay on record.</p>`, ok: "Delete", danger: true }) !== null) { try { await api("DELETE", `/api/webhooks/${id}`); renderSettings(); } catch (err) { fail(err); } } return;
   }
 });
 
@@ -1097,15 +1130,18 @@ async function resolve() {
   const { metas } = partition();
   const filters = describeFilters(metas) || undefined;
   const silence = [...S.silenced];
+  const told = (S.listeners || []).length + (d.resume ? 1 : 0) - silence.length;
   await act(() => api("POST", `/api/decisions/${d.id}/resolve`, { selected: [...S.selection], note, filters, silence }),
-            `${d.id} decided${silence.length ? ` — ${silence.length} listener${silence.length > 1 ? "s" : ""} not notified` : " — webhook firing"}`);
+            `${d.id} decided${told > 0 ? ` · notifying ${told}` : ""}${silence.length ? ` · ${silence.length} not notified` : ""}`);
   S.noteDraft = undefined;
   S.silenced = new Set();
 }
 
 document.addEventListener("keydown", (e) => {
-  if (!S.d || S.editing || S.d.status === "resolved" || closed(S.d)) return;
+  if (!S.d || S.editing || S.d.status !== "open" || dialogOpen()) return;
   const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
+  // Enter and space belong to a focused button or link.
+  if (["BUTTON", "A", "SUMMARY"].includes(document.activeElement?.tagName) && (e.key === "Enter" || e.key === " ")) return;
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
     const btn = $('[data-action="resolve"]');
     if (btn && !btn.disabled) { e.preventDefault(); resolve(); }
