@@ -262,7 +262,8 @@ function attrMeta(d, key) {
   const nums = values.filter((v) => typeof v === "number");
   return {
     key, type, def,
-    label: def.label || key.replace(/[_-]+/g, " ").replace(/^./, (c) => c.toUpperCase()),
+    // Short keys are usually acronyms: "sso" reads as "SSO".
+    label: def.label || (key.length <= 3 ? key.toUpperCase() : key.replace(/[_-]+/g, " ").replace(/^./, (c) => c.toUpperCase())),
     unit: def.unit || "",
     better: def.better,
     requested: !!def.requested,
@@ -361,7 +362,10 @@ function valueHtml(v, m) {
   if (typeof v === "object") return esc(JSON.stringify(v));
   // "1 day", not "1 days", for the common time units.
   const unit = m.unit ? " " + esc(Math.abs(v) === 1 && /^(second|minute|hour|day|week|month|year)s$/i.test(m.unit) ? m.unit.slice(0, -1) : m.unit) : "";
-  if (typeof v === "number") return v.toLocaleString(undefined, { maximumFractionDigits: 4 }) + unit;
+  if (typeof v === "number") {
+    const n = v.toLocaleString(undefined, { maximumFractionDigits: 4 });
+    return /^[$€£¥]$/.test(m.unit) ? esc(m.unit) + n : n + unit;  // "$41", "41 SEK"
+  }
   if (/^https?:\/\//.test(v)) return `<a href="${esc(v)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${esc(v.replace(/^https?:\/\/(www\.)?/, "").slice(0, 40))}</a>`;
   return esc(v) + unit;
 }
@@ -378,15 +382,21 @@ const multiSpace = () => (S.config?.spaces || []).length > 1;
 const inSpace = (d) => !S.space || d.space === S.space;
 const spaceChip = (d) => multiSpace() ? `<span class="chip space" title="Space">${esc(d.space)}</span>` : "";
 
+let loadSeq = 0;
 async function loadDecision(id, { keepSelection = false } = {}) {
+  const seq = ++loadSeq;
   const [d, ev, dl, ls] = await Promise.all([
     api("GET", `/api/decisions/${id}`),
     api("GET", `/api/decisions/${id}/events`),
     api("GET", `/api/deliveries?decision=${id}`),
     api("GET", `/api/decisions/${id}/listeners`),
   ]);
+  let resumer;
+  try { resumer = await api("GET", resumerPath(d)); } catch {}
+  // A slower response for a decision you've since left must not replace the one you're looking at.
+  if (seq !== loadSeq) return;
   S.listeners = ls.listeners;
-  try { S.resumer = await api("GET", resumerPath(d)); } catch {}
+  S.resumer = resumer;
   const switched = !S.d || S.d.id !== d.id;
   S.d = d;
   S.events = ev.events;
@@ -398,7 +408,11 @@ async function loadDecision(id, { keepSelection = false } = {}) {
   for (const s of [...S.selection]) if (!d.options.some((o) => o.id === s)) S.selection.delete(s);
   renderDecision();
   renderSidebar();
+  if (switched) announce(`Loaded ${d.id}: ${d.title}`);
 }
+
+// Screen-reader announcements that survive re-renders.
+const announce = (text) => { const el = $("#sr-status"); if (el) { el.textContent = ""; setTimeout(() => (el.textContent = text), 50); } };
 
 let pollAbort = 0;
 async function poll() {
@@ -563,9 +577,12 @@ function renderEmpty() {
   }'</pre></div></div>`;
 }
 
-// Event types a global webhook can subscribe to.
-const HOOK_EVENTS = ["decision.created", "decision.updated", "decision.resolved", "decision.reopened", "decision.cancelled",
-  "decision.expired", "decision.commented", "options.added", "options.updated", "options.excluded", "attributes.requested"];
+// Event types a global webhook can subscribe to, grouped and described.
+const HOOK_EVENTS = {
+  "Outcome": { "decision.resolved": "Decided", "decision.expired": "Expired undecided", "decision.cancelled": "Cancelled", "decision.reopened": "Reopened" },
+  "Activity": { "decision.created": "Created", "decision.updated": "Edited or deadline moved", "decision.commented": "Commented", "attributes.requested": "Attributes requested" },
+  "Options": { "options.added": "Options added", "options.updated": "Options updated", "options.excluded": "Options ruled out" },
+};
 
 async function renderSettings() {
   const [hooks, verify, cfg, rsAll] = await Promise.all([api("GET", "/api/webhooks"), api("GET", "/api/events/verify"),
@@ -590,11 +607,12 @@ async function renderSettings() {
     <section class="setting">
       <header><h2>Global webhooks</h2><p>Receive events for every decision${S.space ? ` in <strong>${esc(S.space)}</strong>` : ""}, e.g. to notify Slack or sync another app. Agents set per-decision webhooks themselves.</p></header>
       <div>
-        ${webhookTable(global)}
-        <form class="hook-form" id="add-global-hook">
+        <div class="panel">${webhookTable(global)}</div>
+        <form class="hook-form panel" id="add-global-hook"><h3 class="form-title">Add a webhook</h3>
           <label class="lf">Endpoint URL<input class="input" name="url" type="url" placeholder="https://example.com/hooks/decisions" required></label>
-          <fieldset><legend>Events</legend><div class="event-picks">
-            ${HOOK_EVENTS.map((e) => `<label><input type="checkbox" name="events" value="${e}" ${cfg.default_webhook_events.includes(e) ? "checked" : ""}>${e}</label>`).join("")}
+          <fieldset><legend>Events</legend><div class="event-groups">
+            ${Object.entries(HOOK_EVENTS).map(([group, evs]) => `<div class="event-group"><div class="eg-title">${group}</div>
+              ${Object.entries(evs).map(([e, label]) => `<label class="event-pick"><input type="checkbox" name="events" value="${e}" ${cfg.default_webhook_events.includes(e) ? "checked" : ""}><span>${label}<code>${e}</code></span></label>`).join("")}</div>`).join("")}
           </div></fieldset>
           <label class="check-label small"><input type="checkbox" name="ack"> Re-fire every ${w.refire_interval}s until acknowledged</label>
           <div><button class="btn primary">${icon("plus", 15)}Add webhook</button></div>
@@ -723,6 +741,9 @@ function renderDecision() {
     bindDecision();
   });
   syncPopModal();
+  const shown = `${visible.length} of ${d.options.length} options shown`;
+  if (S.lastShown && S.lastShown !== shown && S.lastShownId === d.id) announce(shown);
+  S.lastShown = shown; S.lastShownId = d.id;
 }
 
 // Closed decisions (resolved, expired, cancelled) lead with the outcome, followed by the full
@@ -809,7 +830,7 @@ function closedOptionsHtml(d) {
   if (narrow.matches) return head + `<div class="cards readonly">${opts.map((o) => `
     <div class="card ${chosen.has(o.id) ? "selected" : ""} ${o.excluded ? "excluded" : ""}">
       ${o.image ? `<img class="hero" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
-      <div class="body"><div class="top">${chosen.has(o.id) ? `<span class="picked" title="Picked">${icon("check-circle", 18)}</span>` : ""}<div class="opt-label">${esc(o.label)}${chosen.has(o.id) ? `<span class="sr-only"> (picked)</span>` : ""}</div></div>
+      <div class="body">${chosen.has(o.id) ? `<span class="sel-badge">${icon("check", 13)}Selected</span>` : ""}<div class="top"><div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}</div></div>
         ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}
         ${o.excluded ? `<div class="opt-desc">Ruled out${o.exclude_reason ? `: ${esc(o.exclude_reason)}` : ""}</div>` : ""}
         ${metas.length ? `<dl>${metas.map((m) => `<dt>${esc(m.label)}</dt><dd class="${o.attributes[m.key] == null ? "missing" : ""}">${cellHtml(o.attributes[m.key], m, o.attribute_meta[m.key])}</dd>`).join("")}</dl>` : ""}</div>
@@ -926,7 +947,7 @@ function filterSummary(m, f) {
   return "";
 }
 
-function filtersHtml({ metas, filtered, best }) {
+function filtersHtml({ metas, filtered }) {
   const u = ui();
   const d = S.d;
   const usable = metas.filter((m) => m.type !== "url" && m.type !== "image" && (m.distinct.length || m.requested));
@@ -967,7 +988,6 @@ function filtersHtml({ metas, filtered, best }) {
       <div class="tsearch">${icon("search", 15)}<input type="search" id="opt-text" placeholder="Search options" aria-label="Search options" value="${esc(u.text)}"><span class="kbd" aria-hidden="true">/</span></div>
       ${fs ? `<span class="tlabel">${icon("filter", 14)}${active.length ? `${active.length} filter${active.length > 1 ? "s" : ""}` : "Filter"}</span>${fs}` : ""}
       <span class="spacer"></span>
-      ${Object.keys(best).length ? `<span class="legend"><span class="best-mark"></span>${chips.length ? "Best among shown" : "Best"}: ${esc(metas.filter((m) => best[m.key] !== undefined).map((m) => `${m.better === "lower" ? "lowest" : "highest"} ${m.label.toLowerCase()}`).join(", "))}</span>` : ""}
     </div>
     ${chips.length ? `<div class="active-filters" role="status">
       ${chips.join("")}
@@ -987,7 +1007,8 @@ function sortHead(key, label, extra = "") {
   return `<button class="sortb" data-sort="${esc(key)}" title="Sort by ${esc(label.replace(/<[^>]+>/g, ""))}">${label}${extra}${icon(st === "none" ? "sort" : st === "ascending" ? "arrow-up" : "arrow-down", 13)}</button>`;
 }
 
-function bestTitle(m) { return `Best ${m.label.toLowerCase()} (${m.better} is better)`; }
+function bestTitle(m) { return `${m.better === "lower" ? "Lowest" : "Highest"} ${m.label.toLowerCase()} among shown options`; }
+const bestTag = (m) => `<span class="best-tag">${m.better === "lower" ? "lowest" : "highest"}</span>`;
 
 function tableHtml({ metas, visible, best }, single) {
   if (!visible.length) return S.d.options.length ? `<div class="panel muted" style="margin-top:12px">No options match the filters. <button class="btn small ghost" data-action="clear-all-filters">Reset filters</button></div>` : "";
@@ -1007,7 +1028,7 @@ function tableHtml({ metas, visible, best }, single) {
           const v = o.attributes[m.key];
           const isBest = best[m.key] !== undefined && v === best[m.key];
           const cls = [v == null ? "missing" : "", typeof v === "number" ? "num" : "", isBest ? "best" : ""].join(" ");
-          return `<td class="${cls}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? `<span class="best-mark" aria-hidden="true"></span>` : ""}${cellHtml(v, m, o.attribute_meta[m.key])}${isBest ? `<span class="sr-only"> (best)</span>` : ""}</td>`;
+          return `<td class="${cls}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? bestTag(m) : ""}${cellHtml(v, m, o.attribute_meta[m.key])}</td>`;
         }).join("")}
         <td class="act">${optMenuHtml(o, false)}</td>
       </tr>`).join("")}</tbody></table></div>`;
@@ -1027,7 +1048,7 @@ function cardsHtml({ metas, visible, best }, single) {
         ${cols.length ? `<dl>${cols.map((m) => {
           const v = o.attributes[m.key];
           const isBest = best[m.key] !== undefined && v === best[m.key];
-          return `<dt>${esc(m.label)}</dt><dd class="${v == null ? "missing" : ""} ${isBest ? "best" : ""}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? `<span class="best-mark" aria-hidden="true"></span>` : ""}${cellHtml(v, m, o.attribute_meta[m.key])}${isBest ? `<span class="sr-only"> (best)</span>` : ""}</dd>`;
+          return `<dt>${esc(m.label)}</dt><dd class="${v == null ? "missing" : ""} ${isBest ? "best" : ""}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? bestTag(m) : ""}${cellHtml(v, m, o.attribute_meta[m.key])}</dd>`;
         }).join("")}</dl>` : ""}
       </div>
     </div>`).join("")}</div>`;
@@ -1036,11 +1057,11 @@ function cardsHtml({ metas, visible, best }, single) {
 // "Rule out" offers both the quick action and one with a reason, so neither depends on a hidden modifier.
 function optMenuHtml(o, compact) {
   return `<details class="omenu ruleout" data-menu="${esc(o.id)}">
-    <summary class="omenu-btn ${compact ? "icon-only" : ""}" aria-label="Rule out ${esc(o.label)}" aria-haspopup="menu" title="Rule out">${compact ? icon("more", 16) : `${icon("x", 14)}Rule out${icon("chevron-down", 14)}`}</summary>
-    <div class="menu" role="menu">
-      <button role="menuitem" data-action="exclude" data-id="${esc(o.id)}">${icon("x", 15)}Rule out<span class="kbd">X</span></button>
-      <button role="menuitem" data-action="add-reason" data-id="${esc(o.id)}">${icon("pencil", 15)}Rule out with reason…</button>
-      ${o.url ? `<a role="menuitem" href="${esc(o.url)}" target="_blank" rel="noopener">${icon("external", 15)}Open link</a>` : ""}
+    <summary class="omenu-btn ${compact ? "icon-only" : ""}" aria-label="${compact ? `Actions for ${esc(o.label)}` : `Rule out ${esc(o.label)}`}" title="${compact ? "Actions" : "Rule out"}">${compact ? icon("more", 16) : `${icon("x", 14)}Rule out${icon("chevron-down", 14)}`}</summary>
+    <div class="menu">
+      <button data-action="exclude" data-id="${esc(o.id)}">${icon("x", 15)}Rule out<span class="kbd">X</span></button>
+      <button data-action="add-reason" data-id="${esc(o.id)}">${icon("pencil", 15)}Rule out with reason…</button>
+      ${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${icon("external", 15)}Open link</a>` : ""}
     </div></details>`;
 }
 
@@ -1067,12 +1088,14 @@ function decideBarHtml(d, single, { visible }) {
     : !valid && n > (max ?? Infinity) ? `<span class="need warn">${why}</span>`
     : single ? `<span class="names" title="${esc(labels[0])}">${esc(labels[0])}</span>`
     : `<span class="count">${n} selected</span>${limit ? `<span class="limit">· ${limit}</span>` : ""}<span class="names" title="${esc(labels.join(", "))}">${esc(labels.join(", "))}</span>`;
-  return `<div class="decide-bar ${n ? "has-sel" : ""} ${S.notes[d.id] ? "with-reason" : ""}" role="region" aria-label="Decide">
+  const showReason = S.notes[d.id] || S.showReason === d.id;
+  return `<div class="decide-bar ${showReason ? "with-reason" : ""}" role="region" aria-label="Decide">
     <div class="sel" aria-live="polite">${sel}</div>
-    <div class="reason-field"><label for="note">Reason</label><input id="note" placeholder="Optional, shown to ${esc(d.source || "the requester")}" value="${esc(S.notes[d.id] ?? "")}" autocomplete="off"></div>
-    <button class="btn primary" data-action="resolve" ${valid && !S.resolving ? "" : "disabled"} title="${esc(why || "Decide (⌘↵)")}" aria-keyshortcuts="Meta+Enter Control+Enter">${S.resolving ? "Deciding…" : `${icon("check", 15)}Decide`}<span class="kbd" aria-hidden="true">⌘↵</span></button>
-    ${hidden.length ? `<div class="bar-note" role="status">${icon("help", 15)}<span>${hidden.length === 1 ? `“${esc(hidden[0].label)}” is selected but hidden by filters.` : `${esc(hidden.map((o) => o.label).join(", "))} are selected but hidden by filters.`}</span>
+    ${hidden.length ? `<div class="hid" role="status" title="${esc(hidden.map((o) => o.label).join(", "))}">${icon("help", 14)}<span>${hidden.length} selected outside results</span>
       <button class="btn small ghost" data-action="clear-all-filters">Show</button><button class="btn small ghost" data-action="deselect-hidden">Deselect</button></div>` : ""}
+    <div class="reason-field"><label for="note">Reason</label><input id="note" placeholder="Optional, shown to ${esc(d.source || "the requester")}" value="${esc(S.notes[d.id] ?? "")}" autocomplete="off"></div>
+    <button class="btn ghost small add-reason-btn" data-action="show-reason">${icon("pencil", 14)}Reason</button>
+    <button class="btn primary" data-action="resolve" ${valid && !S.resolving ? "" : "disabled"} title="${esc(why || "Decide (⌘↵)")}" aria-keyshortcuts="Meta+Enter Control+Enter">${S.resolving ? "Deciding…" : `${icon("check", 15)}Decide`}<span class="kbd" aria-hidden="true">⌘↵</span></button>
     ${S.resolveError?.id === d.id ? `<div class="bar-note bad" role="alert">${icon("ban", 15)}<span>Couldn't decide: ${esc(S.resolveError.message)}</span>
       <button class="btn small" data-action="resolve" ${valid ? "" : "disabled"}>Retry</button></div>` : ""}
   </div>
@@ -1267,6 +1290,12 @@ function bindDecision() {
   if (text) text.addEventListener("input", () => { u.text = text.value; saveUi(); renderDecision(); });
   const keep = $("#keep-unknown");
   if (keep) keep.onchange = () => { u.keepUnknown = keep.checked; saveUi(); renderDecision(); };
+  main.querySelectorAll("details.omenu").forEach((el) => el.addEventListener("toggle", () => {
+    if (!el.open) return;
+    document.querySelectorAll("details.omenu[open]").forEach((o) => o !== el && o.removeAttribute("open"));
+    placeMenu(el);
+    el.querySelector(".menu button")?.focus();
+  }));
   main.querySelectorAll("details[data-key]").forEach((el) => el.addEventListener("toggle", () => { u[el.dataset.key] = el.open; saveUi(); }));
   main.querySelectorAll("[data-sort]").forEach((b) => b.onclick = () => {
     const k = b.dataset.sort;
@@ -1300,6 +1329,19 @@ function bindDecision() {
   }
 }
 
+// Menus are fixed to the viewport so table scrolling and card overflow can't clip them.
+function placeMenu(el) {
+  const menu = el.querySelector(".menu"), at = el.querySelector("summary").getBoundingClientRect();
+  menu.style.visibility = "hidden";
+  menu.style.left = menu.style.top = "0px";
+  const h = menu.offsetHeight, w = menu.offsetWidth;
+  const below = at.bottom + 4 + h <= innerHeight - 8;
+  menu.style.top = `${below ? at.bottom + 4 : Math.max(8, at.top - 4 - h)}px`;
+  menu.style.left = `${Math.max(8, Math.min(at.right - w, innerWidth - w - 8))}px`;
+  menu.style.visibility = "";
+}
+addEventListener("scroll", () => document.querySelectorAll("details.omenu[open]").forEach((m) => m.removeAttribute("open")), true);
+
 function bindComments(d) {
   const form = $("#comment-form");
   form.onsubmit = async (e) => {
@@ -1316,7 +1358,9 @@ function syncPopModal() {
   modalInert = [];
   syncInert();
   const open = narrow.matches && S.pop && document.querySelector(`details[data-pop="${CSS.escape(S.pop)}"][open]`);
+  document.querySelectorAll(".pop[aria-modal]").forEach((p) => p.removeAttribute("aria-modal"));
   if (!open) return;
+  open.querySelector(".pop").setAttribute("aria-modal", "true");
   for (let node = open.querySelector(".pop"); node.parentElement && node !== document.body; node = node.parentElement)
     for (const sib of node.parentElement.children)
       if (sib !== node && !sib.inert && !sib.matches(".pop-scrim, #toast, #conn, script")) { sib.inert = true; modalInert.push(sib); }
@@ -1360,6 +1404,7 @@ document.addEventListener("click", async (e) => {
     case "drawer": return drawer();
     case "close-pop": return closePops(true);
     case "palette": return palette();
+    case "show-reason": S.showReason = d.id; renderDecision(); return $("#note")?.focus();
     case "retry": return route();
     case "reload": return location.reload();
     case "view": ui().view = a.dataset.view; saveUi(); return renderDecision();
@@ -1526,9 +1571,12 @@ function palette() {
   dlg.className = "dialog palette";
   dlg.setAttribute("aria-label", "Jump to");
   dlg.innerHTML = `<div class="pal-search">${icon("search", 16)}<input type="text" placeholder="Jump to a decision or command…" aria-label="Search decisions and commands" role="combobox" aria-expanded="true" aria-controls="pal-list" autocomplete="off"><span class="kbd">esc</span></div>
-    <ul class="pal-list" id="pal-list" role="listbox"></ul>`;
+    <ul class="pal-list" id="pal-list" role="listbox"></ul>
+    <div class="pal-foot"><span><span class="kbd">↑</span><span class="kbd">↓</span> move</span><span><span class="kbd">↵</span> open</span><span><span class="kbd">esc</span> close</span><span class="pal-more"></span></div>`;
   document.body.append(dlg);
   const input = dlg.querySelector("input"), list = dlg.querySelector("ul");
+  const back = document.activeElement;
+  let navigated = false;
   const commands = [
     ...Object.entries(STATUS_NAMES).map(([k, v]) => ({ kind: "cmd", icon: "filter", label: `Show ${v.toLowerCase()} decisions`, run: () => { S.status = k; storage("status", k); renderSidebar(); drawer(true); } })),
     { kind: "cmd", icon: "settings", label: "Settings", run: () => navigate("/settings") },
@@ -1540,16 +1588,20 @@ function palette() {
   const draw = () => {
     const q = input.value.trim().toLowerCase();
     const hit = (t) => q.split(/\s+/).every((w) => t.toLowerCase().includes(w));
-    items = [...decisions.filter((x) => !q || hit(`${x.d.id} ${x.d.title} ${x.d.source || ""} ${x.d.status}`)).slice(0, 12), ...commands.filter((c) => !q || hit(c.label))];
+    const ds = decisions.filter((x) => !q || hit(`${x.d.id} ${x.d.title} ${x.d.source || ""} ${x.d.status}`));
+    const cs = commands.filter((c) => !q || hit(c.label));
+    items = [...ds.slice(0, 12), ...cs];
     at = Math.min(at, Math.max(0, items.length - 1));
-    list.innerHTML = items.length ? items.map((x, i) => `<li role="option" id="pal-${i}" aria-selected="${i === at}" class="${i === at ? "on" : ""}" data-i="${i}">
+    dlg.querySelector(".pal-more").textContent = ds.length > 12 ? `Showing 12 of ${ds.length} decisions` : "";
+    const group = (i) => i === 0 && ds.length ? `<li class="pal-group" role="presentation">Decisions</li>` : i === Math.min(ds.length, 12) && cs.length ? `<li class="pal-group" role="presentation">Commands</li>` : "";
+    list.innerHTML = items.length ? items.map((x, i) => `${group(i)}<li role="option" id="pal-${i}" aria-selected="${i === at}" class="${i === at ? "on" : ""}" data-i="${i}">
       ${x.kind === "decision" ? `${statusIcon(x.d)}<span class="pal-label">${esc(x.d.title)}</span><span class="pal-meta">${esc(x.d.id)}${x.d.status === "open" && x.d.due_at ? ` · ${until(x.d.due_at)}` : ` · ${esc(x.d.status)}`}</span>`
                               : `${icon(x.icon, 15)}<span class="pal-label">${esc(x.label)}</span>`}</li>`).join("")
       : `<li class="pal-empty">No matches</li>`;
     input.setAttribute("aria-activedescendant", items.length ? `pal-${at}` : "");
     list.querySelector(".on")?.scrollIntoView({ block: "nearest" });
   };
-  const go = (i) => { const x = items[i]; if (!x) return; dlg.close(); x.run(); };
+  const go = (i) => { const x = items[i]; if (!x) return; navigated = true; dlg.close(); x.run(); };
   input.addEventListener("input", () => { at = 0; draw(); });
   input.addEventListener("keydown", (e) => {
     if (e.key === "ArrowDown") { e.preventDefault(); at = Math.min(items.length - 1, at + 1); draw(); }
@@ -1559,7 +1611,7 @@ function palette() {
   list.addEventListener("click", (e) => { const li = e.target.closest("[data-i]"); if (li) go(+li.dataset.i); });
   list.addEventListener("mousemove", (e) => { const li = e.target.closest("[data-i]"); if (li && +li.dataset.i !== at) { at = +li.dataset.i; draw(); } });
   dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
-  dlg.addEventListener("close", () => dlg.remove());
+  dlg.addEventListener("close", () => { dlg.remove(); if (!navigated) back?.focus?.(); });
   draw();
   dlg.showModal();
   input.focus();
