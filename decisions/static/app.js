@@ -12,6 +12,7 @@ const S = {
   config: null,
   token: storage("token") || "",
   status: storage("status") || "open",
+  space: storage("space") || "",   // "" = every space this token sees
   q: "",
   list: [],
   counts: {},
@@ -20,6 +21,7 @@ const S = {
   deliveries: [],
   cursor: 0,
   selection: new Set(),
+  silenced: new Set(), // listener ids the next resolve won't notify ("resumer", "poll:<actor>", webhook id)
   focus: -1,
   editing: false,
   ui: {},             // per-decision UI state: filters, view, sort, keepUnknown, text
@@ -264,12 +266,14 @@ function valueHtml(v, m) {
 // ------------------------------------------------------------------ data loading
 
 async function loadList() {
-  const all = (await api("GET", "/api/decisions?status=all&limit=500")).decisions;
-  S.counts = { open: 0, resolved: 0, expired: 0, cancelled: 0, all: all.length };
-  for (const d of all) S.counts[d.status]++;
-  S.list = all;
+  S.list = (await api("GET", "/api/decisions?status=all&limit=500")).decisions;
   renderSidebar();
 }
+
+// Spaces only show up in the GUI once there's more than one to tell apart.
+const multiSpace = () => (S.config?.spaces || []).length > 1;
+const inSpace = (d) => !S.space || d.space === S.space;
+const spaceChip = (d) => multiSpace() ? `<span class="chip space" title="Space">${esc(d.space)}</span>` : "";
 
 async function loadDecision(id, { keepSelection = false } = {}) {
   const [d, ev, dl, ls] = await Promise.all([
@@ -286,7 +290,7 @@ async function loadDecision(id, { keepSelection = false } = {}) {
   S.deliveries = dl.deliveries;
   if (switched || !keepSelection) {
     S.selection = new Set(d.resolution ? d.resolution.selected : []);
-    if (switched) { S.focus = -1; S.editing = false; }
+    if (switched) { S.focus = -1; S.editing = false; S.silenced = new Set(); }
   }
   for (const s of [...S.selection]) if (!d.options.some((o) => o.id === s)) S.selection.delete(s);
   renderDecision();
@@ -327,7 +331,7 @@ async function route() {
     S.d = null;
     renderSidebar();
     if (path === "/settings") return await renderSettings();
-    const first = S.list.filter((d) => d.status === "open").sort(byDeadline)[0];
+    const first = S.list.filter((d) => d.status === "open" && inSpace(d)).sort(byDeadline)[0];
     if (first) return navigate(`/d/${first.id}`, true);
     renderEmpty();
   } catch (e) {
@@ -338,11 +342,23 @@ async function route() {
 // ------------------------------------------------------------------ sidebar
 
 function renderSidebar() {
+  const spaces = (S.config?.spaces || []).map((s) => s.name);
+  if (S.space && !spaces.includes(S.space)) S.space = "";
+  const spaceTabs = $("#space-tabs");
+  spaceTabs.hidden = !multiSpace();
+  if (multiSpace()) {
+    const openIn = (s) => S.list.filter((d) => d.status === "open" && (!s || d.space === s)).length;
+    spaceTabs.innerHTML = ["", ...spaces].map((s) => { const n = openIn(s);
+      return `<button class="tab ${S.space === s ? "active" : ""} ${n ? "has-open" : ""}" data-space="${esc(s)}">${s ? esc(s) : "All"}<span class="n">${n || ""}</span></button>`; }).join("");
+  }
+  const list = S.list.filter(inSpace);
+  S.counts = { open: 0, resolved: 0, expired: 0, cancelled: 0, all: list.length };
+  for (const d of list) S.counts[d.status]++;
   const tabs = ["open", "resolved", "expired", "cancelled", "all"];
   const names = { open: "Open", resolved: "Resolved", expired: "Expired", cancelled: "Cancelled", all: "All" };
   $("#status-tabs").innerHTML = tabs.map((t) =>
     `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && S.counts.open ? "has-open" : ""}" data-status="${t}">${names[t]}<span class="n">${S.counts[t] ?? ""}</span></button>`).join("");
-  const open = S.list.filter((d) => d.status === "open").sort(byDeadline);
+  const open = list.filter((d) => d.status === "open").sort(byDeadline);
   document.title = (open.length ? `(${open.length}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : "Decisions");
   $("#attention").innerHTML = open.length
     ? `<a href="/d/${open[0].id}" data-nav class="attention ${urgency(open[0])}" title="Undecided decisions expire at their deadline, and the requester is told it wasn't important">
@@ -350,7 +366,7 @@ function renderSidebar() {
         <span>${open[0].due_at ? `next expires in ${until(open[0].due_at)}: ${esc(open[0].id)}` : `oldest: ${esc(open[0].id)}`}</span></a>`
     : `<div class="attention clear"><strong>Nothing to decide</strong></div>`;
   const q = S.q.toLowerCase();
-  let items = S.list.filter((d) => (S.status === "all" || d.status === S.status) &&
+  let items = list.filter((d) => (S.status === "all" || d.status === S.status) &&
     (!q || d.title.toLowerCase().includes(q) || d.id.toLowerCase().includes(q) || (d.source || "").toLowerCase().includes(q)));
   // Most urgent first: open decisions by deadline, ahead of everything else.
   items = [...items.filter((d) => d.status === "open").sort(byDeadline), ...items.filter((d) => d.status !== "open")];
@@ -363,6 +379,7 @@ function renderSidebar() {
         ${due ? `<span class="dl-due" title="Expires ${esc(fullTime(d.due_at))} unless decided">${until(d.due_at)}</span>` : ""}
         ${d.status === "expired" ? `<span class="dl-due" title="Expired ${esc(fullTime(d.due_at))}: nobody decided in time">expired</span>` : ""}</div>
       <div class="dl-meta">
+        ${multiSpace() && !S.space ? `<span class="dl-space">${esc(d.space)}</span>` : ""}
         ${d.source ? `<span>${esc(d.source)}</span>` : ""}
         <span>${d.option_count - d.excluded_count}/${d.option_count} options</span>
         ${pending ? `<span title="Waiting for requested attributes"><span class="dot"></span>attrs</span>` : ""}
@@ -416,7 +433,7 @@ async function renderSettings() {
     <section class="block">
       <div class="block-head"><h2>Global webhooks</h2></div>
       <div class="panel">
-        <p class="hint" style="margin-top:0">Receive events for <em>every</em> decision, e.g. to notify Slack or sync to another app. Per-decision webhooks are set by the creating agent.</p>
+        <p class="hint" style="margin-top:0">Receive events for <em>every</em> decision${S.space ? ` in <strong>${esc(S.space)}</strong> (the space selected in the sidebar)` : ""}, e.g. to notify Slack or sync to another app. Per-decision webhooks are set by the creating agent.</p>
         ${webhookTable(global)}
         <form class="form-row" id="add-global-hook" style="margin-top:10px">
           <input class="grow" name="url" placeholder="https://example.com/hooks/decisions" required>
@@ -437,9 +454,10 @@ async function renderSettings() {
     <section class="block">
       <div class="block-head"><h2>Audit log</h2></div>
       <div class="panel small">
-        ${verify.ok ? `<span class="badge ok">intact</span> ${verify.events} events in an unbroken SHA-256 hash chain. Head <code>${esc((verify.head || "").slice(0, 16))}…</code>`
-                    : `<span class="badge failed">broken</span> chain fails verification at event #${verify.broken_at}.`}
-        <p class="hint">Events are append-only: the database rejects updates and deletes on the log.</p>
+        ${Object.entries(verify.chains).map(([space, c]) => `<div>${multiSpace() || space === "*" ? `<strong>${space === "*" ? "server" : esc(space)}</strong> · ` : ""}${c.ok
+          ? `<span class="badge ok">intact</span> ${c.events} events in an unbroken SHA-256 hash chain. Head <code>${esc(c.head.slice(0, 16))}…</code>`
+          : `<span class="badge failed">broken</span> chain fails verification at event #${c.broken_at}.`}</div>`).join("") || `<span class="muted">No events yet.</span>`}
+        <p class="hint">Events are append-only: the database rejects updates and deletes on the log. Each space has its own chain.</p>
       </div>
     </section>
   </div>`;
@@ -449,6 +467,7 @@ async function renderSettings() {
     const body = { url: f.get("url") };
     if (f.get("events")) body.events = f.get("events").split(",").map((s) => s.trim()).filter(Boolean);
     if (f.get("ack")) body.require_ack = true;
+    if (S.space) body.space = S.space;  // otherwise it hears every space this token sees
     try {
       const sub = await api("POST", "/api/webhooks", body);
       prompt("Webhook created. Signing secret (shown once):", sub.secret);
@@ -461,8 +480,10 @@ const installCommand = (cfg) => `curl -fsSL ${cfg.install_url} | sh` + (cfg.auth
 
 function webhookTable(hooks) {
   if (!hooks.length) return `<div class="muted small">None.</div>`;
-  return `<table class="plain"><tr><th>URL</th><th>Events</th><th>Ack</th><th></th></tr>${hooks.map((h) => `
+  const spaces = multiSpace() && hooks.some((h) => !h.decision_id);
+  return `<table class="plain"><tr><th>URL</th>${spaces ? "<th>Space</th>" : ""}<th>Events</th><th>Ack</th><th></th></tr>${hooks.map((h) => `
     <tr><td class="mono">${esc(h.url)}${h.active ? "" : ` <span class="badge">paused</span>`}</td>
+    ${spaces ? `<td class="small">${h.space ? esc(h.space) : "all"}</td>` : ""}
     <td class="small">${esc(h.events.join(", "))}</td>
     <td>${h.require_ack === null ? "default" : h.require_ack ? "required" : "no"}</td>
     <td style="text-align:right;white-space:nowrap">
@@ -526,6 +547,7 @@ function renderResolved(d) {
   main.innerHTML = `<div class="page"><div class="resolved-view">
     <div class="d-sub"><span class="chip id" data-action="copy-ref" title="Copy a markdown reference for Slack / Linear">${d.id} ⧉</span><span class="chip status resolved">resolved</span>
       <span title="${esc(fullTime(r.resolved_at))}">${esc(r.resolved_by)} · ${ago(r.resolved_at)}</span>
+      ${spaceChip(d)}
       ${d.source ? `<span>from <strong>${esc(d.source)}</strong></span>` : ""}
       <span title="${esc(fullTime(d.created_at))}">created ${ago(d.created_at)}</span>
       ${d.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}</div>
@@ -594,6 +616,7 @@ function headerHtml(d) {
         <div class="d-sub">
           <span class="chip id" data-action="copy-ref" title="Copy a markdown reference for Slack / Linear">${d.id} ⧉</span>
           <span class="chip status ${d.status}">${d.status}</span>
+          ${spaceChip(d)}
           ${d.source ? `<span>from <strong>${esc(d.source)}</strong></span>` : ""}
           <span title="${esc(fullTime(d.created_at))}">created ${ago(d.created_at)}</span>
           ${d.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}
@@ -809,19 +832,31 @@ function webhooksHtml(d) {
       <td class="small">${x.total_attempts}× ${x.last_status ? `· ${x.last_status}` : ""}${x.last_error && !x.last_status ? `<div class="muted" title="${esc(x.last_error)}">${esc(x.last_error.slice(0, 40))}</div>` : ""}
         ${x.next_attempt_at ? `<div class="muted">next ${new Date(x.next_attempt_at).toLocaleTimeString()}</div>` : ""}</td>
       <td style="text-align:right"><button class="btn small ghost" data-action="redeliver" data-id="${x.id}" title="Fire again now">Re-fire</button></td></tr>`).join("");
-  const resumerRow = d.resume ? `<div class="listener"><span class="live ${S.resumer?.online ? "on" : "off"}"></span><strong>resumer</strong>
-       <span class="muted">${S.resumer?.machine ? `on ${esc(S.resumer.machine)}, ` : ""}${S.resumer?.online ? `online, will resume ${esc(d.resume.agent || "the agent")} session ${esc(d.resume.session_id.slice(0, 8))}…` : "offline: the session will not resume automatically"}</span></div>` : "";
+  // The eye lets you resolve without telling this listener (say, to fix a typo). Global webhooks always hear.
+  const canSilence = !closed(d);
+  const eye = (id) => {
+    if (!canSilence) return "";
+    const off = S.silenced.has(id);
+    return `<button class="eye ${off ? "off" : ""}" data-action="toggle-silence" data-id="${esc(id)}"
+      title="${off ? "Won't be notified when you decide. Click to notify." : "Will be notified when you decide. Click to skip it."}">${off ? EYE_OFF : EYE}</button>`;
+  };
+  const row = (id, body) => `<div class="listener ${S.silenced.has(id) ? "silenced" : ""}">${body}${id ? eye(id) : ""}</div>`;
+  const resumerRow = d.resume ? row("resumer", `<span class="live ${S.resumer?.online ? "on" : "off"}"></span><strong>resumer</strong>
+       <span class="muted">${S.resumer?.machine ? `on ${esc(S.resumer.machine)}, ` : ""}${S.resumer?.online ? `online, will resume ${esc(d.resume.agent || "the agent")} session ${esc(d.resume.session_id.slice(0, 8))}…` : "offline: the session will not resume automatically"}</span>`) : "";
   const listeners = resumerRow + (S.listeners || []).map((l) => l.kind === "long-poll"
-    ? `<div class="listener"><span class="live ${l.connected ? "on" : ""}"></span><strong>${esc(l.actor)}</strong>
-         <span class="muted">waiting (long-poll) since ${ago(l.since)} for ${esc(l.events.join(", "))}</span></div>`
-    : `<div class="listener"><span class="live on hook"></span><strong>${l.scope === "global" ? "global webhook" : "webhook"}</strong>
-         <span class="mono small">${esc(l.url)}</span> <span class="muted">· ${esc(l.events.join(", "))}${l.require_ack ? " · re-fires until acked" : ""}</span></div>`).join("");
+    ? row(l.id, `<span class="live ${l.connected ? "on" : ""}"></span><strong>${esc(l.actor)}</strong>
+         <span class="muted">waiting (long-poll) since ${ago(l.since)} for ${esc(l.events.join(", "))}</span>`)
+    : row(l.scope === "global" ? null : l.id, `<span class="live on hook"></span><strong>${l.scope === "global" ? "global webhook" : "webhook"}</strong>
+         <span class="mono small">${esc(l.url)}</span> <span class="muted">· ${esc(l.events.join(", "))}${l.require_ack ? " · re-fires until acked" : ""}</span>`)).join("");
   return `<div class="block-head"><h2>Listening</h2><span class="spacer"></span><span class="muted small">${(S.listeners || []).length + (d.resume && S.resumer?.online ? 1 : 0) || "nobody"}</span></div>
     <div class="panel">
       ${listeners || `<div class="muted small">Nobody is listening for this decision right now. It will still be recorded; the requester can check later.</div>`}
       ${rows ? `<div class="hint" style="margin-top:12px">Webhook deliveries</div><table class="plain"><tr><th>Event</th><th>Status</th><th>Attempts</th><th></th></tr>${rows}</table>` : ""}
     </div>`;
 }
+
+const EYE = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const EYE_OFF = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-2.2 3.2M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="M2 2l20 20"/></svg>`;
 
 const EVENT_ICONS = {
   "decision.created": "✦", "decision.updated": "✎", "decision.resolved": "✔", "decision.reopened": "↺",
@@ -842,7 +877,7 @@ function eventText(e) {
       return [due ? `set the deadline to <strong title="${esc(fullTime(due))}">${esc(whenTime(due))}</strong>` : "",
               rest.length ? `updated ${esc(rest.join(", "))}` : ""].filter(Boolean).join(", ");
     }
-    case "decision.resolved": return `${x.previous_status === "resolved" ? "changed the decision to" : "decided"} <strong>${esc(x.resolution.selected.map(label).join(", "))}</strong>${x.resolution.note ? ` — “${esc(x.resolution.note)}”` : ""}${x.resolution.filters ? `<div class="muted small">filters: ${esc(x.resolution.filters)}</div>` : ""}`;
+    case "decision.resolved": return `${x.previous_status === "resolved" ? "changed the decision to" : "decided"} <strong>${esc(x.resolution.selected.map(label).join(", "))}</strong>${x.resolution.note ? ` — “${esc(x.resolution.note)}”` : ""}${x.resolution.filters ? `<div class="muted small">filters: ${esc(x.resolution.filters)}</div>` : ""}${x.silenced ? `<div class="muted small">didn't notify ${esc(x.silenced.join(", "))}</div>` : ""}`;
     case "decision.reopened": return `reopened${x.due_at ? ` with a new deadline, <span title="${esc(fullTime(x.due_at))}">${esc(whenTime(x.due_at))}</span>` : ""}${x.note ? ` — “${esc(x.note)}”` : ""}`;
     case "decision.expired": return `expired it: nobody decided before the deadline`;
     case "decision.cancelled": return `cancelled${x.note ? ` — “${esc(x.note)}”` : ""}`;
@@ -972,6 +1007,8 @@ document.addEventListener("click", async (e) => {
   if (nav && !e.metaKey && !e.ctrlKey) { e.preventDefault(); return navigate(nav.getAttribute("href")); }
   const tab = e.target.closest("[data-status]");
   if (tab) { S.status = tab.dataset.status; storage("status", S.status); return renderSidebar(); }
+  const spaceTab = e.target.closest("[data-space]");
+  if (spaceTab) { S.space = spaceTab.dataset.space; storage("space", S.space); return renderSidebar(); }
 
   const a = e.target.closest("[data-action]");
   const d = S.d;
@@ -1003,6 +1040,12 @@ document.addEventListener("click", async (e) => {
     case "clear-filter": delete ui().filters[a.dataset.key]; saveUi(); return renderDecision();
     case "clear-all-filters": ui().filters = {}; ui().text = ""; saveUi(); return renderDecision();
     case "resolve": return resolve();
+    case "toggle-silence": {
+      S.silenced.has(id) ? S.silenced.delete(id) : S.silenced.add(id);
+      const panel = $("#listeners-panel");
+      if (panel) panel.innerHTML = webhooksHtml(d);
+      return;
+    }
     case "reopen": {
       const note = prompt("Reopen — note (optional):");
       if (note === null) return;
@@ -1053,8 +1096,11 @@ async function resolve() {
   const note = $("#note")?.value || "";
   const { metas } = partition();
   const filters = describeFilters(metas) || undefined;
-  await act(() => api("POST", `/api/decisions/${d.id}/resolve`, { selected: [...S.selection], note, filters }), `${d.id} decided — webhook firing`);
+  const silence = [...S.silenced];
+  await act(() => api("POST", `/api/decisions/${d.id}/resolve`, { selected: [...S.selection], note, filters, silence }),
+            `${d.id} decided${silence.length ? ` — ${silence.length} listener${silence.length > 1 ? "s" : ""} not notified` : " — webhook firing"}`);
   S.noteDraft = undefined;
+  S.silenced = new Set();
 }
 
 document.addEventListener("keydown", (e) => {

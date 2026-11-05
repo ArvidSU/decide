@@ -67,6 +67,11 @@ h1, h2, h3 { margin: 0; line-height: 1.25; }
 .tab:hover { background: var(--sunken); }
 .tab.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .tab .n { opacity: .7; margin-left: 3px; }
+.tabs.spaces { flex-wrap: wrap; padding-top: 0; }
+.tabs[hidden] { display: none; }
+.tabs.spaces .tab { flex: none; padding: 5px 9px; }
+.dl-space { font-weight: 600; }
+.chip.space { color: var(--text); }
 .tab.has-open .n { opacity: 1; display: inline-block; min-width: 17px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--accent-text); font-weight: 700; font-size: 11px; line-height: 17px; }
 
 /* What's waiting on you, and how soon the next one expires. */
@@ -301,6 +306,10 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-
 .live { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; align-self: center; }
 .live.on { background: var(--good); box-shadow: 0 0 0 3px var(--good-soft); }
 .live.hook { border-radius: 2px; }
+.listener .eye { margin-left: auto; align-self: center; display: inline-flex; padding: 2px 4px; border: 0; border-radius: 4px; background: none; color: var(--muted); cursor: pointer; }
+.listener .eye:hover { background: var(--sunken); color: var(--text); }
+.listener .eye.off { color: var(--bad); }
+.listener.silenced > :not(.eye) { opacity: .45; text-decoration: line-through; }
 .estimate { font-style: italic; }
 
 .live.off { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-soft); }

@@ -18,12 +18,13 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from .agents import manual_command
-from .config import Config
+from .config import ALL, DEFAULT_SPACE, Config, Scope
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY,
   num INTEGER NOT NULL UNIQUE,
+  space TEXT NOT NULL,
   title TEXT NOT NULL,
   context TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL DEFAULT '',
@@ -36,13 +37,15 @@ CREATE TABLE IF NOT EXISTS decisions (
   metadata TEXT NOT NULL DEFAULT '{}',
   resolution TEXT,
   due_at TEXT,
-  idempotency_key TEXT UNIQUE,
+  idempotency_key TEXT,
   resume TEXT,
   next_option INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  resolved_at TEXT
+  resolved_at TEXT,
+  UNIQUE (space, idempotency_key)
 );
+CREATE INDEX IF NOT EXISTS decisions_by_space ON decisions(space, status);
 
 CREATE TABLE IF NOT EXISTS options (
   decision_id TEXT NOT NULL REFERENCES decisions(id),
@@ -61,8 +64,10 @@ CREATE TABLE IF NOT EXISTS options (
   PRIMARY KEY (decision_id, id)
 );
 
+-- Each space has its own hash chain; space NULL is the server's own (webhooks across all spaces).
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  space TEXT,
   ts TEXT NOT NULL,
   decision_id TEXT,
   type TEXT NOT NULL,
@@ -72,13 +77,16 @@ CREATE TABLE IF NOT EXISTS events (
   hash TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_by_decision ON events(decision_id, seq);
+CREATE INDEX IF NOT EXISTS events_by_space ON events(space, seq);
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
   BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
   BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
 
+-- space NULL = hears every space (only the admin token can create one).
 CREATE TABLE IF NOT EXISTS subscriptions (
   id TEXT PRIMARY KEY,
+  space TEXT,
   decision_id TEXT,
   url TEXT NOT NULL,
   secret TEXT NOT NULL,
@@ -94,6 +102,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 CREATE TABLE IF NOT EXISTS deliveries (
   id TEXT PRIMARY KEY,
   subscription_id TEXT NOT NULL,
+  space TEXT,
   event_seq INTEGER NOT NULL,
   decision_id TEXT,
   event_type TEXT NOT NULL,
@@ -258,8 +267,8 @@ class Store:
 
     # ------------------------------------------------------------------ plumbing
 
-    def default_due_at(self) -> str | None:
-        days = self.cfg.deadline_days
+    def default_due_at(self, space: str) -> str | None:
+        days = self.cfg.deadline_days_for(space)
         return iso(datetime.now(timezone.utc) + timedelta(days=days)) if days > 0 else None
 
     @contextmanager
@@ -282,36 +291,53 @@ class Store:
         with self.lock:
             return self.conn.execute(sql, args).fetchone()
 
-    def _decision_row(self, did: str):
+    def _decision_row(self, did: str, scope: Scope = ALL):
         row = self.conn.execute("SELECT * FROM decisions WHERE id=?", (did,)).fetchone()
-        if not row:
+        # Out of scope looks exactly like missing: other spaces' decisions aren't even confirmed to exist.
+        if not row or not scope.allows(row["space"]):
             raise ApiError(404, f"no decision {did}")
         return row
 
-    def _event(self, decision_id, etype, actor, data) -> int:
-        """Append to the hash-chained log and fan out webhook deliveries. Call inside tx()."""
-        last = self.conn.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone()
+    def _space_for(self, scope: Scope, requested) -> str:
+        """The space a caller's new decision or webhook goes to: the one asked for, else their default."""
+        space = _opt_type({"space": requested}, "space", str) or scope.default
+        if space not in self.cfg.space_names or not scope.allows(space):
+            raise ApiError(404, f"no space {space!r}")
+        return space
+
+    @staticmethod
+    def _record(space, ts, decision_id, etype, actor, data, prev_hash) -> str:
+        record = {"space": space, "ts": ts, "decision_id": decision_id, "type": etype, "actor": actor,
+                  "data": data, "prev_hash": prev_hash}
+        return hashlib.sha256(canonical(record).encode()).hexdigest()
+
+    def _event(self, decision_id, etype, actor, data, space=None) -> int:
+        """Append to the space's hash chain and fan out webhook deliveries. Call inside tx().
+        An event about a decision goes to the decision's space; others to `space`."""
+        if decision_id:
+            space = self._decision_row(decision_id)["space"]
+        last = self.conn.execute("SELECT hash FROM events WHERE space IS ? ORDER BY seq DESC LIMIT 1",
+                                 (space,)).fetchone()
         prev_hash = last["hash"] if last else GENESIS
         ts = now_iso()
-        record = {"ts": ts, "decision_id": decision_id, "type": etype, "actor": actor,
-                  "data": data, "prev_hash": prev_hash}
-        digest = hashlib.sha256(canonical(record).encode()).hexdigest()
+        digest = self._record(space, ts, decision_id, etype, actor, data, prev_hash)
         seq = self.conn.execute(
-            "INSERT INTO events (ts, decision_id, type, actor, data, prev_hash, hash) VALUES (?,?,?,?,?,?,?)",
-            (ts, decision_id, etype, actor, canonical(data), prev_hash, digest),
+            "INSERT INTO events (space, ts, decision_id, type, actor, data, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?)",
+            (space, ts, decision_id, etype, actor, canonical(data), prev_hash, digest),
         ).lastrowid
         if not etype.startswith("webhook."):
-            self._fanout(seq, ts, decision_id, etype, actor)
+            self._fanout(seq, ts, decision_id, space, etype, actor, data.get("silenced", ()))
         return seq
 
-    def _fanout(self, seq, ts, decision_id, etype, actor):
+    def _fanout(self, seq, ts, decision_id, space, etype, actor, silenced=()):
         subs = self.conn.execute(
-            "SELECT * FROM subscriptions WHERE active=1 AND (decision_id IS NULL OR decision_id=?)",
-            (decision_id,),
+            "SELECT * FROM subscriptions WHERE active=1 AND (decision_id=? OR "
+            "(decision_id IS NULL AND (space IS NULL OR space=?)))",
+            (decision_id, space),
         ).fetchall()
         snapshot = None
         for sub in subs:
-            if not event_matches(json.loads(sub["events"]), etype):
+            if sub["id"] in silenced or not event_matches(json.loads(sub["events"]), etype):
                 continue
             if snapshot is None and decision_id:
                 snapshot = self._decision_dict(decision_id)
@@ -332,9 +358,9 @@ class Store:
             "decision": snapshot,
         }
         self.conn.execute(
-            """INSERT INTO deliveries (id, subscription_id, event_seq, decision_id, event_type, payload,
-               status, require_ack, next_attempt_at, created_at) VALUES (?,?,?,?,?,?,'pending',?,?,?)""",
-            (delivery_id, sub["id"], seq, decision_id, etype, canonical(payload),
+            """INSERT INTO deliveries (id, subscription_id, space, event_seq, decision_id, event_type, payload,
+               status, require_ack, next_attempt_at, created_at) VALUES (?,?,?,?,?,?,?,'pending',?,?,?)""",
+            (delivery_id, sub["id"], sub["space"], seq, decision_id, etype, canonical(payload),
              int(require_ack), time.time(), now_iso()),
         )
 
@@ -392,6 +418,7 @@ class Store:
             "SELECT * FROM subscriptions WHERE decision_id=? ORDER BY created_at", (did,)).fetchall()
         out = {
             "id": row["id"],
+            "space": row["space"],
             "url": f"{self.cfg.public_url}/d/{row['id']}",
             "title": row["title"],
             "context": row["context"],
@@ -423,9 +450,10 @@ class Store:
         if not row["resume"]:
             return None
         trigger = RESUME_TRIGGERS.get(row["status"])
-        res = trigger and self.conn.execute(
-            "SELECT seq, ts FROM events WHERE decision_id=? AND type=? ORDER BY seq DESC LIMIT 1",
-            (did, trigger)).fetchone()
+        # A resolution that silenced the resumer doesn't count: the state is that of the one before.
+        res = trigger and next((ev for ev in self.conn.execute(
+            "SELECT seq, ts, data FROM events WHERE decision_id=? AND type=? ORDER BY seq DESC", (did, trigger))
+            if "resumer" not in json.loads(ev["data"]).get("silenced", ())), None)
         if not res:
             return {"status": "armed"}
         ev = self.conn.execute(
@@ -441,6 +469,7 @@ class Store:
     def _sub_dict(row, reveal_secret=False) -> dict:
         out = {
             "id": row["id"],
+            "space": row["space"],
             "decision_id": row["decision_id"],
             "url": row["url"],
             "events": json.loads(row["events"]),
@@ -457,13 +486,14 @@ class Store:
 
     # ------------------------------------------------------------------ decisions
 
-    def create_decision(self, body: dict, actor: str) -> tuple[dict, bool]:
+    def create_decision(self, body: dict, actor: str, scope: Scope = ALL) -> tuple[dict, bool]:
         title = _req_str(body, "title")
         key = _opt_type(body, "idempotency_key", str)
+        space = self._space_for(scope, body.get("space"))
         with self.tx():
             if key:
                 existing = self.conn.execute(
-                    "SELECT id FROM decisions WHERE idempotency_key=?", (key,)).fetchone()
+                    "SELECT id FROM decisions WHERE space=? AND idempotency_key=?", (space, key)).fetchone()
                 if existing:
                     return self._decision_dict(existing["id"]), False
             num = (self.conn.execute("SELECT COALESCE(MAX(num), 0) + 1 FROM decisions").fetchone()[0])
@@ -475,19 +505,19 @@ class Store:
             self._check_select_bounds(min_select, max_select)
             defs = self._clean_defs(_opt_type(body, "attributes", dict, {}))
             self.conn.execute(
-                """INSERT INTO decisions (id, num, title, context, source, min_select, max_select,
+                """INSERT INTO decisions (id, num, space, title, context, source, min_select, max_select,
                    attribute_defs, links, tags, metadata, due_at, idempotency_key, created_at, updated_at, resume)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (did, num, title, _opt_type(body, "context", str, ""),
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (did, num, space, title, _opt_type(body, "context", str, ""),
                  _opt_type(body, "source", str, actor), min_select, max_select, canonical(defs),
                  canonical(_links(body.get("links"))), canonical(_opt_type(body, "tags", list, [])),
                  canonical(_opt_type(body, "metadata", dict, {})),
-                 _due_at(body["due_at"]) if body.get("due_at") is not None else self.default_due_at(),
+                 _due_at(body["due_at"]) if body.get("due_at") is not None else self.default_due_at(space),
                  key, ts, ts, canonical(r) if (r := _resume(body.get("resume"))) else None),
             )
             self._insert_options(did, _opt_type(body, "options", list, []))
             hooks = body.get("webhooks") or ([body["webhook"]] if body.get("webhook") else [])
-            created_subs = [self._create_sub(h, did) for h in hooks]
+            created_subs = [self._create_sub(h, did, space) for h in hooks]
             self._event(did, "decision.created", actor, {"decision": self._decision_dict(did)})
             out = self._decision_dict(did)
             # Secrets are only ever revealed in the response that created them.
@@ -512,13 +542,18 @@ class Store:
             out[str(k)] = v
         return out
 
-    def get_decision(self, raw_id: str) -> dict:
+    def get_decision(self, raw_id: str, scope: Scope = ALL) -> dict:
+        did = norm_id(raw_id)
         with self.lock:
-            return self._decision_dict(norm_id(raw_id))
+            return self._decision_dict(did, self._decision_row(did, scope))
 
-    def list_decisions(self, status=None, q=None, tag=None, source=None, limit=100, offset=0) -> list[dict]:
-        sql = "SELECT * FROM decisions WHERE 1=1"
-        args: list = []
+    def list_decisions(self, status=None, q=None, tag=None, source=None, space=None, limit=100, offset=0,
+                       scope: Scope = ALL) -> list[dict]:
+        cond, args = scope.where("space")
+        sql = "SELECT * FROM decisions WHERE 1=1" + cond
+        if space:
+            sql += " AND space=?"
+            args.append(space)
         if status and status != "all":
             sql += " AND status=?"
             args.append(status)
@@ -540,16 +575,16 @@ class Store:
                     "SELECT COUNT(*), SUM(excluded) FROM options WHERE decision_id=?", (row["id"],)).fetchone()
                 d = self._decision_dict(row["id"], row)
                 out.append({
-                    k: d[k] for k in ("id", "url", "title", "source", "status", "tags", "created_at",
+                    k: d[k] for k in ("id", "space", "url", "title", "source", "status", "tags", "created_at",
                                       "updated_at", "resolved_at", "due_at", "resolution",
                                       "pending_attribute_requests", "min_select", "max_select", "resume_state")
                 } | {"option_count": counts[0], "excluded_count": counts[1] or 0})
         return out
 
-    def update_decision(self, raw_id: str, body: dict, actor: str) -> dict:
+    def update_decision(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         with self.tx():
-            row = self._decision_row(did)
+            row = self._decision_row(did, scope)
             changes = {}
             sets = {}
             for field, kinds in (("title", str), ("context", str), ("source", str), ("due_at", str)):
@@ -558,7 +593,7 @@ class Store:
                     if field == "title" and not (val or "").strip():
                         raise ApiError(400, "title cannot be empty")
                     if field == "due_at":
-                        if val is None and self.cfg.deadline_days > 0:
+                        if val is None and self.cfg.deadline_days_for(row["space"]) > 0:
                             raise ApiError(400, "decisions can't go without a deadline; set a later due_at instead")
                         val = None if val is None else _due_at(val)
                     if val != row[field]:
@@ -608,7 +643,7 @@ class Store:
                 self._event(did, "decision.updated", actor, {"changes": changes})
             return self._decision_dict(did)
 
-    def resolve(self, raw_id: str, body: dict, actor: str) -> dict:
+    def resolve(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         selected = body.get("selected", body.get("option_ids"))
         if isinstance(selected, str):
@@ -616,8 +651,10 @@ class Store:
         if not isinstance(selected, list):
             raise ApiError(400, "'selected' must be a list of option ids")
         selected = list(dict.fromkeys(str(s) for s in selected))
+        silence = _opt_type(body, "silence", list, [])
         with self.tx():
-            row = self._decision_row(did)
+            row = self._decision_row(did, scope)
+            silence = self._check_silence(did, silence)
             ids = {r["id"] for r in self.conn.execute("SELECT id FROM options WHERE decision_id=?", (did,))}
             unknown = [s for s in selected if s not in ids]
             if unknown:
@@ -638,23 +675,42 @@ class Store:
             self.conn.execute(
                 "UPDATE decisions SET status='resolved', resolution=?, resolved_at=?, updated_at=? WHERE id=?",
                 (canonical(resolution), ts, ts, did))
-            self._event(did, "decision.resolved", actor,
-                        {"resolution": resolution, "previous_status": row["status"], "previous_resolution": previous})
+            data = {"resolution": resolution, "previous_status": row["status"], "previous_resolution": previous}
+            if silence:
+                data["silenced"] = silence
+            self._event(did, "decision.resolved", actor, data)
             return self._decision_dict(did)
 
-    def set_status(self, raw_id: str, status: str, note: str, actor: str) -> dict:
+    def _check_silence(self, did: str, silence: list) -> list[str]:
+        """Listeners a resolution won't notify (e.g. when fixing a typo): `resumer`, `poll:<actor>`, or the id of a
+        webhook on this decision. Webhooks that hear every decision always hear it."""
+        out = []
+        for key in dict.fromkeys(silence):
+            if not isinstance(key, str):
+                raise ApiError(400, "'silence' must be a list of listener ids")
+            if key != "resumer" and not (key.startswith("poll:") and len(key) > 5):
+                sub = self.conn.execute("SELECT decision_id FROM subscriptions WHERE id=?", (key,)).fetchone()
+                if not sub:
+                    raise ApiError(400, f"no listener {key!r}")
+                if sub["decision_id"] != did:
+                    raise ApiError(400, f"{key} is a global webhook; it can't be silenced")
+            out.append(key)
+        return out
+
+    def set_status(self, raw_id: str, status: str, note: str, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         etype = {"open": "decision.reopened", "cancelled": "decision.cancelled"}[status]
         with self.tx():
-            row = self._decision_row(did)
+            row = self._decision_row(did, scope)
             previous = json.loads(row["resolution"]) if row["resolution"] else None
             data = {"note": note, "previous_status": row["status"], "previous_resolution": previous}
             due_at = row["due_at"]
             if status == "open":
                 # Reopening restarts a passed (or missing) deadline; otherwise it would expire again at once.
                 due = parse_ts(due_at)
-                if (due is None and self.cfg.deadline_days > 0) or (due and due <= datetime.now(timezone.utc)):
-                    due_at = data["due_at"] = self.default_due_at()
+                if (due is None and self.cfg.deadline_days_for(row["space"]) > 0) or \
+                        (due and due <= datetime.now(timezone.utc)):
+                    due_at = data["due_at"] = self.default_due_at(row["space"])
             self.conn.execute(
                 "UPDATE decisions SET status=?, resolution=NULL, resolved_at=NULL, due_at=?, updated_at=? WHERE id=?",
                 (status, due_at, now_iso(), did))
@@ -679,11 +735,11 @@ class Store:
                 expired.append(row["id"])
         return expired
 
-    def comment(self, raw_id: str, body: dict, actor: str) -> dict:
+    def comment(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         text = _req_str(body, "text")
         with self.tx():
-            self._decision_row(did)
+            self._decision_row(did, scope)
             self._touch(did)
             seq = self._event(did, "decision.commented", actor, {"text": text})
         return {"seq": seq, "text": text, "actor": actor}
@@ -692,13 +748,13 @@ class Store:
 
     RESUME_EVENTS = ("started", "finished", "failed", "manual")
 
-    def resume_event(self, raw_id: str, body: dict, actor: str) -> dict:
+    def resume_event(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         kind = body.get("status")
         if kind not in self.RESUME_EVENTS:
             raise ApiError(400, f"status must be one of {', '.join(self.RESUME_EVENTS)}")
         with self.tx():
-            row = self._decision_row(did)
+            row = self._decision_row(did, scope)
             if not row["resume"]:
                 raise ApiError(400, f"{did} has no resume target")
             self._touch(did)
@@ -768,10 +824,11 @@ class Store:
         self.conn.execute("UPDATE decisions SET next_option=? WHERE id=?", (nxt, did))
         return added
 
-    def add_options(self, raw_id: str, body, actor: str) -> dict:
+    def add_options(self, raw_id: str, body, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         items = body if isinstance(body, list) else body.get("options", [body])
         with self.tx():
+            self._decision_row(did, scope)
             added = self._insert_options(did, items)
             self._touch(did)
             opts = [self._option_dict(r) for r in self.conn.execute(
@@ -817,24 +874,24 @@ class Store:
             (*sets.values(), did, oid))
         return changes
 
-    def update_option(self, raw_id: str, oid: str, patch: dict, actor: str) -> dict:
+    def update_option(self, raw_id: str, oid: str, patch: dict, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         with self.tx():
-            self._decision_row(did)
+            self._decision_row(did, scope)
             changes = self._apply_option_patch(did, oid, patch)
             if changes:
                 self._touch(did)
                 self._event(did, "options.updated", actor, {"options": {oid: changes}})
             return self._decision_dict(did)
 
-    def update_options(self, raw_id: str, body, actor: str) -> dict:
+    def update_options(self, raw_id: str, body, actor: str, scope: Scope = ALL) -> dict:
         """Bulk patch: [{id, attributes?, label?, ...}]. Handy for filling requested attributes."""
         did = norm_id(raw_id)
         items = body if isinstance(body, list) else body.get("options")
         if not isinstance(items, list):
             raise ApiError(400, "expected a list of option patches, each with an 'id'")
         with self.tx():
-            self._decision_row(did)
+            self._decision_row(did, scope)
             all_changes = {}
             for item in items:
                 if not isinstance(item, dict) or "id" not in item:
@@ -847,9 +904,10 @@ class Store:
                 self._event(did, "options.updated", actor, {"options": all_changes})
             return self._decision_dict(did)
 
-    def remove_option(self, raw_id: str, oid: str, actor: str) -> dict:
+    def remove_option(self, raw_id: str, oid: str, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         with self.tx():
+            self._decision_row(did, scope)
             row = self.conn.execute("SELECT * FROM options WHERE decision_id=? AND id=?", (did, oid)).fetchone()
             if not row:
                 raise ApiError(404, f"no option {oid!r} in {did}")
@@ -858,7 +916,7 @@ class Store:
             self._event(did, "option.removed", actor, {"option": self._option_dict(row)})
             return self._decision_dict(did)
 
-    def set_excluded(self, raw_id: str, body: dict, excluded: bool, actor: str) -> dict:
+    def set_excluded(self, raw_id: str, body: dict, excluded: bool, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         oids = body.get("option_ids", body.get("options"))
         if isinstance(oids, str):
@@ -868,7 +926,7 @@ class Store:
         oids = [str(o) for o in oids]
         reason = _opt_type(body, "reason", str) if excluded else None
         with self.tx():
-            self._decision_row(did)
+            self._decision_row(did, scope)
             existing = {r["id"] for r in self.conn.execute("SELECT id FROM options WHERE decision_id=?", (did,))}
             unknown = [o for o in oids if o not in existing]
             if unknown:
@@ -884,11 +942,11 @@ class Store:
 
     # ------------------------------------------------------------------ attribute requests
 
-    def request_attributes(self, raw_id: str, body, actor: str) -> dict:
+    def request_attributes(self, raw_id: str, body, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         items = body if isinstance(body, list) else body.get("attributes", [body])
         with self.tx():
-            row = self._decision_row(did)
+            row = self._decision_row(did, scope)
             defs = json.loads(row["attribute_defs"])
             requested = {}
             ts = now_iso()
@@ -904,10 +962,10 @@ class Store:
             self._event(did, "attributes.requested", actor, {"attributes": requested})
             return self._decision_dict(did)
 
-    def cancel_attribute_request(self, raw_id: str, key: str, actor: str) -> dict:
+    def cancel_attribute_request(self, raw_id: str, key: str, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
         with self.tx():
-            row = self._decision_row(did)
+            row = self._decision_row(did, scope)
             defs = json.loads(row["attribute_defs"])
             if key not in defs:
                 raise ApiError(404, f"no attribute {key!r} on {did}")
@@ -922,14 +980,18 @@ class Store:
 
     @staticmethod
     def _event_dict(row) -> dict:
-        return {"seq": row["seq"], "ts": row["ts"], "decision_id": row["decision_id"], "type": row["type"],
-                "actor": row["actor"], "data": json.loads(row["data"]), "hash": row["hash"]}
+        return {"seq": row["seq"], "space": row["space"], "ts": row["ts"], "decision_id": row["decision_id"],
+                "type": row["type"], "actor": row["actor"], "data": json.loads(row["data"]), "hash": row["hash"]}
 
-    def events(self, after=0, decision_id=None, types=None, limit=200) -> list[dict]:
-        sql, args = "SELECT * FROM events WHERE seq > ?", [after]
+    def events(self, after=0, decision_id=None, types=None, limit=200, scope: Scope = ALL) -> list[dict]:
+        cond, args = scope.where("space")
+        sql, args = "SELECT * FROM events WHERE seq > ?" + cond, [after, *args]
         if decision_id:
+            did = norm_id(decision_id)
+            with self.lock:
+                self._decision_row(did, scope)
             sql += " AND decision_id=?"
-            args.append(norm_id(decision_id))
+            args.append(did)
         sql += " ORDER BY seq LIMIT ?"
         # Type filtering is done in Python so wildcard patterns work.
         args.append(limit if not types else 100000)
@@ -942,19 +1004,22 @@ class Store:
     def cursor(self) -> int:
         return self.q1("SELECT COALESCE(MAX(seq), 0) FROM events")[0]
 
-    def wait_events(self, after=0, decision_id=None, types=None, timeout=0.0, limit=200) -> list[dict]:
+    def wait_events(self, after=0, decision_id=None, types=None, timeout=0.0, limit=200,
+                    scope: Scope = ALL) -> list[dict]:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
-                evs = self.events(after, decision_id, types, limit)
+                evs = self.events(after, decision_id, types, limit, scope)
                 remaining = deadline - time.monotonic()
                 if evs or remaining <= 0:
                     return evs
                 self.cond.wait(remaining)
 
     def wait_decision(self, raw_id: str, types: list[str], after: int | None, timeout: float,
-                      actor: str = "api") -> dict:
+                      actor: str = "api", scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
+        with self.lock:
+            self._decision_row(did, scope)
         key = (did, actor, tuple(types))
         with self.lock:
             w = self.waiters.get(key)
@@ -963,33 +1028,37 @@ class Store:
                 w = self.waiters[key] = {"since": now_iso(), "connections": 0, "last_seen": time.time()}
             w["connections"] += 1
         try:
-            return self._wait_decision(did, types, after, timeout)
+            return self._wait_decision(did, types, after, timeout, actor)
         finally:
             with self.lock:
                 w["connections"] -= 1
                 w["last_seen"] = time.time()
 
-    def listeners(self, raw_id: str) -> list[dict]:
+    def listeners(self, raw_id: str, scope: Scope = ALL) -> list[dict]:
         """Everyone who will hear about this decision: long-pollers and webhooks."""
         did = norm_id(raw_id)
         out = []
         with self.lock:
+            space = self._decision_row(did, scope)["space"]
             for (wdid, actor, types), w in list(self.waiters.items()):
                 idle = time.time() - w["last_seen"]
                 if not w["connections"] and idle > 90:
                     del self.waiters[(wdid, actor, types)]
                     continue
                 if wdid == did:
-                    out.append({"kind": "long-poll", "actor": actor, "events": list(types), "since": w["since"],
+                    out.append({"kind": "long-poll", "id": f"poll:{actor}", "actor": actor, "events": list(types), "since": w["since"],
                                 "connected": w["connections"] > 0})
             subs = self.conn.execute(
-                "SELECT * FROM subscriptions WHERE active=1 AND (decision_id=? OR decision_id IS NULL)", (did,))
+                "SELECT * FROM subscriptions WHERE active=1 AND (decision_id=? OR "
+                "(decision_id IS NULL AND (space IS NULL OR space=?)))", (did, space))
             for sub in subs.fetchall():
+                if not scope.allows(sub["space"]):
+                    continue  # an all-spaces webhook is the admin's business
                 out.append({"kind": "webhook", "scope": "decision" if sub["decision_id"] else "global",
                             **self._sub_dict(sub)})
         return out
 
-    def _wait_decision(self, did: str, types: list[str], after: int | None, timeout: float) -> dict:
+    def _wait_decision(self, did: str, types: list[str], after: int | None, timeout: float, actor: str) -> dict:
         with self.cond:
             d = self._decision_dict(did)
             if after is None:
@@ -1001,28 +1070,39 @@ class Store:
                     return {"timed_out": False, "event": self._event_dict(ev) if ev else None,
                             "decision": d, "cursor": self.cursor()}
                 after = self.cursor()
-            evs = self.wait_events(after, did, types, timeout, limit=1)
+            deadline = time.monotonic() + timeout
+            while True:
+                evs = self.wait_events(after, did, types, max(0.0, deadline - time.monotonic()), limit=1)
+                # Skip events this poller was silenced for; keep waiting for the next one.
+                if not evs or f"poll:{actor}" not in evs[0]["data"].get("silenced", ()):
+                    break
+                after = evs[0]["seq"]
             return {"timed_out": not evs, "event": evs[0] if evs else None,
                     "decision": self._decision_dict(did),
                     "cursor": evs[0]["seq"] if evs else max(after, self.cursor())}
 
-    def verify_chain(self) -> dict:
-        prev = GENESIS
-        count = 0
+    def verify_chain(self, scope: Scope = ALL) -> dict:
+        """Verify each space's chain on its own (space None = the server's chain)."""
+        cond, args = scope.where("space")
+        chains: dict = {}
         with self.lock:
-            for row in self.conn.execute("SELECT * FROM events ORDER BY seq"):
-                record = {"ts": row["ts"], "decision_id": row["decision_id"], "type": row["type"],
-                          "actor": row["actor"], "data": json.loads(row["data"]), "prev_hash": row["prev_hash"]}
-                digest = hashlib.sha256(canonical(record).encode()).hexdigest()
-                if row["prev_hash"] != prev or digest != row["hash"]:
-                    return {"ok": False, "events": count, "broken_at": row["seq"]}
-                prev = row["hash"]
-                count += 1
-        return {"ok": True, "events": count, "head": prev}
+            for row in self.conn.execute("SELECT * FROM events WHERE 1=1" + cond + " ORDER BY seq", args):
+                c = chains.setdefault(row["space"], {"ok": True, "events": 0, "head": GENESIS})
+                if not c["ok"]:
+                    continue
+                digest = self._record(row["space"], row["ts"], row["decision_id"], row["type"], row["actor"],
+                                      json.loads(row["data"]), row["prev_hash"])
+                if row["prev_hash"] != c["head"] or digest != row["hash"]:
+                    c |= {"ok": False, "broken_at": row["seq"]}
+                    continue
+                c["head"] = row["hash"]
+                c["events"] += 1
+        return {"ok": all(c["ok"] for c in chains.values()), "events": sum(c["events"] for c in chains.values()),
+                "chains": {("*" if k is None else k): v for k, v in sorted(chains.items(), key=lambda kv: kv[0] or "")}}
 
     # ------------------------------------------------------------------ webhooks
 
-    def _create_sub(self, spec: dict, decision_id: str | None) -> dict:
+    def _create_sub(self, spec: dict, decision_id: str | None, space: str | None) -> dict:
         if not isinstance(spec, dict):
             raise ApiError(400, "webhook must be an object with a 'url'")
         url = _req_str(spec, "url")
@@ -1033,37 +1113,53 @@ class Store:
         secret = _opt_type(spec, "secret", str) or secrets.token_urlsafe(24)
         req_ack = _opt_type(spec, "require_ack", bool)
         self.conn.execute(
-            """INSERT INTO subscriptions (id, decision_id, url, secret, events, require_ack, max_attempts,
-               refire_interval, description, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (sid, decision_id, url, secret, canonical(events), None if req_ack is None else int(req_ack),
+            """INSERT INTO subscriptions (id, space, decision_id, url, secret, events, require_ack, max_attempts,
+               refire_interval, description, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (sid, space, decision_id, url, secret, canonical(events), None if req_ack is None else int(req_ack),
              _opt_type(spec, "max_attempts", int), _opt_type(spec, "refire_interval", (int, float)),
              _opt_type(spec, "description", str, ""), now_iso()))
         row = self.conn.execute("SELECT * FROM subscriptions WHERE id=?", (sid,)).fetchone()
         return self._sub_dict(row, reveal_secret=True)
 
-    def create_subscription(self, body: dict, actor: str, decision_id: str | None = None) -> dict:
+    def create_subscription(self, body: dict, actor: str, decision_id: str | None = None,
+                            scope: Scope = ALL) -> dict:
         did = norm_id(decision_id or body["decision_id"]) if (decision_id or body.get("decision_id")) else None
         with self.tx():
             if did:
-                self._decision_row(did)
-            sub = self._create_sub(body, did)
+                space = self._decision_row(did, scope)["space"]
+            elif scope.everything and not body.get("space"):
+                space = None  # hears every space
+            else:
+                space = self._space_for(scope, body.get("space"))
+            sub = self._create_sub(body, did, space)
             if did and body.get("replay", True):
                 self._replay_terminal(sub["id"], did)
-            self._event(did, "webhook.created", actor, {"webhook": {k: v for k, v in sub.items() if k != "secret"}})
+            self._event(did, "webhook.created", actor, {"webhook": {k: v for k, v in sub.items() if k != "secret"}},
+                        space)
             return sub
 
-    def list_subscriptions(self, decision_id=None) -> list[dict]:
+    def list_subscriptions(self, decision_id=None, scope: Scope = ALL) -> list[dict]:
+        cond, args = scope.where("space")
         if decision_id:
-            rows = self.q("SELECT * FROM subscriptions WHERE decision_id=? ORDER BY created_at", norm_id(decision_id))
+            did = norm_id(decision_id)
+            with self.lock:
+                self._decision_row(did, scope)
+            rows = self.q("SELECT * FROM subscriptions WHERE decision_id=?" + cond + " ORDER BY created_at",
+                          did, *args)
         else:
-            rows = self.q("SELECT * FROM subscriptions ORDER BY decision_id IS NOT NULL, created_at")
+            rows = self.q("SELECT * FROM subscriptions WHERE 1=1" + cond +
+                          " ORDER BY decision_id IS NOT NULL, created_at", *args)
         return [self._sub_dict(r) for r in rows]
 
-    def update_subscription(self, sid: str, body: dict, actor: str) -> dict:
+    def _sub_row(self, sid: str, scope: Scope):
+        row = self.conn.execute("SELECT * FROM subscriptions WHERE id=?", (sid,)).fetchone()
+        if not row or not scope.allows(row["space"]):
+            raise ApiError(404, f"no webhook {sid}")
+        return row
+
+    def update_subscription(self, sid: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         with self.tx():
-            row = self.conn.execute("SELECT * FROM subscriptions WHERE id=?", (sid,)).fetchone()
-            if not row:
-                raise ApiError(404, f"no webhook {sid}")
+            row = self._sub_row(sid, scope)
             sets = {}
             for field, kinds in (("url", str), ("secret", str), ("description", str), ("max_attempts", int),
                                  ("refire_interval", (int, float))):
@@ -1083,24 +1179,23 @@ class Store:
                         "UPDATE deliveries SET status='cancelled', next_attempt_at=NULL "
                         "WHERE subscription_id=? AND next_attempt_at IS NOT NULL", (sid,))
                 logged = {k: ("***" if k == "secret" else v) for k, v in sets.items()}
-                self._event(row["decision_id"], "webhook.updated", actor, {"webhook_id": sid, "changes": logged})
+                self._event(row["decision_id"], "webhook.updated", actor, {"webhook_id": sid, "changes": logged},
+                            row["space"])
             return self._sub_dict(self.conn.execute("SELECT * FROM subscriptions WHERE id=?", (sid,)).fetchone())
 
-    def delete_subscription(self, sid: str, actor: str) -> dict:
+    def delete_subscription(self, sid: str, actor: str, scope: Scope = ALL) -> dict:
         with self.tx():
-            row = self.conn.execute("SELECT * FROM subscriptions WHERE id=?", (sid,)).fetchone()
-            if not row:
-                raise ApiError(404, f"no webhook {sid}")
+            row = self._sub_row(sid, scope)
             self.conn.execute("DELETE FROM subscriptions WHERE id=?", (sid,))
             self.conn.execute(
                 "UPDATE deliveries SET status='cancelled', next_attempt_at=NULL "
                 "WHERE subscription_id=? AND next_attempt_at IS NOT NULL", (sid,))
-            self._event(row["decision_id"], "webhook.deleted", actor, {"webhook": self._sub_dict(row)})
+            self._event(row["decision_id"], "webhook.deleted", actor, {"webhook": self._sub_dict(row)}, row["space"])
             return {"deleted": sid}
 
     @staticmethod
     def _delivery_dict(row) -> dict:
-        return {k: row[k] for k in ("id", "subscription_id", "event_seq", "decision_id", "event_type", "status",
+        return {k: row[k] for k in ("id", "subscription_id", "space", "event_seq", "decision_id", "event_type", "status",
                                     "attempts", "total_attempts", "last_status", "last_error",
                                     "delivered_at", "acked_at", "acked_by", "created_at")} | {
             "require_ack": bool(row["require_ack"]),
@@ -1109,8 +1204,9 @@ class Store:
                                 if row["next_attempt_at"] else None),
         }
 
-    def list_deliveries(self, decision_id=None, status=None, limit=100) -> list[dict]:
-        sql, args = "SELECT * FROM deliveries WHERE 1=1", []
+    def list_deliveries(self, decision_id=None, status=None, limit=100, scope: Scope = ALL) -> list[dict]:
+        cond, args = scope.where("space")
+        sql = "SELECT * FROM deliveries WHERE 1=1" + cond
         if decision_id:
             sql += " AND decision_id=?"
             args.append(norm_id(decision_id))
@@ -1121,40 +1217,47 @@ class Store:
         args.append(limit)
         return [self._delivery_dict(r) for r in self.q(sql, *args)]
 
-    def delivery_attempts(self, delivery_id: str) -> list[dict]:
+    def _delivery_row(self, delivery_id: str, scope: Scope):
+        row = self.conn.execute("SELECT * FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
+        if not row or not scope.allows(row["space"]):
+            raise ApiError(404, f"no delivery {delivery_id}")
+        return row
+
+    def delivery_attempts(self, delivery_id: str, scope: Scope = ALL) -> list[dict]:
+        with self.lock:
+            self._delivery_row(delivery_id, scope)
         return [dict(r) for r in self.q("SELECT * FROM delivery_attempts WHERE delivery_id=? ORDER BY id",
                                         delivery_id)]
 
-    def ack_delivery(self, delivery_id: str, actor: str) -> dict:
+    def ack_delivery(self, delivery_id: str, actor: str, scope: Scope = ALL) -> dict:
         with self.tx():
-            row = self.conn.execute("SELECT * FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
-            if not row:
-                raise ApiError(404, f"no delivery {delivery_id}")
+            row = self._delivery_row(delivery_id, scope)
             if row["status"] != "acked":
                 self.conn.execute(
                     "UPDATE deliveries SET status='acked', acked_at=?, acked_by=?, next_attempt_at=NULL WHERE id=?",
                     (now_iso(), actor, delivery_id))
                 self._event(row["decision_id"], "webhook.acked", actor,
-                            {"delivery_id": delivery_id, "event_seq": row["event_seq"]})
+                            {"delivery_id": delivery_id, "event_seq": row["event_seq"]}, row["space"])
             return self._delivery_dict(self.conn.execute("SELECT * FROM deliveries WHERE id=?",
                                                          (delivery_id,)).fetchone())
 
-    def ack_decision(self, raw_id: str, actor: str) -> dict:
+    def ack_decision(self, raw_id: str, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)
+        cond, args = scope.where("space")
         with self.lock:
+            self._decision_row(did, scope)
             ids = [r["id"] for r in self.conn.execute(
-                "SELECT id FROM deliveries WHERE decision_id=? AND status IN ('pending','delivered')", (did,))]
-        return {"acked": [self.ack_delivery(i, actor)["id"] for i in ids]}
+                "SELECT id FROM deliveries WHERE decision_id=? AND status IN ('pending','delivered')" + cond,
+                (did, *args))]
+        return {"acked": [self.ack_delivery(i, actor, scope)["id"] for i in ids]}
 
-    def redeliver(self, delivery_id: str, actor: str) -> dict:
+    def redeliver(self, delivery_id: str, actor: str, scope: Scope = ALL) -> dict:
         with self.tx():
-            row = self.conn.execute("SELECT * FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
-            if not row:
-                raise ApiError(404, f"no delivery {delivery_id}")
+            row = self._delivery_row(delivery_id, scope)
             self.conn.execute(
                 "UPDATE deliveries SET status='pending', attempts=0, acked_at=NULL, acked_by=NULL, "
                 "next_attempt_at=? WHERE id=?", (time.time(), delivery_id))
-            self._event(row["decision_id"], "webhook.redelivered", actor, {"delivery_id": delivery_id})
+            self._event(row["decision_id"], "webhook.redelivered", actor, {"delivery_id": delivery_id}, row["space"])
             return self._delivery_dict(self.conn.execute("SELECT * FROM deliveries WHERE id=?",
                                                          (delivery_id,)).fetchone())
 

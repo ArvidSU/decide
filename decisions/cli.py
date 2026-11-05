@@ -201,6 +201,8 @@ def cmd_create(args):
         body["max_select"] = None
     if args.source:
         body["source"] = args.source
+    if args.space or os.environ.get("DECISIONS_SPACE"):
+        body["space"] = args.space or os.environ["DECISIONS_SPACE"]
     if args.webhook:
         body.setdefault("webhooks", []).append({"url": args.webhook, **({"require_ack": True} if args.require_ack else {})})
     if args.meta:
@@ -241,10 +243,15 @@ def cmd_get(args):
 
 
 def cmd_list(args):
-    for d in Client().call("GET", f"/api/decisions?status={args.status}&limit={args.limit}")["decisions"]:
+    q = f"status={args.status}&limit={args.limit}" + (f"&space={args.space}" if args.space else "")
+    decisions = Client().call("GET", f"/api/decisions?{q}")["decisions"]
+    # Show which space each is in only when the token sees more than one.
+    show_space = len({d["space"] for d in decisions}) > 1
+    for d in decisions:
         pending = " (attributes requested)" if d["pending_attribute_requests"] else ""
         due = f"  [expires {_until(d['due_at'])}]" if d.get("due_at") and d["status"] == "open" else ""
-        print(f"{d['id']:>7}  {d['status']:<9} {d['title']}{pending}{due}")
+        space = f"{d['space']:<10} " if show_space else ""
+        print(f"{d['id']:>7}  {space}{d['status']:<9} {d['title']}{pending}{due}")
 
 
 def cmd_wait(args):
@@ -808,6 +815,7 @@ def main(argv=None):
     s.add_argument("--option", "-o", action="append", help="option label (repeatable)")
     s.add_argument("--multi", action="store_true", help="allow selecting any number of options")
     s.add_argument("--source")
+    s.add_argument("--space", help="space to create it in (default: the token's space, or DECISIONS_SPACE)")
     s.add_argument("--webhook", help="webhook URL to notify")
     s.add_argument("--require-ack", action="store_true", help="re-fire webhook until acked")
     s.add_argument("--meta", action="append", help="metadata key=value (repeatable)")
@@ -831,6 +839,7 @@ def main(argv=None):
     s = sub.add_parser("list", help="list decisions")
     s.add_argument("--status", default="open")
     s.add_argument("--limit", type=int, default=50)
+    s.add_argument("--space", help="only this space")
     s.set_defaults(fn=cmd_list)
 
     s = sub.add_parser("wait", help="block until a decision is resolved (long-poll; no inbound port needed)")

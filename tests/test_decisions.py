@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -317,6 +318,44 @@ class DecisionsTest(unittest.TestCase):
         poller = next(l for l in self.call("GET", f"/api/decisions/{d['id']}/listeners")["listeners"] if l["kind"] == "long-poll")
         self.assertFalse(poller["connected"])
 
+    def test_resolve_can_silence_listeners(self):
+        mine, everyone = Receiver(), Receiver()
+        self.call("POST", "/api/webhooks", {"url": everyone.url}, expect=201)
+        d = self.create(webhooks=[{"url": mine.url}],
+                        resume={"session_id": "s1", "agent": "claude", "machine": "m", "cwd": "/"})
+        hook = d["webhooks"][0]["id"]
+        glob = next(l["id"] for l in self.call("GET", f"/api/decisions/{d['id']}/listeners")["listeners"]
+                    if l["scope"] == "global")
+        self.call("POST", f"/api/decisions/{d['id']}/resolve", {"selected": ["1"]}, actor="me")
+        self.assertTrue(mine.wait_for(1) and everyone.wait_for(1))
+        self.call("POST", f"/api/decisions/{d['id']}/resume-events", {"status": "manual"}, actor="me")
+        # Global webhooks always hear; unknown listeners are an error.
+        self.call("POST", f"/api/decisions/{d['id']}/resolve", {"selected": ["2"], "silence": [glob]}, expect=400)
+        self.call("POST", f"/api/decisions/{d['id']}/resolve", {"selected": ["2"], "silence": ["wh_nope"]}, expect=400)
+
+        cursor = self.call("GET", "/api/events?limit=1000")["cursor"]
+        got = {}
+        t = threading.Thread(target=lambda: got.update(self.call(
+            "GET", f"/api/decisions/{d['id']}/wait?timeout=5&after={cursor}", actor="haiku")))
+        t.start()
+        time.sleep(0.3)
+        # Fixing a typo: only the global webhook hears; the resumer's state stays as it was.
+        silenced = self.call("POST", f"/api/decisions/{d['id']}/resolve",
+                             {"selected": ["1"], "note": "fixed typo", "silence": [hook, "resumer", "poll:haiku"]})
+        self.assertTrue(everyone.wait_for(2))
+        time.sleep(0.3)
+        self.assertEqual(len(mine.received), 1)
+        self.assertEqual(silenced["resume_state"]["status"], "manual")
+        self.assertTrue(t.is_alive(), "a silenced long-poller keeps waiting")
+        ev = self.call("GET", f"/api/decisions/{d['id']}/events?types=decision.resolved")["events"][-1]
+        self.assertEqual(ev["data"]["silenced"], [hook, "resumer", "poll:haiku"])
+        # The next resolution reaches everyone again.
+        again = self.call("POST", f"/api/decisions/{d['id']}/resolve", {"selected": ["2"]}, actor="me")
+        t.join()
+        self.assertEqual(got["event"]["seq"], ev["seq"] + 1)
+        self.assertTrue(mine.wait_for(2))
+        self.assertEqual(again["resume_state"]["status"], "pending")
+
     def test_resumer_resumes_catches_up_and_respects_manual(self):
         state = os.path.join(self.tmp, "state")
         out = os.path.join(self.tmp, "resumed.txt")
@@ -619,6 +658,178 @@ class RemoteTest(unittest.TestCase):
         self.assertIn(["launchctl", "bootstrap", f"gui/{os.getuid()}",
                        os.path.join(home, "Library/LaunchAgents/com.decisions.server.plist")],
                       [c.args[0] for c in run.call_args_list])
+
+
+class SpacesTest(unittest.TestCase):
+    """Spaces are hard boundaries: a space's token sees only that space; the admin token sees all."""
+
+    def setUp(self):
+        from decisions.config import Space
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = Config(port=0, db=os.path.join(self.tmp, "t.db"), token="admin", webhook_backoff_base=0.1,
+                          spaces={"work": Space("work", ["tok-work"], deadline_days=1),
+                                  "private": Space("private", ["tok-private"])})
+        self.httpd, self.store, self.dispatcher = make_server(self.cfg)
+        self.cfg.port = self.httpd.server_port
+        self.dispatcher.poll_interval = 0.05
+        self.dispatcher.start()
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.cfg.port}"
+
+    def tearDown(self):
+        self.dispatcher.stop()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def call(self, method, path, body=None, token="admin", expect=None):
+        req = urllib.request.Request(self.base + path, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                status, text = r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            status, text = e.code, e.read().decode()
+        if expect is not None:
+            self.assertEqual(status, expect, f"{method} {path}: {text}")
+        return json.loads(text) if text.startswith(("{", "[")) else text
+
+    def create(self, token, **extra):
+        return self.call("POST", "/api/decisions", {"title": "Which?", "options": ["a", "b"]} | extra,
+                         token=token, expect=201)
+
+    def test_space_token_routes_and_isolates(self):
+        w = self.create("tok-work")
+        p = self.create("tok-private")
+        self.assertEqual((w["space"], p["space"]), ("work", "private"))
+        ids = lambda token, q="": [d["id"] for d in self.call("GET", "/api/decisions" + q, token=token)["decisions"]]
+        self.assertEqual(ids("tok-work"), [w["id"]])
+        self.assertEqual(ids("tok-private"), [p["id"]])
+        self.assertEqual(ids("admin"), [p["id"], w["id"]])
+        self.assertEqual(ids("admin", "?space=work"), [w["id"]])
+        # A space token can't create elsewhere; the admin can create anywhere.
+        self.call("POST", "/api/decisions", {"title": "x", "space": "private"}, token="tok-work", expect=404)
+        self.call("POST", "/api/decisions", {"title": "x", "space": "nope"}, token="admin", expect=404)
+        self.assertEqual(self.create("admin", space="private")["space"], "private")
+        self.assertEqual(self.create("admin")["space"], "default")
+        cfg = self.call("GET", "/api/config", token="tok-work")
+        self.assertEqual((cfg["space"], [s["name"] for s in cfg["spaces"]]), ("work", ["work"]))
+        self.assertEqual([s["name"] for s in self.call("GET", "/api/config")["spaces"]],
+                         ["default", "private", "work"])
+        self.call("GET", "/api/decisions", token="wrong", expect=401)
+
+    def test_every_decision_route_hides_other_spaces(self):
+        from decisions.server import ROUTES
+        p = self.create("tok-private")
+        checked = 0
+        for method, pattern, name in ROUTES:
+            if "/api/decisions/" not in pattern.pattern:
+                continue
+            path = pattern.pattern.strip("^$").replace("([^/]+)", p["id"], 1).replace("([^/]+)", "1")
+            body = {"title": "x", "selected": ["1"], "text": "hi", "status": "manual", "option_ids": ["1"],
+                    "url": "http://127.0.0.1:9/", "label": "c", "key": "k", "options": [{"id": "1", "label": "c"}]} if method != "GET" else None
+            self.call(method, path + ("?timeout=0" if path.endswith("/wait") else ""), body, token="tok-work",
+                      expect=404)
+            checked += 1
+        self.assertGreater(checked, 15)
+        self.call("GET", f"/api/events?decision={p['id']}", token="tok-work", expect=404)
+        self.call("GET", f"/api/webhooks?decision={p['id']}", token="tok-work", expect=404)
+        self.call("POST", "/api/webhooks", {"url": "http://127.0.0.1:9/", "decision_id": p["id"]},
+                  token="tok-work", expect=404)
+        # ...and none of it changed anything.
+        self.assertEqual(self.call("GET", f"/api/decisions/{p['id']}", token="tok-private")["status"], "open")
+
+    def test_event_feed_is_scoped(self):
+        w = self.create("tok-work")
+        p = self.create("tok-private")
+        feed = lambda token: {e["decision_id"] for e in self.call("GET", "/api/events", token=token)["events"]}
+        self.assertEqual(feed("tok-work"), {w["id"]})
+        self.assertEqual(feed("admin"), {w["id"], p["id"]})
+
+    def test_webhooks_only_hear_their_space(self):
+        rx_work, rx_all = Receiver(), Receiver()
+        hook = self.call("POST", "/api/webhooks", {"url": rx_work.url, "events": ["decision.created"]},
+                         token="tok-work", expect=201)
+        self.assertEqual(hook["space"], "work")
+        everywhere = self.call("POST", "/api/webhooks", {"url": rx_all.url, "events": ["decision.created"]},
+                               expect=201)
+        self.assertIsNone(everywhere["space"])
+        w = self.create("tok-work")
+        p = self.create("tok-private")
+        self.assertTrue(rx_all.wait_for(2))
+        self.assertTrue(rx_work.wait_for(1))
+        time.sleep(0.3)
+        self.assertEqual([json.loads(b)["decision"]["id"] for _, b in rx_work.received], [w["id"]])
+        self.assertEqual(sorted(json.loads(b)["decision"]["id"] for _, b in rx_all.received), sorted([w["id"], p["id"]]))
+        # The work token can't see or touch the admin's all-spaces webhook or its deliveries.
+        self.assertEqual([h["id"] for h in self.call("GET", "/api/webhooks", token="tok-work")["webhooks"]],
+                         [hook["id"]])
+        self.call("DELETE", f"/api/webhooks/{everywhere['id']}", token="tok-work", expect=404)
+        self.assertTrue(all(d["space"] == "work" for d in
+                            self.call("GET", "/api/deliveries", token="tok-work")["deliveries"]))
+        self.assertEqual(len(self.call("GET", "/api/deliveries")["deliveries"]), 3)
+        self.assertEqual([x["kind"] for x in
+                          self.call("GET", f"/api/decisions/{w['id']}/listeners", token="tok-work")["listeners"]],
+                         ["webhook"])
+
+    def test_each_space_has_its_own_hash_chain(self):
+        for token in ("tok-work", "tok-private", "tok-work", "tok-private"):
+            d = self.create(token)
+            self.call("POST", f"/api/decisions/{d['id']}/resolve", {"selected": ["1"]}, token=token, expect=200)
+        v = self.call("GET", "/api/events/verify")
+        self.assertTrue(v["ok"])
+        self.assertEqual({k: c["events"] for k, c in v["chains"].items()}, {"private": 4, "work": 4})
+        self.assertEqual(list(self.call("GET", "/api/events/verify", token="tok-work")["chains"]), ["work"])
+        conn = sqlite3.connect(self.cfg.db_path)
+        conn.execute("DROP TRIGGER events_no_update")
+        conn.execute("UPDATE events SET actor='mallory' WHERE seq=(SELECT MIN(seq) FROM events WHERE space='work')")
+        conn.commit()
+        conn.close()
+        v = self.call("GET", "/api/events/verify")
+        self.assertFalse(v["ok"])
+        self.assertTrue(v["chains"]["private"]["ok"])
+        self.assertTrue(self.call("GET", "/api/events/verify", token="tok-private")["ok"])
+
+    def test_idempotency_keys_and_deadlines_are_per_space(self):
+        w = self.create("tok-work", idempotency_key="k")
+        p = self.create("tok-private", idempotency_key="k")
+        self.assertNotEqual(w["id"], p["id"])
+        self.assertEqual(self.call("POST", "/api/decisions", {"title": "again", "idempotency_key": "k"},
+                                   token="tok-work", expect=200)["id"], w["id"])
+        days = lambda d: (datetime.fromisoformat(d["due_at"]) - datetime.fromisoformat(d["created_at"])).days
+        self.assertEqual((days(w), days(p)), (1, self.cfg.deadline_days))
+
+
+class SpacesConfigTest(unittest.TestCase):
+    def load(self, text):
+        from decisions.config import load_config
+        path = os.path.join(tempfile.mkdtemp(), "c.toml")
+        with open(path, "w") as fh:
+            fh.write(text)
+        return load_config(path)
+
+    def test_spaces_from_toml(self):
+        cfg = self.load('token = "admin"\n[spaces.work]\ntokens = ["a", "b"]\ndeadline_days = 2\n'
+                        '[spaces.private]\ntokens = "c"\n')
+        self.assertEqual(cfg.space_names, ["default", "private", "work"])
+        self.assertEqual((cfg.deadline_days_for("work"), cfg.deadline_days_for("private")), (2, cfg.deadline_days))
+        self.assertEqual(cfg.scope_for("b").spaces, frozenset({"work"}))
+        self.assertTrue(cfg.scope_for("admin").everything)
+        self.assertIsNone(cfg.scope_for("nope"))
+
+    def test_rejects_shared_tokens_and_bad_names(self):
+        with self.assertRaises(SystemExit):
+            self.load('[spaces.a]\ntokens = ["x"]\n[spaces.b]\ntokens = ["x"]\n')
+        with self.assertRaises(SystemExit):
+            self.load('token = "x"\n[spaces.a]\ntokens = ["x"]\n')
+        with self.assertRaises(SystemExit):
+            self.load('[spaces.Work]\ntokens = ["x"]\n')
+
+    def test_without_admin_token_space_tokens_still_route(self):
+        from decisions.config import Space
+        cfg = Config(spaces={"work": Space("work", ["w"])})
+        self.assertTrue(cfg.scope_for("").everything)
+        self.assertEqual(cfg.scope_for("w").default, "work")
 
 
 if __name__ == "__main__":

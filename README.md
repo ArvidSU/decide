@@ -18,15 +18,16 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 
 | | |
 |---|---|
+| **Space** | A hard boundary between contexts: `work`, `private`, later maybe one shared with someone. Every decision, webhook and event belongs to exactly one. Each space has its own tokens: an agent using a space's token creates decisions there automatically and can't see any other space. Other spaces' decisions look the same as missing ones (404). The admin `token` sees every space. Without any `[spaces.*]` config, everything is in `default` and the GUI doesn't show spaces at all. Use tags for topics inside a space. |
 | **Decision** | `D-12`: title, context (markdown), source, options, `min_select`/`max_select` (default: pick exactly one; `"max_select": null` = any number), links, tags, metadata, `due_at`. Status `open` → `resolved` / `cancelled` / `expired`. Nothing is locked: you can edit, re-resolve or reopen at any time; every change is logged. |
 | **Deadline** | Every open decision has a `due_at`, by default 4 days after it's created (`deadline_days`). If nobody decides by then, it **expires**: status `expired`, event `decision.expired` (actor `deadline`). That's distinct from `cancelled`, which someone does on purpose. If nobody took action, it wasn't very important. Its waiters, webhooks and resumer are notified, the same as for a resolution. Extend it with `PATCH {"due_at": …}` or the GUI's +1 day / +4 days. Reopening an expired decision starts a new deadline. |
 | **Option** | `label`, `description`, `url`, `image`, `attributes` (any JSON). The ID is yours (e.g. a SKU) or auto-assigned (`1`, `2`, …). |
 | **Attribute defs** | Optional hints per attribute key: `label`, `type` (`number`/`boolean`/`enum`/`tags`/`text`/`url`), `unit`, `better` (`lower`/`higher`), `description`. Without them the GUI infers types from the values. |
 | **Attribute request** | You ask for a new attribute in the GUI. The decision's `pending_attribute_requests` lists which options are missing it, and an `attributes.requested` webhook fires. The requester PATCHes the values in. |
 | **Attribute meta** | Per-option provenance for values: `attribute_meta: {"price": {"estimate": true, "source": "…", "note": "…"}}`. Estimates show as "≈ value" in the GUI and "~value" in markdown. |
-| **Listening** | The decision page shows who will hear about it: agents long-polling right now (by `X-Actor`) and webhooks. `GET /api/decisions/{id}/listeners`. |
+| **Listening** | The decision page shows who will hear about it: agents long-polling right now (by `X-Actor`) and webhooks. `GET /api/decisions/{id}/listeners`. Click the eye next to a listener to resolve without notifying it (global webhooks always hear). |
 | **Exclusion** | Ruling an option out (✕, or "Exclude N hidden" to turn current filters into exclusions). It's persisted with a reason, so the log shows *why* options were dropped. |
-| **Event log** | Append-only and SHA-256 hash-chained. SQLite triggers reject UPDATE/DELETE. `GET /api/events/verify` checks the chain. |
+| **Event log** | Append-only and SHA-256 hash-chained, with one chain per space, so a space's history can be verified or shared without the others. SQLite triggers reject UPDATE/DELETE. `GET /api/events/verify` checks each chain the token can see. |
 | **Reference** | Click the `D-12` chip to copy `[D-12: title](url)` for Slack / Linear. "Copy summary" copies a markdown table of options and the outcome. |
 
 ## GUI
@@ -55,7 +56,7 @@ Base: `http://127.0.0.1:8787/api`. JSON in and out. Send `X-Actor: <name>` so th
 | `PATCH` / `DELETE /decisions/{id}/options/{oid}` | Edit / remove one option |
 | `POST /decisions/{id}/exclude` · `/include` | `{option_ids, reason?}` |
 | `POST /decisions/{id}/attribute-requests` | `{key, description}` (normally done from the GUI) |
-| `POST /decisions/{id}/resolve` | `{selected: [ids], note?}` |
+| `POST /decisions/{id}/resolve` | `{selected: [ids], note?, silence?: [listener ids]}`. `silence` skips notifying those listeners, e.g. when fixing a typo: `resumer`, `poll:<actor>`, or the id of a webhook on this decision. Global webhooks always hear. Recorded as `silenced` on the event. |
 | `POST /decisions/{id}/reopen` · `/cancel` · `/comments` | |
 | `GET /decisions/{id}/wait?timeout=60&types=…&after=…` | Long-poll until resolved/cancelled/expired (or other event types). Returns immediately if already in one of those states. |
 | `GET /decisions/{id}/events` · `GET /events?after=N&wait=30` | Event log; the global feed can be long-polled instead of using webhooks |
@@ -170,7 +171,7 @@ Flags: `--no-resumer`, `--no-skill`. The pieces are also served on their own: `/
 host = "127.0.0.1"
 port = 8787
 db = "~/.local/share/decisions/decisions.db"
-token = ""                 # set to require Authorization: Bearer <token>
+token = ""                 # admin token: sees every space. Set to require Authorization: Bearer <token>
 base_url = ""              # public URL for links/ack_url if behind a proxy/tunnel
 owner = "me"               # actor name for GUI actions
 callback_host = ""         # how the server reaches its own machine for webhooks (Docker: host.docker.internal)
@@ -183,7 +184,18 @@ backoff_base = 10
 backoff_max = 3600
 require_ack = false        # default for subscriptions that don't say
 refire_interval = 300
+
+# Spaces (optional). Decision IDs stay global (D-12), so they never collide across spaces.
+[spaces.work]
+tokens = ["…"]             # agents with this token see and create only in `work`
+deadline_days = 4          # optional, overrides the server-wide value
+
+[spaces.private]
+tokens = ["…"]
+deadline_days = 30
 ```
+
+Each token belongs to one space. The admin token creates in `default` unless the body names a `space`, and `decide create --space` / `DECISIONS_SPACE` do the same from the CLI. A webhook created without a decision (`POST /api/webhooks`) covers the creating token's space. If the admin token creates one without a `space`, it covers every space. If there's no admin token, auth is off and anyone sees everything, but a space token still routes new decisions to its space.
 
 Answer attribute requests from the CLI with `decide fill D-12 < patches.json` (`[{"id", "attributes"}]`).
 

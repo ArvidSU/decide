@@ -1,7 +1,6 @@
 """HTTP server: JSON REST API under /api, the single-page GUI everywhere else."""
 from __future__ import annotations
 
-import hmac
 import json
 import mimetypes
 import re
@@ -11,7 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__, dist
-from .config import Config, is_loopback
+from .config import ALL, Config, Scope, is_loopback
 from .markdown import decision_markdown
 from .store import DEFAULT_WEBHOOK_EVENTS, ApiError, Store
 from .webhooks import Dispatcher
@@ -37,6 +36,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "decisions/0.1"
     store: Store
     cfg: Config
+    scope: Scope = ALL
 
     # ------------------------------------------------------------------ plumbing
 
@@ -70,12 +70,10 @@ class Handler(BaseHTTPRequestHandler):
     def actor(self) -> str:
         return (self.headers.get("X-Actor") or "").strip()[:100] or "api"
 
-    def _authorized(self) -> bool:
-        if not self.cfg.token:
-            return True
+    def _scope(self) -> Scope | None:
         auth = self.headers.get("Authorization", "")
         supplied = auth[7:] if auth.startswith("Bearer ") else self.headers.get("X-Api-Key", "")
-        return hmac.compare_digest(supplied, self.cfg.token)
+        return self.cfg.scope_for(supplied)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -111,8 +109,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._install(path)
             if not path.startswith("/api/"):
                 return self._static(path)
-            if path != "/api/health" and not self._authorized():
-                raise ApiError(401, "missing or invalid token")
+            if path != "/api/health":
+                scope = self._scope()
+                if scope is None:
+                    raise ApiError(401, "missing or invalid token")
+                self.scope = scope
             for m, pattern, name in ROUTES:
                 match = pattern.match(path)
                 if match and m == method:
@@ -174,6 +175,9 @@ class Handler(BaseHTTPRequestHandler):
                 "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
                 "default_webhook_events": DEFAULT_WEBHOOK_EVENTS, "cursor": self.store.cursor(),
+                "space": self.scope.default,
+                "spaces": [{"name": n, "deadline_days": c.deadline_days_for(n)}
+                           for n in c.space_names if self.scope.allows(n)],
                 "webhook": {"timeout": c.webhook_timeout, "max_attempts": c.webhook_max_attempts,
                             "backoff_base": c.webhook_backoff_base, "backoff_max": c.webhook_backoff_max,
                             "require_ack": c.webhook_require_ack, "refire_interval": c.webhook_refire_interval}}
@@ -184,41 +188,41 @@ class Handler(BaseHTTPRequestHandler):
     def list_decisions(self):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
         return {"decisions": self.store.list_decisions(
-            status=g("status"), q=g("q"), tag=g("tag"), source=g("source"),
-            limit=int(g("limit", 100)), offset=int(g("offset", 0)))}
+            status=g("status"), q=g("q"), tag=g("tag"), source=g("source"), space=g("space"),
+            limit=int(g("limit", 100)), offset=int(g("offset", 0)), scope=self.scope)}
 
     @route("POST", "/api/decisions")
     def create_decision(self):
-        decision, created = self.store.create_decision(self._body(), self.actor)
+        decision, created = self.store.create_decision(self._body(), self.actor, self.scope)
         return (201 if created else 200), decision
 
     @route("GET", "/api/decisions/([^/]+)")
     def get_decision(self, did):
-        return self.store.get_decision(did)
+        return self.store.get_decision(did, self.scope)
 
     @route("PATCH", "/api/decisions/([^/]+)")
     def update_decision(self, did):
-        return self.store.update_decision(did, self._body(), self.actor)
+        return self.store.update_decision(did, self._body(), self.actor, self.scope)
 
     @route("GET", "/api/decisions/([^/]+)/markdown")
     def markdown(self, did):
-        self._send(200, decision_markdown(self.store.get_decision(did)), "text/markdown; charset=utf-8")
+        self._send(200, decision_markdown(self.store.get_decision(did, self.scope)), "text/markdown; charset=utf-8")
 
     @route("POST", "/api/decisions/([^/]+)/resolve")
     def resolve(self, did):
-        return self.store.resolve(did, self._body(), self.actor)
+        return self.store.resolve(did, self._body(), self.actor, self.scope)
 
     @route("POST", "/api/decisions/([^/]+)/reopen")
     def reopen(self, did):
-        return self.store.set_status(did, "open", self._body().get("note", ""), self.actor)
+        return self.store.set_status(did, "open", self._body().get("note", ""), self.actor, self.scope)
 
     @route("POST", "/api/decisions/([^/]+)/cancel")
     def cancel(self, did):
-        return self.store.set_status(did, "cancelled", self._body().get("note", ""), self.actor)
+        return self.store.set_status(did, "cancelled", self._body().get("note", ""), self.actor, self.scope)
 
     @route("POST", "/api/decisions/([^/]+)/comments")
     def comment(self, did):
-        return 201, self.store.comment(did, self._body(), self.actor)
+        return 201, self.store.comment(did, self._body(), self.actor, self.scope)
 
     @route("GET", "/api/decisions/([^/]+)/wait")
     def wait(self, did):
@@ -227,11 +231,11 @@ class Handler(BaseHTTPRequestHandler):
         return self.store.wait_decision(
             did, _types(self.qs, ["decision.resolved", "decision.cancelled", "decision.expired"]),
             int(after) if after not in (None, "") else None,
-            min(float(g("timeout", 60)), MAX_WAIT), self.actor)
+            min(float(g("timeout", 60)), MAX_WAIT), self.actor, self.scope)
 
     @route("POST", "/api/decisions/([^/]+)/resume-events")
     def resume_event(self, did):
-        return 201, self.store.resume_event(did, self._body(), self.actor)
+        return 201, self.store.resume_event(did, self._body(), self.actor, self.scope)
 
     @route("POST", "/api/resumer/heartbeat")
     def resumer_heartbeat(self):
@@ -243,105 +247,105 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", "/api/decisions/([^/]+)/listeners")
     def listeners(self, did):
-        return {"listeners": self.store.listeners(did)}
+        return {"listeners": self.store.listeners(did, self.scope)}
 
     @route("POST", "/api/decisions/([^/]+)/ack")
     def ack_decision(self, did):
-        return self.store.ack_decision(did, self.actor)
+        return self.store.ack_decision(did, self.actor, self.scope)
 
     # ------------------------------------------------------------------ options
 
     @route("POST", "/api/decisions/([^/]+)/options")
     def add_options(self, did):
-        return 201, self.store.add_options(did, self._body(), self.actor)
+        return 201, self.store.add_options(did, self._body(), self.actor, self.scope)
 
     @route("PATCH", "/api/decisions/([^/]+)/options")
     def update_options(self, did):
-        return self.store.update_options(did, self._body(), self.actor)
+        return self.store.update_options(did, self._body(), self.actor, self.scope)
 
     @route("PATCH", "/api/decisions/([^/]+)/options/([^/]+)")
     def update_option(self, did, oid):
-        return self.store.update_option(did, oid, self._body(), self.actor)
+        return self.store.update_option(did, oid, self._body(), self.actor, self.scope)
 
     @route("DELETE", "/api/decisions/([^/]+)/options/([^/]+)")
     def remove_option(self, did, oid):
-        return self.store.remove_option(did, oid, self.actor)
+        return self.store.remove_option(did, oid, self.actor, self.scope)
 
     @route("POST", "/api/decisions/([^/]+)/exclude")
     def exclude(self, did):
-        return self.store.set_excluded(did, self._body(), True, self.actor)
+        return self.store.set_excluded(did, self._body(), True, self.actor, self.scope)
 
     @route("POST", "/api/decisions/([^/]+)/include")
     def include(self, did):
-        return self.store.set_excluded(did, self._body(), False, self.actor)
+        return self.store.set_excluded(did, self._body(), False, self.actor, self.scope)
 
     # ------------------------------------------------------------------ attribute requests
 
     @route("POST", "/api/decisions/([^/]+)/attribute-requests")
     def request_attributes(self, did):
-        return 201, self.store.request_attributes(did, self._body(), self.actor)
+        return 201, self.store.request_attributes(did, self._body(), self.actor, self.scope)
 
     @route("DELETE", "/api/decisions/([^/]+)/attribute-requests/([^/]+)")
     def cancel_attribute_request(self, did, key):
-        return self.store.cancel_attribute_request(did, key, self.actor)
+        return self.store.cancel_attribute_request(did, key, self.actor, self.scope)
 
     # ------------------------------------------------------------------ events
 
     @route("GET", "/api/decisions/([^/]+)/events")
     def decision_events(self, did):
         return {"events": self.store.events(int(self.qs.get("after", [0])[0]), did,
-                                            limit=int(self.qs.get("limit", [1000])[0]))}
+                                            limit=int(self.qs.get("limit", [1000])[0]), scope=self.scope)}
 
     @route("GET", "/api/events")
     def events(self):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
         evs = self.store.wait_events(
             int(g("after", 0)), g("decision"), _types(self.qs, None),
-            min(float(g("wait", 0)), MAX_WAIT), int(g("limit", 200)))
+            min(float(g("wait", 0)), MAX_WAIT), int(g("limit", 200)), self.scope)
         return {"events": evs, "cursor": evs[-1]["seq"] if evs else max(int(g("after", 0)), 0)}
 
     @route("GET", "/api/events/verify")
     def verify(self):
-        return self.store.verify_chain()
+        return self.store.verify_chain(self.scope)
 
     # ------------------------------------------------------------------ webhooks
 
     @route("GET", "/api/webhooks")
     def list_webhooks(self):
-        return {"webhooks": self.store.list_subscriptions(self.qs.get("decision", [None])[0])}
+        return {"webhooks": self.store.list_subscriptions(self.qs.get("decision", [None])[0], self.scope)}
 
     @route("POST", "/api/webhooks")
     def create_webhook(self):
-        return 201, self.store.create_subscription(self._body(), self.actor)
+        return 201, self.store.create_subscription(self._body(), self.actor, scope=self.scope)
 
     @route("POST", "/api/decisions/([^/]+)/webhooks")
     def create_decision_webhook(self, did):
-        return 201, self.store.create_subscription(self._body(), self.actor, did)
+        return 201, self.store.create_subscription(self._body(), self.actor, did, self.scope)
 
     @route("PATCH", "/api/webhooks/([^/]+)")
     def update_webhook(self, sid):
-        return self.store.update_subscription(sid, self._body(), self.actor)
+        return self.store.update_subscription(sid, self._body(), self.actor, self.scope)
 
     @route("DELETE", "/api/webhooks/([^/]+)")
     def delete_webhook(self, sid):
-        return self.store.delete_subscription(sid, self.actor)
+        return self.store.delete_subscription(sid, self.actor, self.scope)
 
     @route("GET", "/api/deliveries")
     def deliveries(self):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
-        return {"deliveries": self.store.list_deliveries(g("decision"), g("status"), int(g("limit", 100)))}
+        return {"deliveries": self.store.list_deliveries(g("decision"), g("status"), int(g("limit", 100)), self.scope)}
 
     @route("GET", "/api/deliveries/([^/]+)/attempts")
     def attempts(self, delivery_id):
-        return {"attempts": self.store.delivery_attempts(delivery_id)}
+        return {"attempts": self.store.delivery_attempts(delivery_id, self.scope)}
 
     @route("POST", "/api/deliveries/([^/]+)/ack")
     def ack_delivery(self, delivery_id):
-        return self.store.ack_delivery(delivery_id, self.actor)
+        return self.store.ack_delivery(delivery_id, self.actor, self.scope)
 
     @route("POST", "/api/deliveries/([^/]+)/redeliver")
     def redeliver(self, delivery_id):
-        return self.store.redeliver(delivery_id, self.actor)
+        return self.store.redeliver(delivery_id, self.actor, self.scope)
 
 
 def make_server(cfg: Config, store: Store | None = None) -> tuple[ThreadingHTTPServer, Store, Dispatcher]:
