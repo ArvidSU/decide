@@ -283,7 +283,7 @@ def _goal_line(g: dict) -> str:
 
 
 def cmd_goal_list(args):
-    q = f"status={args.status}" + (f"&space={args.space}" if args.space else "")
+    q = f"status={args.status}" + (f"&space={args.space}" if args.space else "") + (f"&tag={args.tag}" if args.tag else "")
     goals = Client().call("GET", f"/api/goals?{q}")["goals"]
     # Indented under the goals they serve; a goal serving several shows under each.
     ids = {g["id"] for g in goals}
@@ -300,7 +300,7 @@ def cmd_goal_list(args):
 
 
 def cmd_goal_create(args):
-    body = {"title": args.title, "serves": args.serves or []}
+    body = {"title": args.title, "serves": args.serves or [], "tags": args.tag or []}
     if args.description:
         body["description"] = args.description
     if args.space or os.environ.get("DECISIONS_SPACE"):
@@ -335,12 +335,14 @@ def cmd_goal_set(args):
                               ("note", args.note)) if v is not None}
     if args.serves is not None:
         body["serves"] = [x for x in args.serves if x]
+    if args.tags is not None:
+        body["tags"] = [x for x in args.tags if x]
     _print(Client().call("PATCH", f"/api/goals/{args.id}", body))
 
 
 def cmd_map(args):
     q = "&".join(x for x in (f"focus={args.focus}" if args.focus else "", f"space={args.space}" if args.space else "",
-                             "all=1" if args.all else "") if x)
+                             "all=1" if args.all else "", *(f"tag={t}" for t in args.tag or [])) if x)
     g = Client().call("GET", f"/api/graph?{q}")
     if args.json:
         return _print(g)
@@ -351,13 +353,15 @@ def cmd_map(args):
     for n in g["nodes"]:
         picked = f" -> {', '.join(n['outcome'])}" if n.get("outcome") else ""
         changed = f"  (changed {n['changed']}x)" if n.get("changed") else ""
-        print(f"{n['id']:>6}  {n['status']:<9} {n['title']}{picked}{changed}")
+        context = "  (context: it leads up to what matches)" if n.get("context") else ""
+        print(f"{n['id']:>6}  {n['status']:<9} {n['title']}{picked}{changed}{context}")
         for e in out.get(n["id"], []):
             print(f"{'':>8}{e}")
 
 
 def cmd_insights(args):
-    i = Client().call("GET", "/api/insights" + (f"?space={args.space}" if args.space else ""))
+    q = "&".join([*([f"space={args.space}"] if args.space else []), *(f"tag={t}" for t in args.tag or [])])
+    i = Client().call("GET", "/api/insights" + (f"?{q}" if q else ""))
     if args.json:
         return _print(i)
     print("Dead ends: options picked and later dropped, or picked for a goal that was abandoned")
@@ -1027,11 +1031,13 @@ def main(argv=None):
     r = gsub.add_parser("list", help="goals as a tree, under the goals they serve")
     r.add_argument("--status", default="active", help="active, achieved, abandoned or all")
     r.add_argument("--space", help="only this space")
+    r.add_argument("--tag", help="only goals with this tag")
     r.set_defaults(fn=cmd_goal_list)
     r = gsub.add_parser("create", help="create a goal")
     r.add_argument("title")
     r.add_argument("--serves", action="append", metavar="G-N", help="a larger goal this one is a step toward (repeatable)")
     r.add_argument("--description")
+    r.add_argument("--tag", action="append", help="e.g. business, product, tech (repeatable); its decisions share them")
     r.add_argument("--space", help="space to create it in (default: the token's space, or DECISIONS_SPACE)")
     r.add_argument("--quiet", "-q", action="store_true", help="print only the goal id")
     r.set_defaults(fn=cmd_goal_create)
@@ -1046,17 +1052,21 @@ def main(argv=None):
     r.add_argument("--status", choices=["active", "achieved", "abandoned"])
     r.add_argument("--note", help="why its status changed")
     r.add_argument("--serves", nargs="*", metavar="G-N", help="replace the goals it serves (none: a top-level goal)")
+    r.add_argument("--tags", nargs="*", help="replace its tags")
     r.set_defaults(fn=cmd_goal_set)
 
     s = sub.add_parser("map", help="goals and decisions as a graph: what serves what")
     s.add_argument("--focus", metavar="G-N|D-N", help="only what leads to it and what it leads to")
     s.add_argument("--all", action="store_true", help="include decisions that aren't linked to a goal")
+    s.add_argument("--tag", action="append", help="only goals and decisions with this tag, and what they lead up to "
+                                                   "(repeatable: any of them). Decisions have their goals' tags too.")
     s.add_argument("--space", help="only this space")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_map)
 
     s = sub.add_parser("insights", help="dead-end options, reversed decisions and abandoned goals")
     s.add_argument("--space", help="only this space")
+    s.add_argument("--tag", action="append", help="only goals and decisions with this tag (repeatable: any of them)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_insights)
 

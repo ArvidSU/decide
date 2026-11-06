@@ -317,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
     @route("GET", "/api/goals")
     def list_goals(self):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
-        return {"goals": self.store.list_goals(status=g("status"), space=g("space"), scope=self.scope)}
+        return {"goals": self.store.list_goals(status=g("status"), space=g("space"), tag=g("tag"), scope=self.scope)}
 
     @route("POST", "/api/goals")
     def create_goal(self):
@@ -340,11 +340,15 @@ class Handler(BaseHTTPRequestHandler):
     def graph(self):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
         return self.store.graph(self.scope, space=g("space"), focus=g("focus"),
-                                everything=g("all", "") in ("1", "true"))
+                                everything=g("all", "") in ("1", "true"), tags=self._tags())
 
     @route("GET", "/api/insights")
     def insights(self):
-        return self.store.insights(self.scope, space=self.qs.get("space", [None])[0])
+        return self.store.insights(self.scope, space=self.qs.get("space", [None])[0], tags=self._tags())
+
+    def _tags(self) -> list[str]:
+        """`?tags=tech,product`, or `?tag=tech` repeated."""
+        return [t.strip() for raw in self.qs.get("tags", []) + self.qs.get("tag", []) for t in raw.split(",") if t.strip()]
 
     # ------------------------------------------------------------------ options
 

@@ -1496,8 +1496,8 @@ function mapNodeHtml(n, p, focus) {
   const sub = goal ? (n.status === "active" ? "" : GOAL_STATUS[n.status])
     : n.status === "resolved" ? `→ ${n.outcome.join(", ")}`
     : isWaiting(n) ? `after ${n.waiting_on.join(", ")}` : n.status === "open" ? "Undecided" : n.status[0].toUpperCase() + n.status.slice(1);
-  return `<a href="/${goal ? "g" : "d"}/${esc(n.id)}" data-nav class="mnode ${n.kind} ${esc(n.status)} ${n.id === focus ? "focus" : ""}" data-node="${esc(n.id)}"
-      style="left:${p.x}px;top:${p.y}px" title="${esc(`${n.id}: ${n.title}`)}">
+  return `<a href="/${goal ? "g" : "d"}/${esc(n.id)}" data-nav class="mnode ${n.kind} ${esc(n.status)} ${n.id === focus ? "focus" : ""} ${n.context ? "context" : ""}" data-node="${esc(n.id)}"
+      style="left:${p.x}px;top:${p.y}px" title="${esc(`${n.id}: ${n.title}${n.context ? " (doesn't have the tag: shown because what does leads up to it)" : ""}`)}">
     <span class="mn-top">${goal ? icon("target", 12) : statusIcon(n, 12)}<span>${goal ? "Goal " : ""}${esc(n.id)}</span>
       ${n.changed ? `<span class="mn-changed" title="Changed its mind ${n.changed} time${n.changed > 1 ? "s" : ""}">${icon("rotate", 11)}${n.changed}</span>` : ""}</span>
     <span class="mn-title">${esc(n.title)}</span>
@@ -1607,21 +1607,32 @@ async function renderMap() {
   const params = new URLSearchParams(location.search);
   const focus = params.get("focus") || "";
   const all = params.get("all") === "1";
-  const q = new URLSearchParams();
-  if (S.space) q.set("space", S.space);
+  const tags = mapTags();
+  const q = new URLSearchParams(), iq = new URLSearchParams();
+  if (S.space) { q.set("space", S.space); iq.set("space", S.space); }
+  if (tags.length) { q.set("tags", tags.join(",")); iq.set("tags", tags.join(",")); }
   if (focus) q.set("focus", focus);
   if (all) q.set("all", "1");
-  const [g, ins] = await Promise.all([api("GET", `/api/graph?${q}`), api("GET", `/api/insights${S.space ? `?space=${encodeURIComponent(S.space)}` : ""}`)]);
+  const [g, ins] = await Promise.all([api("GET", `/api/graph?${q}`), api("GET", `/api/insights?${iq}`)]);
   if (location.pathname !== "/map") return;
-  const goals = S.goals.filter((x) => inSpace(x));
+  const shown = new Set(g.nodes.map((n) => n.id));
+  const goals = S.goals.filter((x) => inSpace(x) && (!tags.length || shown.has(x.id)));
+  // Every tag in this space; decisions count too, since agents tag them.
+  const known = [...new Set([...tags, ...[...S.goals, ...S.list].filter(inSpace).flatMap((x) => x.tags || [])])].sort();
   const main = $("#main");
   const scroll = main.scrollTop, mapScroll = $(".map-scroll")?.scrollLeft;
   main.innerHTML = `<div class="page wide">
     <div class="map-head"><div><h1 class="d-title">Map</h1>
       <p>Goals are why decisions are made. Each goal serves larger ones, from the vision down to technical goals, and each decision is a step toward one. Hover anything to trace what led to it and what it led to.</p></div>
       <button class="btn primary" data-action="new-goal">${icon("plus", 15)}New goal</button></div>
-    ${g.nodes.length || focus ? `<div class="toolbar map-tools">
+    ${known.length ? `<div class="tag-filter" role="group" aria-label="Only show goals and decisions with these tags">
+        <span class="tlabel">${icon("filter", 14)}Topics</span>
+        ${known.map((t) => `<button class="tagb ${tags.includes(t) ? "on" : ""}" data-action="map-tag" data-tag="${esc(t)}" aria-pressed="${tags.includes(t)}">#${esc(t)}</button>`).join("")}
+        ${tags.length ? `<button class="btn small ghost" data-action="map-tags-clear">Show all</button>
+          <span class="muted small">Decisions have their goals' tags. Faded: what matches leads up to it.</span>` : ""}</div>` : ""}
+    ${g.nodes.length || focus || tags.length ? `<div class="toolbar map-tools">
         ${focus ? `<span class="afchip">Connected to ${esc(focus)}<a href="/map" data-nav aria-label="Show the whole map">${icon("x", 13)}</a></span>` : ""}
+        ${tags.length && !g.nodes.length ? `<span class="muted small">Nothing has ${tags.map((t) => `#${esc(t)}`).join(" or ")}${S.space ? ` in ${esc(S.space)}` : ""}.</span>` : ""}
         <label class="check-label small"><input type="checkbox" id="map-all" ${all ? "checked" : ""}> Show decisions without a goal</label>
         <span class="spacer"></span>${mapLegend()}</div>
       ${mapHtml(g, { focus })}`
@@ -1640,6 +1651,18 @@ async function renderMap() {
   });
   bindMaps();
   document.title = "Map · Decisions";
+}
+
+// Topics the map is filtered to: the link's, else the last ones picked in this browser.
+function mapTags() {
+  const raw = new URLSearchParams(location.search).get("tags") ?? storage("mapTags") ?? "";
+  return raw.split(",").map((t) => t.trim()).filter(Boolean);
+}
+function setMapTags(tags) {
+  storage("mapTags", tags.length ? tags.join(",") : null);
+  const p = new URLSearchParams(location.search);
+  if (tags.length) p.set("tags", tags.join(",")); else p.delete("tags");
+  navigate(`/map${p.toString() ? `?${p}` : ""}`, true);
 }
 
 async function loadGoal(id) {
@@ -1695,6 +1718,7 @@ function renderGoal() {
   const head = S.editingGoal ? `<form class="edit-form" id="goal-form">
       <label class="lf">Title<input class="input" name="title" value="${esc(g.title)}" style="font-size:16px;font-weight:600;height:40px"></label>
       <label class="lf">Description <span style="font-weight:400">(markdown: what success looks like, and why it matters)</span><textarea class="input" name="description">${esc(g.description)}</textarea></label>
+      <label class="lf">Tags <span style="font-weight:400">(comma-separated, e.g. business, product, tech: the map filters on them, and decisions toward it share them)</span><input class="input" name="tags" value="${esc(g.tags.join(", "))}"></label>
       <div class="form-row"><button class="btn primary">Save</button><button type="button" class="btn ghost" data-action="cancel-goal-edit">Cancel</button></div></form>`
     : `<div class="d-head" style="display:flex;gap:16px;align-items:flex-start;justify-content:space-between">
       <div style="min-width:0"><h1 class="d-title">${esc(g.title)}</h1>
@@ -1751,7 +1775,8 @@ function renderGoal() {
     form.onsubmit = async (e) => {
       e.preventDefault();
       const f = new FormData(form);
-      if (await goalAct(() => api("PATCH", `/api/goals/${g.id}`, { title: f.get("title"), description: f.get("description") }), "Saved")) {
+      const tags = [...new Set(f.get("tags").split(",").map((t) => t.trim().replace(/^#/, "")).filter(Boolean))];
+      if (await goalAct(() => api("PATCH", `/api/goals/${g.id}`, { title: f.get("title"), description: f.get("description"), tags }), "Saved")) {
         S.editingGoal = false; renderGoal();
       }
     };
@@ -1793,7 +1818,9 @@ async function newGoal(serves) {
     field: "Goal", placeholder: serves ? "e.g. Onboard a customer in a day" : "e.g. Be the default tool for EU utilities", ok: "Create goal" });
   if (!title) return;
   try {
-    const g = await api("POST", "/api/goals", { title, serves: serves ? [serves] : [], space: S.goal?.space || S.space || S.config.space });
+    // A subgoal starts with its parent's topics (business, tech, …); edit them on its page.
+    const tags = serves ? S.goals.find((x) => x.id === serves)?.tags || [] : [];
+    const g = await api("POST", "/api/goals", { title, serves: serves ? [serves] : [], tags, space: S.goal?.space || S.space || S.config.space });
     await loadList();
     navigate(`/g/${g.id}`);
   } catch (err) { fail(err); }
@@ -1979,7 +2006,10 @@ document.addEventListener("click", async (e) => {
   const tab = e.target.closest("[data-status]");
   if (tab) { S.status = tab.dataset.status; storage("status", S.status); return renderSidebar(); }
   const spaceTab = e.target.closest("[data-space]");
-  if (spaceTab) { S.space = spaceTab.dataset.space; storage("space", S.space); return renderSidebar(); }
+  if (spaceTab) {
+    S.space = spaceTab.dataset.space; storage("space", S.space); renderSidebar();
+    return location.pathname === "/map" && renderMap().catch(fail);
+  }
 
   const a = e.target.closest("[data-action]");
   const d = S.d;
@@ -2093,6 +2123,11 @@ document.addEventListener("click", async (e) => {
     }
     case "remove-goal": return setGoals(d, d.goals.map((g) => g.goal).filter((g) => g !== id), `Unlinked from ${id}`);
     case "new-goal": return newGoal(a.dataset.serves);
+    case "map-tag": {
+      const tags = mapTags(), t = a.dataset.tag;
+      return setMapTags(tags.includes(t) ? tags.filter((x) => x !== t) : [...tags, t]);
+    }
+    case "map-tags-clear": return setMapTags([]);
     case "edit-goal": S.editingGoal = true; return renderGoal();
     case "cancel-goal-edit": S.editingGoal = false; return renderGoal();
     case "copy-goal-ref": return copy(`[${S.goal.id}: ${S.goal.title}](${S.goal.url})`, "link");

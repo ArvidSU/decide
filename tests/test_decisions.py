@@ -837,6 +837,30 @@ class DecisionsTest(unittest.TestCase):
         withdrawn = [x for x in self.call("GET", "/api/insights")["reversals"] if x["decision"] == isolation["id"]]
         self.assertEqual((withdrawn[0]["withdrawn"], withdrawn[0]["upstream"]), (True, [tenancy["id"]]))
 
+    def test_the_map_filters_on_tags(self):
+        vision = self.goal("Grid planning for every utility", tags=["business"])
+        sales = self.goal("Win three utilities this year", [vision["id"]], tags=["business"])
+        tech = self.goal("Deploy in a day", [vision["id"]], tags=["tech"])
+        infra = self.create(title="Where to run it?", goals=[tech["id"]], options=["Fly", "ECS"])
+        tagged = self.create(title="Logging?", tags=["tech"], goals=[sales["id"]], options=["a", "b"])
+        pricing = self.create(title="Pricing model?", goals=[sales["id"]], options=["Seats", "Usage"])
+        g = self.call("GET", "/api/graph?tags=tech")
+        nodes = {n["id"]: n["context"] for n in g["nodes"]}
+        # Decisions have their goals' tags; what the matches lead up to stays, as context.
+        self.assertEqual(nodes, {tech["id"]: False, infra["id"]: False, tagged["id"]: False,
+                                 vision["id"]: True, sales["id"]: True})
+        self.assertNotIn(pricing["id"], nodes)
+        self.assertEqual(g["tags"], ["tech"])
+        both = {n["id"] for n in self.call("GET", "/api/graph?tag=tech&tag=business")["nodes"]}
+        self.assertIn(pricing["id"], both)
+        self.assertNotIn("context", self.call("GET", "/api/graph")["nodes"][0])
+        self.assertEqual([x["id"] for x in self.call("GET", "/api/goals?tag=business")["goals"]], [vision["id"], sales["id"]])
+        # Insights only count what has the tag.
+        self.call("POST", f"/api/decisions/{pricing['id']}/resolve", {"selected": ["1"]}, expect=200)
+        self.call("POST", f"/api/decisions/{pricing['id']}/resolve", {"selected": ["2"]}, expect=200)
+        self.assertEqual(self.call("GET", "/api/insights?tags=tech")["reversals"], [])
+        self.assertEqual(len(self.call("GET", "/api/insights?tags=business")["reversals"]), 1)
+
     def test_cli_goals_map_and_insights(self):
         env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT}
         run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,
@@ -851,6 +875,9 @@ class DecisionsTest(unittest.TestCase):
         self.assertTrue(tree[1].startswith("    ") and "Subgoal  (1 decision, 1 open)" in tree[1], tree)
         self.assertIn(f"decision {did} [open] Which?", run("goal", "get", sub).stdout)
         self.assertIn(f"toward {sub}", run("map", "--focus", did).stdout)
+        run("goal", "set", sub, "--tags", "tech")
+        self.assertIn(did, run("map", "--tag", "tech").stdout)
+        self.assertNotIn(did, run("map", "--tag", "business").stdout)
         out = run("goal", "set", sub, "--status", "abandoned", "--note", "nope")
         self.assertEqual(json.loads(out.stdout)["status"], "abandoned", out.stderr)
         self.assertIn("Abandoned goals", run("insights").stdout)

@@ -1193,12 +1193,15 @@ class Store:
         with self.lock:
             return self._goal_dict(gid, self._goal_row(gid, scope))
 
-    def list_goals(self, status=None, space=None, scope: Scope = ALL) -> list[dict]:
+    def list_goals(self, status=None, space=None, tag=None, scope: Scope = ALL) -> list[dict]:
         cond, args = scope.where("space")
         sql = "SELECT * FROM goals WHERE 1=1" + cond
         if space:
             sql += " AND space=?"
             args.append(space)
+        if tag:
+            sql += " AND EXISTS (SELECT 1 FROM json_each(goals.tags) WHERE value=?)"
+            args.append(tag)
         if status and status != "all":
             sql += " AND status=?"
             args.append(status)
@@ -1287,7 +1290,18 @@ class Store:
                 h["withdrawn"] = True
         return out
 
-    def _map_rows(self, scope: Scope, space: str | None):
+    @staticmethod
+    def _tagged(goals: dict, decisions: dict, toward: list, tags: list[str]) -> set[str]:
+        """Goals and decisions with any of `tags`. A decision also has the tags of the goals it's toward,
+        so tagging goals is enough; a goal doesn't inherit from the goals it serves."""
+        want = set(tags)
+        has = lambda row: bool(want & set(json.loads(row["tags"])))
+        out = {g for g, r in goals.items() if has(r)} | {d for d, r in decisions.items() if has(r)}
+        return out | {d for d, g in toward if g in out and g in goals}
+
+    def _map_rows(self, scope: Scope, space: str | None, tags=None):
+        """Goals, decisions and the links between them in view. With `tags`, only what has one of them
+        (see _tagged), and only the links between those."""
         cond, args = scope.where("space")
         if space:
             cond += " AND space=?"
@@ -1302,6 +1316,13 @@ class Store:
             "SELECT decision_id, goal_id FROM decision_goals ORDER BY decision_id, position") if r[0] in decisions]
         deps = [r for r in self.conn.execute("SELECT * FROM dependencies ORDER BY decision_id, position")
                 if r["decision_id"] in decisions]
+        if tags:
+            keep = self._tagged(goals, decisions, toward, tags)
+            goals = {k: v for k, v in goals.items() if k in keep}
+            decisions = {k: v for k, v in decisions.items() if k in keep}
+            serves = [(a, b) for a, b in serves if a in keep and b in keep]
+            toward = [(a, b) for a, b in toward if a in keep and b in keep]
+            deps = [r for r in deps if r["decision_id"] in keep and r["depends_on"] in keep]
         return goals, decisions, serves, toward, deps
 
     @staticmethod
@@ -1314,11 +1335,12 @@ class Store:
                 todo += adjacent.get(cur, [])
         return seen
 
-    def graph(self, scope: Scope = ALL, space=None, focus=None, everything=False) -> dict:
+    def graph(self, scope: Scope = ALL, space=None, focus=None, everything=False, tags=None) -> dict:
         """Goals and decisions as one graph. Each edge goes from a step to what it's for: a goal to the goals it
         `serves`, a decision `toward` its goals, and a decision to the ones it `depends_on`. Decisions show up when
         they're linked to a goal, directly or through dependencies (`everything`: all of them). With `focus`
-        (G-n or D-n), only what leads to it and what it leads to."""
+        (G-n or D-n), only what leads to it and what it leads to. With `tags`, only what has one of them (see
+        _tagged), plus what those lead up to as `context`, so the chain up to the vision stays whole."""
         with self.lock:
             goals, decisions, serves, toward, deps = self._map_rows(scope, space)
             edges = ([{"from": a, "to": b, "kind": "serves"} for a, b in serves] +
@@ -1345,6 +1367,10 @@ class Store:
                 for did in list(linked):
                     linked |= self._reach(did, related)
                 keep = set(goals) | linked
+            tagged = None
+            if tags:
+                tagged = self._tagged(goals, decisions, toward, tags)
+                keep &= tagged | {a for t in tagged for a in self._reach(t, up)}
             history = self._history({d for d in decisions if d in keep})
             nodes = [{"id": g, "kind": "goal", "space": r["space"], "title": r["title"], "status": r["status"]}
                      for g, r in goals.items() if g in keep]
@@ -1352,16 +1378,19 @@ class Store:
                        "outcome": self._outcome(r), "changed": len(history[d]["turns"]),
                        "waiting_on": self._open_upstreams(d) if r["status"] == "open" else []}
                       for d, r in decisions.items() if d in keep]
+            if tagged is not None:
+                for n in nodes:
+                    n["context"] = n["id"] not in tagged
             return {"nodes": nodes, "edges": [e for e in edges if e["from"] in keep and e["to"] in keep],
-                    "focus": fid if focus else None}
+                    "focus": fid if focus else None, "tags": tags or []}
 
-    def insights(self, scope: Scope = ALL, space=None) -> dict:
+    def insights(self, scope: Scope = ALL, space=None, tags=None) -> dict:
         """What the history says. `dead_ends`: options, matched by label across decisions, that were picked and
         later dropped, or picked for a goal that was abandoned, or keep being ruled out. `reversals`: each time a
         decision changed its mind, with what led to it and the decided ones it pulled the rug from.
-        `abandoned_goals`: with how many decisions went into them."""
+        `abandoned_goals`: with how many decisions went into them. With `tags`, only what has one of them."""
         with self.lock:
-            goals, decisions, serves, toward, deps = self._map_rows(scope, space)
+            goals, decisions, serves, toward, deps = self._map_rows(scope, space, tags)
             history = self._history(set(decisions))
             goals_of, decisions_of = {}, {}
             for did, gid in toward:
