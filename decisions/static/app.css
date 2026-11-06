@@ -486,7 +486,7 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 /* ---------------------------------------------------------------- settings */
 .settings-head { margin-bottom: 4px; }
 .settings-head p { color: var(--muted); margin: 6px 0 0; }
-.setting { display: grid; grid-template-columns: 240px 1fr; gap: 24px; padding: 28px 0; border-bottom: 1px solid var(--border); }
+.setting { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 24px; padding: 28px 0; border-bottom: 1px solid var(--border); }
 .setting:last-child { border-bottom: 0; }
 .setting > header h2 { font-size: 15px; font-weight: 650; }
 .setting > header p { color: var(--muted); font-size: 14px; line-height: 20px; margin: 6px 0 0; }
@@ -560,7 +560,7 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
   .fpop[open] .pop-scrim { display: block; position: fixed; inset: 0; z-index: 60; background: rgba(10, 10, 20, .4); }
   .choice { min-height: 44px; }
   html { scroll-padding-bottom: 96px; }
-  .setting { grid-template-columns: 1fr; gap: 12px; padding: 22px 0; }
+  .setting { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 22px 0; }
   .form-row > .lf, .form-row > .btn { flex: 1 1 100%; }
   .opts td.check { width: 36px; }
   .ruleout { opacity: 1; }
@@ -643,3 +643,6 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
   .main { padding-bottom: 72px; }
   .pal-foot { display: none; }
 }
+.plain .item { display: inline-flex; gap: 8px; align-items: center; }
+.nowrap { white-space: nowrap; }
+.table-scroll { overflow-x: auto; }

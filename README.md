@@ -18,7 +18,8 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 
 | | |
 |---|---|
-| **Space** | A hard boundary between contexts: `work`, `private`, later maybe one shared with someone. Every decision, webhook and event belongs to exactly one. Each space has its own tokens: an agent using a space's token creates decisions there automatically and can't see any other space. Other spaces' decisions look the same as missing ones (404). The admin `token` sees every space. Without any `[spaces.*]` config, everything is in `default` and the GUI doesn't show spaces at all. Use tags for topics inside a space. |
+| **Space** | A hard boundary between contexts: `work`, `private`, later maybe one shared with someone. Every decision, webhook and event belongs to exactly one. Each machine gets its own token for one space (Settings → Machines, or `decide token create`). An agent using it creates decisions there automatically and can't see any other space. Other spaces' decisions look the same as missing ones (404). The admin `token` from the config sees and manages every space. With only the `default` space, the GUI doesn't show spaces at all. Use tags for topics inside a space. |
+| **Machine token** | `dk_…`, for one machine in one space. Only its hash is stored, so it's shown once, when it's created or rolled. Rolling gives it a new secret and the old one stops working at once. Revoking deletes it. Settings → Machines shows when each was last used and whether that machine's resumer is online. Creating, rolling and revoking are logged in the space's chain, without the secret. |
 | **Decision** | `D-12`: title, context (markdown), source, options, `min_select`/`max_select` (default: pick exactly one; `"max_select": null` = any number), links, tags, metadata, `due_at`. Status `open` → `resolved` / `cancelled` / `expired`. Nothing is locked: you can edit, re-resolve or reopen at any time; every change is logged. |
 | **Deadline** | Every open decision has a `due_at`, by default 4 days after it's created (`deadline_days`). If nobody decides by then, it **expires**: status `expired`, event `decision.expired` (actor `deadline`). That's distinct from `cancelled`, which someone does on purpose. If nobody took action, it wasn't very important. Its waiters, webhooks and resumer are notified, the same as for a resolution. Extend it with `PATCH {"due_at": …}` or the GUI's +1 day / +4 days. Reopening an expired decision starts a new deadline. |
 | **Option** | `label`, `description`, `url`, `image`, `attributes` (any JSON). The ID is yours (e.g. a SKU) or auto-assigned (`1`, `2`, …). |
@@ -61,6 +62,8 @@ Base: `http://127.0.0.1:8787/api`. JSON in and out. Send `X-Actor: <name>` so th
 | `POST /decisions/{id}/reopen` · `/cancel` · `/comments` | |
 | `GET /decisions/{id}/wait?timeout=60&types=…&after=…` | Long-poll until resolved/cancelled/expired (or other event types). Returns immediately if already in one of those states. |
 | `GET /decisions/{id}/events` · `GET /events?after=N&wait=30` | Event log; the global feed can be long-polled instead of using webhooks |
+| `GET /spaces` · `POST /spaces` · `PATCH/DELETE /spaces/{name}` | Spaces with their decision counts. Create: `{name, deadline_days?}`. PATCH `{deadline_days}` (`null` = the server's). Only an empty space can be deleted, which revokes its tokens; `default` can't be. Everything except listing needs the admin token (403). |
+| `GET /tokens` · `POST /tokens` · `POST /tokens/{id}/roll` · `DELETE /tokens/{id}` | Machine tokens (admin token only). Create: `{name, space}`. Create and roll return the secret as `token`, the only time it's shown. |
 | `GET /events/verify` | Verify each space's hash chain: `{ok, events, chains: {space: {ok, events, head, broken_at?}}}` (`*` = webhooks covering every space) |
 | `POST /decisions/{id}/webhooks` · `GET/POST /webhooks` · `PATCH/DELETE /webhooks/{id}` | Per-decision or global subscriptions. A global one covers the token's space, or `space` if given; from the admin token without `space`, every space |
 | `GET /deliveries?decision=` · `GET /deliveries/{id}/attempts` | Delivery status and immutable attempt log |
@@ -139,7 +142,7 @@ Run the server on one always-on machine (a home server, a Mac mini, a VPS on you
 uv tool install /path/to/decisions          # or: git clone … && uv tool install .
 decide server install --host 0.0.0.0        # launchd (macOS) or systemd --user (Linux); generates a token
 ```
-This writes `~/.config/decisions/config.toml` (host, port, db, token, `base_url`), starts the service, and prints the two things you need: a GUI link with the token (`http://server:8787/#token=…` logs the browser in once), and the setup command for other machines. The server refuses to listen on a non-loopback address without a token (`--insecure` overrides). Traffic is plain HTTP, so keep it on a trusted network or a tailnet, or put it behind an HTTPS reverse proxy and set `base_url`.
+This writes `~/.config/decisions/config.toml` (host, port, db, the admin token, `base_url`), starts the service, and prints a GUI link with the admin token (`http://server:8787/#token=…` logs the browser in once). Create spaces and connect machines from there. The server refuses to listen on a non-loopback address without a token (`--insecure` overrides). Traffic is plain HTTP, so keep it on a trusted network or a tailnet, or put it behind an HTTPS reverse proxy and set `base_url`.
 
 **Or with Docker** (the image is just the server; resumers run on the agent machines):
 ```sh
@@ -148,11 +151,11 @@ docker compose up -d
 ```
 Data lives in the `decisions-data` volume (`/data/decisions.db`). Both variables are required: without a token the server refuses to listen on the network, and without `DECISIONS_BASE_URL` links would point at the container's hostname. Any other setting works as a `DECISIONS_*` env var. Plain `docker build -t decisions . && docker run -p 8787:8787 -v decisions-data:/data --add-host=host.docker.internal:host-gateway -e DECISIONS_TOKEN=… -e DECISIONS_BASE_URL=… decisions` works too. Agents on the Docker machine itself can use `decide watch` against `localhost`: the image sets `callback_host = "host.docker.internal"`, and `decide watch` registers that name instead of `127.0.0.1`.
 
-**On every machine whose agents should use it:**
+**On every machine whose agents should use it:** in the GUI, Settings → Machines → *Connect a machine*: name it, pick its space, and run the command it shows there:
 ```sh
-curl -fsSL http://server:8787/install.sh | sh -s -- --token <token>
+curl -fsSL http://server:8787/install.sh | sh -s -- --token dk_…
 ```
-The command is also in the GUI under Settings → *Connect a machine*. The installer:
+`decide token create laptop --space work` prints the same command. Each machine gets its own token, so you can roll or revoke one without touching the others. Don't hand out the admin token: it sees every space. The installer:
 1. installs `decide` from a wheel the server builds from its own code (via uv, pipx or pip; uv can even fetch Python). Re-run it to update after you update the server.
 2. runs `decide connect <url> --token …`, which checks the token and saves both to `~/.config/decisions/client.toml` (mode 600).
 3. runs `decide skill install` (see above).
@@ -172,7 +175,7 @@ Flags: `--no-resumer`, `--no-skill`. The pieces are also served on their own: `/
 host = "127.0.0.1"
 port = 8787
 db = "~/.local/share/decisions/decisions.db"
-token = ""                 # admin token: sees every space. Set to require Authorization: Bearer <token>
+token = ""                 # admin token: sees and manages every space. Set to require Authorization: Bearer <token>
 base_url = ""              # public URL for links/ack_url if behind a proxy/tunnel
 owner = "me"               # actor name for GUI actions
 callback_host = ""         # how the server reaches its own machine for webhooks (Docker: host.docker.internal)
@@ -185,19 +188,10 @@ backoff_base = 10
 backoff_max = 3600
 require_ack = false        # default for subscriptions that don't say
 refire_interval = 300
-
-# Spaces (optional). Decision IDs stay global (D-12), so they never collide across spaces.
-[spaces.work]
-tokens = ["…"]             # agents with this token see and create only in `work`
-deadline_days = 4          # optional, overrides the server-wide value
-
-[spaces.private]
-tokens = ["…"]
-deadline_days = 30
 ```
 
-Each token belongs to one space. The admin token creates in `default` unless the body names a `space`, and `decide create --space` / `DECISIONS_SPACE` do the same from the CLI. A webhook created without a decision (`POST /api/webhooks`) covers the creating token's space. If the admin token creates one without a `space`, it covers every space. If there's no admin token, auth is off and anyone sees everything, but a space token still routes new decisions to its space.
+Spaces and machine tokens live in the database, not here: manage them in Settings or with `decide space` / `decide token` (admin token). A space can set its own `deadline_days`. Decision IDs stay global (D-12), so they never collide across spaces. The admin token creates in `default` unless the body names a `space`, and `decide create --space` / `DECISIONS_SPACE` do the same from the CLI. A webhook created without a decision (`POST /api/webhooks`) covers the creating token's space. If the admin token creates one without a `space`, it covers every space. If there's no admin token, auth is off and anyone sees everything, but a machine token still routes new decisions to its space.
 
 Answer attribute requests from the CLI with `decide fill D-12 < patches.json` (`[{"id", "attributes"}]`).
 
-Client commands (`decide create/get/list/wait/watch/fill/ack/verify/resumer`) find the server from `DECISIONS_URL` / `DECISIONS_TOKEN`, then `~/.config/decisions/client.toml` (written by `decide connect`), then `http://127.0.0.1:8787`. `DECISIONS_ACTOR` names who is acting; `DECISIONS_MACHINE` overrides the machine name.
+Client commands (`decide create/get/list/wait/watch/fill/ack/verify/resumer/space/token`) find the server from `DECISIONS_URL` / `DECISIONS_TOKEN`, then `~/.config/decisions/client.toml` (written by `decide connect`), then `http://127.0.0.1:8787`. `DECISIONS_ACTOR` names who is acting; `DECISIONS_MACHINE` overrides the machine name.

@@ -7,6 +7,7 @@ log is the provenance record of what changed, when, and by whom.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -15,16 +16,35 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from .agents import manual_command
-from .config import ALL, DEFAULT_SPACE, Config, Scope
+from .config import Config
 
 SCHEMA = """
+-- Hard boundaries between contexts (work, private, ...). `default` always exists.
+CREATE TABLE IF NOT EXISTS spaces (
+  name TEXT PRIMARY KEY,
+  deadline_days REAL,
+  created_at TEXT NOT NULL
+);
+
+-- A machine's API token: it sees only its space. Only a hash is stored; the token is shown once.
+CREATE TABLE IF NOT EXISTS tokens (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  space TEXT NOT NULL REFERENCES spaces(name),
+  hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  rolled_at TEXT,
+  last_used_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY,
   num INTEGER NOT NULL UNIQUE,
-  space TEXT NOT NULL,
+  space TEXT NOT NULL REFERENCES spaces(name),
   title TEXT NOT NULL,
   context TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL DEFAULT '',
@@ -86,7 +106,7 @@ CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
 -- space NULL = hears every space (only the admin token can create one).
 CREATE TABLE IF NOT EXISTS subscriptions (
   id TEXT PRIMARY KEY,
-  space TEXT,
+  space TEXT REFERENCES spaces(name),
   decision_id TEXT,
   url TEXT NOT NULL,
   secret TEXT NOT NULL,
@@ -153,6 +173,37 @@ TERMINAL_EVENTS = {"resolved": "decision.resolved", "cancelled": "decision.cance
 RESUME_TRIGGERS = {"resolved": "decision.resolved", "expired": "decision.expired"}
 DEADLINE_ACTOR = "deadline"
 GENESIS = "0" * 64
+DEFAULT_SPACE = "default"
+SPACE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
+TOKEN_PREFIX = "dk_"
+# A token's last_used_at is written at most this often (seconds), not on every request.
+LAST_USED_EVERY = 60
+
+
+@dataclass(frozen=True)
+class Scope:
+    """What a caller may see: one space (a machine token), or (spaces=None) all of them (the admin)."""
+    spaces: frozenset[str] | None = None
+    # Where the caller's new decisions and webhooks go.
+    default: str = DEFAULT_SPACE
+    # The machine token used, if any.
+    token: str | None = None
+
+    @property
+    def everything(self) -> bool:
+        return self.spaces is None
+
+    def allows(self, space: str | None) -> bool:
+        return self.spaces is None or space in self.spaces
+
+    def where(self, column: str) -> tuple[str, list]:
+        """SQL condition (with a leading AND) limiting `column` to this scope."""
+        if self.spaces is None:
+            return "", []
+        return f" AND {column} IN ({','.join('?' * len(self.spaces))})", sorted(self.spaces)
+
+
+ALL = Scope()
 
 
 class ApiError(Exception):
@@ -260,6 +311,7 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self.conn.execute("INSERT OR IGNORE INTO spaces (name, created_at) VALUES (?, ?)", (DEFAULT_SPACE, now_iso()))
         # Last heartbeat per machine from resumer daemons (`decide resumer run`). In memory only.
         self.resumers: dict[str, dict] = {}
         # Who is long-polling which decision right now: (decision, actor, types) -> info. In memory only.
@@ -267,8 +319,13 @@ class Store:
 
     # ------------------------------------------------------------------ plumbing
 
+    def deadline_days_for(self, space: str) -> float:
+        with self.lock:
+            row = self.conn.execute("SELECT deadline_days FROM spaces WHERE name=?", (space,)).fetchone()
+        return self.cfg.deadline_days if not row or row["deadline_days"] is None else row["deadline_days"]
+
     def default_due_at(self, space: str) -> str | None:
-        days = self.cfg.deadline_days_for(space)
+        days = self.deadline_days_for(space)
         return iso(datetime.now(timezone.utc) + timedelta(days=days)) if days > 0 else None
 
     @contextmanager
@@ -301,7 +358,7 @@ class Store:
     def _space_for(self, scope: Scope, requested) -> str:
         """The space a caller's new decision or webhook goes to: the one asked for, else their default."""
         space = _opt_type({"space": requested}, "space", str) or scope.default
-        if space not in self.cfg.space_names or not scope.allows(space):
+        if not scope.allows(space) or not self.q1("SELECT 1 FROM spaces WHERE name=?", space):
             raise ApiError(404, f"no space {space!r}")
         return space
 
@@ -593,7 +650,7 @@ class Store:
                     if field == "title" and not (val or "").strip():
                         raise ApiError(400, "title cannot be empty")
                     if field == "due_at":
-                        if val is None and self.cfg.deadline_days_for(row["space"]) > 0:
+                        if val is None and self.deadline_days_for(row["space"]) > 0:
                             raise ApiError(400, "decisions can't go without a deadline; set a later due_at instead")
                         val = None if val is None else _due_at(val)
                     if val != row[field]:
@@ -708,7 +765,7 @@ class Store:
             if status == "open":
                 # Reopening restarts a passed (or missing) deadline; otherwise it would expire again at once.
                 due = parse_ts(due_at)
-                if (due is None and self.cfg.deadline_days_for(row["space"]) > 0) or \
+                if (due is None and self.deadline_days_for(row["space"]) > 0) or \
                         (due and due <= datetime.now(timezone.utc)):
                     due_at = data["due_at"] = self.default_due_at(row["space"])
             self.conn.execute(
@@ -761,16 +818,17 @@ class Store:
             self._event(did, f"resume.{kind}", actor, {k: v for k, v in body.items() if k != "status"})
             return self._decision_dict(did)
 
-    def resumer_heartbeat(self, body: dict, actor: str) -> dict:
+    def resumer_heartbeat(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
         machine = str(body.get("machine") or body.get("host") or "default")
         with self.lock:
             self.resumers[machine] = {"name": actor, "pid": body.get("pid"), "machine": machine,
-                                      "command": body.get("command"), "last_seen": time.time()}
+                                      "command": body.get("command"), "last_seen": time.time(),
+                                      "token": scope.token}
         return self.resumer_status(machine)
 
     def _resumer_dict(self, r: dict) -> dict:
         return {"online": time.time() - r["last_seen"] < 90, "name": r["name"], "pid": r["pid"],
-                "machine": r["machine"], "command": r["command"],
+                "machine": r["machine"], "command": r["command"], "token": r["token"],
                 "last_seen": datetime.fromtimestamp(r["last_seen"], timezone.utc).isoformat(timespec="seconds")
                 .replace("+00:00", "Z")}
 
@@ -786,6 +844,161 @@ class Store:
             main = next((r for r in everyone if r["online"]), everyone[0] if everyone else
                         {"online": False, "last_seen": None})
         return main | {"resumers": everyone}
+
+    # ------------------------------------------------------------------ spaces and machine tokens
+
+    @staticmethod
+    def _hash_token(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def scope_for(self, token: str) -> Scope | None:
+        """A machine token sees only its space; the admin token (config `token`) sees every space.
+        Without an admin token auth is off: anyone sees everything, though a machine token still
+        routes to its space. None = not authorized."""
+        if token:
+            with self.lock:
+                row = self.conn.execute("SELECT id, space, last_used_at FROM tokens WHERE hash=?",
+                                        (self._hash_token(token),)).fetchone()
+                if row:
+                    last = parse_ts(row["last_used_at"])
+                    if not last or (datetime.now(timezone.utc) - last).total_seconds() > LAST_USED_EVERY:
+                        self.conn.execute("UPDATE tokens SET last_used_at=? WHERE id=?", (now_iso(), row["id"]))
+                    return Scope(frozenset({row["space"]}), row["space"], row["id"])
+        if not self.cfg.token or hmac.compare_digest(token, self.cfg.token):
+            return ALL
+        return None
+
+    @staticmethod
+    def _admin(scope: Scope):
+        if not scope.everything:
+            raise ApiError(403, "only the admin token can manage spaces and tokens")
+
+    def _space_row(self, name: str):
+        row = self.conn.execute("SELECT * FROM spaces WHERE name=?", (name,)).fetchone()
+        if not row:
+            raise ApiError(404, f"no space {name!r}")
+        return row
+
+    def _space_dict(self, row) -> dict:
+        n = self.conn.execute(
+            "SELECT COUNT(*) AS total, COALESCE(SUM(status='open'), 0) AS open FROM decisions WHERE space=?",
+            (row["name"],)).fetchone()
+        return {"name": row["name"], "deadline_days": row["deadline_days"],
+                "effective_deadline_days": self.cfg.deadline_days if row["deadline_days"] is None
+                else row["deadline_days"],
+                "created_at": row["created_at"], "decisions": n["total"], "open": n["open"],
+                "tokens": self.conn.execute("SELECT COUNT(*) FROM tokens WHERE space=?", (row["name"],)).fetchone()[0]}
+
+    def list_spaces(self, scope: Scope = ALL) -> list[dict]:
+        cond, args = scope.where("name")
+        with self.lock:
+            return [self._space_dict(r) for r in
+                    self.conn.execute("SELECT * FROM spaces WHERE 1=1" + cond + " ORDER BY name", args).fetchall()]
+
+    @staticmethod
+    def _deadline_days(body: dict):
+        days = _opt_type(body, "deadline_days", (int, float))
+        if days is not None and days < 0:
+            raise ApiError(400, "deadline_days must be >= 0 (0 = no default deadline)")
+        return days
+
+    def create_space(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        self._admin(scope)
+        name = _req_str(body, "name")
+        if not SPACE_NAME.fullmatch(name):
+            raise ApiError(400, "space names are 1-40 lowercase letters, digits, - and _")
+        days = self._deadline_days(body)
+        with self.tx():
+            if self.conn.execute("SELECT 1 FROM spaces WHERE name=?", (name,)).fetchone():
+                raise ApiError(409, f"space {name!r} already exists")
+            self.conn.execute("INSERT INTO spaces (name, deadline_days, created_at) VALUES (?,?,?)",
+                              (name, days, now_iso()))
+            out = self._space_dict(self._space_row(name))
+            self._event(None, "space.created", actor, {"space": out}, name)
+            return out
+
+    def update_space(self, name: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        self._admin(scope)
+        with self.tx():
+            row = self._space_row(name)
+            if "deadline_days" in body:
+                days = self._deadline_days(body)
+                if days != row["deadline_days"]:
+                    self.conn.execute("UPDATE spaces SET deadline_days=? WHERE name=?", (days, name))
+                    self._event(None, "space.updated", actor,
+                                {"changes": {"deadline_days": [row["deadline_days"], days]}}, name)
+            return self._space_dict(self._space_row(name))
+
+    def delete_space(self, name: str, actor: str, scope: Scope = ALL) -> dict:
+        """Only an empty space can go. Its machine tokens are revoked; its event chain stays."""
+        self._admin(scope)
+        with self.tx():
+            self._space_row(name)
+            if name == DEFAULT_SPACE:
+                raise ApiError(409, "the default space can't be deleted")
+            if self.conn.execute("SELECT 1 FROM decisions WHERE space=?", (name,)).fetchone():
+                raise ApiError(409, f"space {name!r} still has decisions")
+            if self.conn.execute("SELECT 1 FROM subscriptions WHERE space=?", (name,)).fetchone():
+                raise ApiError(409, f"space {name!r} still has webhooks")
+            revoked = [self._token_dict(r) for r in
+                       self.conn.execute("SELECT * FROM tokens WHERE space=?", (name,)).fetchall()]
+            self.conn.execute("DELETE FROM tokens WHERE space=?", (name,))
+            self.conn.execute("DELETE FROM spaces WHERE name=?", (name,))
+            self._event(None, "space.deleted", actor, {"revoked_tokens": revoked}, name)
+            return {"deleted": name, "revoked_tokens": [t["id"] for t in revoked]}
+
+    def _token_dict(self, row) -> dict:
+        seen = sorted((r for r in self.resumers.values() if r.get("token") == row["id"]),
+                      key=lambda r: r["last_seen"], reverse=True)
+        return {"id": row["id"], "name": row["name"], "space": row["space"], "created_at": row["created_at"],
+                "rolled_at": row["rolled_at"], "last_used_at": row["last_used_at"],
+                "resumer": self._resumer_dict(seen[0]) if seen else None}
+
+    def _token_row(self, tid: str):
+        row = self.conn.execute("SELECT * FROM tokens WHERE id=?", (tid,)).fetchone()
+        if not row:
+            raise ApiError(404, f"no token {tid}")
+        return row
+
+    def list_tokens(self, scope: Scope = ALL) -> list[dict]:
+        self._admin(scope)
+        with self.lock:
+            return [self._token_dict(r) for r in
+                    self.conn.execute("SELECT * FROM tokens ORDER BY space, created_at").fetchall()]
+
+    def create_token(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """A token for one machine in one space. The secret is in this response only."""
+        self._admin(scope)
+        name = _req_str(body, "name")[:60]
+        space = _opt_type(body, "space", str) or DEFAULT_SPACE
+        secret = TOKEN_PREFIX + secrets.token_urlsafe(24)
+        tid = "tok_" + secrets.token_hex(6)
+        with self.tx():
+            self._space_row(space)
+            self.conn.execute("INSERT INTO tokens (id, name, space, hash, created_at) VALUES (?,?,?,?,?)",
+                              (tid, name, space, self._hash_token(secret), now_iso()))
+            out = self._token_dict(self._token_row(tid))
+            self._event(None, "token.created", actor, {"token": out}, space)
+            return out | {"token": secret}
+
+    def roll_token(self, tid: str, actor: str, scope: Scope = ALL) -> dict:
+        """Replace a token's secret: the old one stops working at once."""
+        self._admin(scope)
+        secret = TOKEN_PREFIX + secrets.token_urlsafe(24)
+        with self.tx():
+            row = self._token_row(tid)
+            self.conn.execute("UPDATE tokens SET hash=?, rolled_at=?, last_used_at=NULL WHERE id=?",
+                              (self._hash_token(secret), now_iso(), tid))
+            self._event(None, "token.rolled", actor, {"token_id": tid, "name": row["name"]}, row["space"])
+            return self._token_dict(self._token_row(tid)) | {"token": secret}
+
+    def revoke_token(self, tid: str, actor: str, scope: Scope = ALL) -> dict:
+        self._admin(scope)
+        with self.tx():
+            row = self._token_row(tid)
+            self.conn.execute("DELETE FROM tokens WHERE id=?", (tid,))
+            self._event(None, "token.revoked", actor, {"token": self._token_dict(row)}, row["space"])
+            return {"revoked": tid}
 
     # ------------------------------------------------------------------ options
 

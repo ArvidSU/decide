@@ -137,7 +137,8 @@ def cmd_connect(args):
         fh.write(f"# written by `decide connect`\nurl = {json.dumps(url)}\n")
         if args.token:
             fh.write(f"token = {json.dumps(args.token)}\n")
-    print(f"connected to {url} (server {cfg.get('version', '?')}, auth {'on' if cfg['auth'] else 'off'}); "
+    space = "all spaces" if cfg["admin"] else f"space {cfg['space']}"
+    print(f"connected to {url} (server {cfg.get('version', '?')}, auth {'on' if cfg['auth'] else 'off'}, {space}); "
           f"saved to {CLIENT_CONFIG}")
     if os.environ.get("DECISIONS_URL") and os.environ["DECISIONS_URL"].rstrip("/") != url:
         print(f"note: DECISIONS_URL={os.environ['DECISIONS_URL']} is set and takes precedence", file=sys.stderr)
@@ -746,10 +747,10 @@ def cmd_server_install(args):
     _install_service(SERVER_SERVICE, [decide, "serve", "--config", path], _service_env(decide),
                      os.path.join(STATE_DIR, "server.log"))
     url = cfg.public_url
-    print(f"\nGUI: {url}" + (f"/#token={cfg.token}" if cfg.token else ""))
+    print(f"\nGUI: {url}" + (f"/#token={cfg.token}" if cfg.token else "") + "  (this link holds the admin token)")
     if not is_loopback(cfg.host):
-        print(f"set up another machine (installs decide, the skill, and the resumer):\n"
-              f"  curl -fsSL {url}/install.sh | sh -s -- --token {cfg.token}")
+        print("set up another machine: in the GUI, Settings → Machines → Connect a machine. It creates a token for "
+              "one space and the command that installs decide, the skill and the resumer with it.")
 
 
 def cmd_server_uninstall(args):
@@ -764,6 +765,56 @@ def cmd_verify(args):
     res = Client().call("GET", "/api/events/verify")
     _print(res)
     sys.exit(0 if res["ok"] else 1)
+
+
+def cmd_space_list(args):
+    for sp in Client().call("GET", "/api/spaces")["spaces"]:
+        days = f"{sp['effective_deadline_days']:g}d" + ("" if sp["deadline_days"] is not None else " (server default)")
+        print(f"{sp['name']:<16} {sp['open']:>3} open / {sp['decisions']:<4} deadline {days:<22} "
+              f"{sp['tokens']} token{'' if sp['tokens'] == 1 else 's'}")
+
+
+def cmd_space_create(args):
+    body = {"name": args.name} | ({"deadline_days": args.deadline_days} if args.deadline_days is not None else {})
+    _print(Client().call("POST", "/api/spaces", body))
+
+
+def cmd_space_set(args):
+    days = None if args.deadline_days == "default" else float(args.deadline_days)
+    _print(Client().call("PATCH", f"/api/spaces/{args.name}", {"deadline_days": days}))
+
+
+def cmd_space_delete(args):
+    _print(Client().call("DELETE", f"/api/spaces/{args.name}"))
+
+
+def cmd_token_list(args):
+    for t in Client().call("GET", "/api/tokens")["tokens"]:
+        used = f"used {_until(t['last_used_at'])}" if t["last_used_at"] else "never used"
+        resumer = f", resumer {'online' if t['resumer']['online'] else 'offline'}" if t["resumer"] else ""
+        print(f"{t['id']}  {t['space']:<12} {t['name']:<24} {used}{resumer}")
+
+
+def _print_new_token(c: Client, t: dict):
+    install = c.call("GET", "/api/config")["install_url"]
+    print(f"{t['id']} for {t['name']!r} in space {t['space']}. The token is shown only now:\n  {t['token']}\n"
+          f"set up the machine (installs decide, the skill and the resumer):\n"
+          f"  curl -fsSL {install} | sh -s -- --token {t['token']}\n"
+          f"or, where decide is installed: decide connect {c.url} --token {t['token']}")
+
+
+def cmd_token_create(args):
+    c = Client()
+    _print_new_token(c, c.call("POST", "/api/tokens", {"name": args.name, "space": args.space}))
+
+
+def cmd_token_roll(args):
+    c = Client()
+    _print_new_token(c, c.call("POST", f"/api/tokens/{args.id}/roll"))
+
+
+def cmd_token_revoke(args):
+    _print(Client().call("DELETE", f"/api/tokens/{args.id}"))
 
 
 def main(argv=None):
@@ -908,6 +959,37 @@ def main(argv=None):
 
     s = sub.add_parser("verify", help="verify the integrity of the hash-chained event log")
     s.set_defaults(fn=cmd_verify)
+
+    s = sub.add_parser("space", help="spaces: hard boundaries between contexts like work and private (admin token)")
+    psub = s.add_subparsers(dest="space_cmd", required=True)
+    r = psub.add_parser("list", help="spaces with their open decisions, deadline and tokens")
+    r.set_defaults(fn=cmd_space_list)
+    r = psub.add_parser("create", help="create a space")
+    r.add_argument("name", help="lowercase letters, digits, - and _")
+    r.add_argument("--deadline-days", type=float, help="default deadline for its decisions (default: the server's)")
+    r.set_defaults(fn=cmd_space_create)
+    r = psub.add_parser("set", help="change a space's default deadline")
+    r.add_argument("name")
+    r.add_argument("--deadline-days", required=True, help="days, or `default` for the server's deadline_days")
+    r.set_defaults(fn=cmd_space_set)
+    r = psub.add_parser("delete", help="delete an empty space; revokes its tokens")
+    r.add_argument("name")
+    r.set_defaults(fn=cmd_space_delete)
+
+    s = sub.add_parser("token", help="machine tokens: each sees one space (admin token)")
+    tsub = s.add_subparsers(dest="token_cmd", required=True)
+    r = tsub.add_parser("list", help="tokens with when they were last used and their machine's resumer")
+    r.set_defaults(fn=cmd_token_list)
+    r = tsub.add_parser("create", help="create a token for a machine and print the command that sets it up")
+    r.add_argument("name", help="which machine, e.g. laptop")
+    r.add_argument("--space", default="default")
+    r.set_defaults(fn=cmd_token_create)
+    r = tsub.add_parser("roll", help="replace a token's secret; the old one stops working at once")
+    r.add_argument("id")
+    r.set_defaults(fn=cmd_token_roll)
+    r = tsub.add_parser("revoke", help="delete a token")
+    r.add_argument("id")
+    r.set_defaults(fn=cmd_token_revoke)
 
     args = p.parse_args(argv)
     args.fn(args)

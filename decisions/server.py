@@ -10,9 +10,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__, dist
-from .config import ALL, Config, Scope, is_loopback
+from .config import Config, is_loopback
 from .markdown import decision_markdown
-from .store import DEFAULT_WEBHOOK_EVENTS, ApiError, Store
+from .store import ALL, DEFAULT_WEBHOOK_EVENTS, ApiError, Scope, Store
 from .webhooks import Dispatcher
 
 STATIC = Path(__file__).parent / "static"
@@ -73,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
     def _scope(self) -> Scope | None:
         auth = self.headers.get("Authorization", "")
         supplied = auth[7:] if auth.startswith("Bearer ") else self.headers.get("X-Api-Key", "")
-        return self.cfg.scope_for(supplied)
+        return self.store.scope_for(supplied)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -175,12 +175,46 @@ class Handler(BaseHTTPRequestHandler):
                 "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
                 "default_webhook_events": DEFAULT_WEBHOOK_EVENTS, "cursor": self.store.cursor(),
-                "space": self.scope.default,
-                "spaces": [{"name": n, "deadline_days": c.deadline_days_for(n)}
-                           for n in c.space_names if self.scope.allows(n)],
+                "space": self.scope.default, "admin": self.scope.everything,
+                "spaces": [{"name": sp["name"], "deadline_days": sp["effective_deadline_days"]}
+                           for sp in self.store.list_spaces(self.scope)],
                 "webhook": {"timeout": c.webhook_timeout, "max_attempts": c.webhook_max_attempts,
                             "backoff_base": c.webhook_backoff_base, "backoff_max": c.webhook_backoff_max,
                             "require_ack": c.webhook_require_ack, "refire_interval": c.webhook_refire_interval}}
+
+    # ------------------------------------------------------------------ spaces and machine tokens
+
+    @route("GET", "/api/spaces")
+    def list_spaces(self):
+        return {"spaces": self.store.list_spaces(self.scope)}
+
+    @route("POST", "/api/spaces")
+    def create_space(self):
+        return 201, self.store.create_space(self._body(), self.actor, self.scope)
+
+    @route("PATCH", "/api/spaces/([^/]+)")
+    def update_space(self, name):
+        return self.store.update_space(name, self._body(), self.actor, self.scope)
+
+    @route("DELETE", "/api/spaces/([^/]+)")
+    def delete_space(self, name):
+        return self.store.delete_space(name, self.actor, self.scope)
+
+    @route("GET", "/api/tokens")
+    def list_tokens(self):
+        return {"tokens": self.store.list_tokens(self.scope)}
+
+    @route("POST", "/api/tokens")
+    def create_token(self):
+        return 201, self.store.create_token(self._body(), self.actor, self.scope)
+
+    @route("POST", "/api/tokens/([^/]+)/roll")
+    def roll_token(self, tid):
+        return self.store.roll_token(tid, self.actor, self.scope)
+
+    @route("DELETE", "/api/tokens/([^/]+)")
+    def revoke_token(self, tid):
+        return self.store.revoke_token(tid, self.actor, self.scope)
 
     # ------------------------------------------------------------------ decisions
 
@@ -239,7 +273,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", "/api/resumer/heartbeat")
     def resumer_heartbeat(self):
-        return self.store.resumer_heartbeat(self._body(), self.actor)
+        return self.store.resumer_heartbeat(self._body(), self.actor, self.scope)
 
     @route("GET", "/api/resumer")
     def resumer(self):
@@ -369,7 +403,8 @@ def serve(cfg: Config, insecure: bool = False):
         print(f"  warning: base_url is not set, so decision links use {cfg.public_url}. "
               "Set base_url (DECISIONS_BASE_URL) to the URL other machines use.")
     if not is_loopback(cfg.host):
-        print(f"  other machines: curl -fsSL {cfg.public_url}/install.sh | sh -s -- --token <token>")
+        print("  other machines: Settings → Machines in the GUI (or `decide token create`) makes each one a token "
+              "for one space and the command that installs it")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -664,17 +664,22 @@ class SpacesTest(unittest.TestCase):
     """Spaces are hard boundaries: a space's token sees only that space; the admin token sees all."""
 
     def setUp(self):
-        from decisions.config import Space
         self.tmp = tempfile.mkdtemp()
-        self.cfg = Config(port=0, db=os.path.join(self.tmp, "t.db"), token="admin", webhook_backoff_base=0.1,
-                          spaces={"work": Space("work", ["tok-work"], deadline_days=1),
-                                  "private": Space("private", ["tok-private"])})
+        self.cfg = Config(port=0, db=os.path.join(self.tmp, "t.db"), token="admin", webhook_backoff_base=0.1)
         self.httpd, self.store, self.dispatcher = make_server(self.cfg)
         self.cfg.port = self.httpd.server_port
         self.dispatcher.poll_interval = 0.05
         self.dispatcher.start()
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.cfg.port}"
+        # Tests name tokens by alias (tok-work); call() swaps in the real secret.
+        self.tokens = {}
+        self.call("POST", "/api/spaces", {"name": "work", "deadline_days": 1}, expect=201)
+        self.call("POST", "/api/spaces", {"name": "private"}, expect=201)
+        for space in ("work", "private"):
+            t = self.call("POST", "/api/tokens", {"name": "laptop", "space": space}, expect=201)
+            self.tokens[f"tok-{space}"] = t["token"]
+            self.tokens[f"id-{space}"] = t["id"]
 
     def tearDown(self):
         self.dispatcher.stop()
@@ -684,7 +689,8 @@ class SpacesTest(unittest.TestCase):
     def call(self, method, path, body=None, token="admin", expect=None):
         req = urllib.request.Request(self.base + path, method=method,
                                      data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": f"Bearer {self.tokens.get(token, token)}"})
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
                 status, text = r.status, r.read().decode()
@@ -742,9 +748,10 @@ class SpacesTest(unittest.TestCase):
     def test_event_feed_is_scoped(self):
         w = self.create("tok-work")
         p = self.create("tok-private")
-        feed = lambda token: {e["decision_id"] for e in self.call("GET", "/api/events", token=token)["events"]}
-        self.assertEqual(feed("tok-work"), {w["id"]})
-        self.assertEqual(feed("admin"), {w["id"], p["id"]})
+        feed = lambda token: {e["decision_id"] or e["space"]
+                              for e in self.call("GET", "/api/events", token=token)["events"]}
+        self.assertEqual(feed("tok-work"), {w["id"], "work"})  # "work": its space.created and token.created
+        self.assertEqual(feed("admin"), {w["id"], p["id"], "work", "private"})
 
     def test_webhooks_only_hear_their_space(self):
         rx_work, rx_all = Receiver(), Receiver()
@@ -778,7 +785,8 @@ class SpacesTest(unittest.TestCase):
             self.call("POST", f"/api/decisions/{d['id']}/resolve", {"selected": ["1"]}, token=token, expect=200)
         v = self.call("GET", "/api/events/verify")
         self.assertTrue(v["ok"])
-        self.assertEqual({k: c["events"] for k, c in v["chains"].items()}, {"private": 4, "work": 4})
+        # Each: space.created, token.created, then two decisions created and resolved.
+        self.assertEqual({k: c["events"] for k, c in v["chains"].items()}, {"private": 6, "work": 6})
         self.assertEqual(list(self.call("GET", "/api/events/verify", token="tok-work")["chains"]), ["work"])
         conn = sqlite3.connect(self.cfg.db_path)
         conn.execute("DROP TRIGGER events_no_update")
@@ -799,37 +807,70 @@ class SpacesTest(unittest.TestCase):
         days = lambda d: (datetime.fromisoformat(d["due_at"]) - datetime.fromisoformat(d["created_at"])).days
         self.assertEqual((days(w), days(p)), (1, self.cfg.deadline_days))
 
+    def test_only_the_admin_manages_spaces_and_tokens(self):
+        for method, path in (("GET", "/api/tokens"), ("POST", "/api/tokens"), ("POST", "/api/spaces"),
+                             ("PATCH", "/api/spaces/work"), ("DELETE", "/api/spaces/work"),
+                             ("POST", f"/api/tokens/{self.tokens['id-work']}/roll"),
+                             ("DELETE", f"/api/tokens/{self.tokens['id-private']}")):
+            self.call(method, path, {"name": "x", "space": "work"}, token="tok-work", expect=403)
+        # A machine token still sees its own space, and nothing else.
+        self.assertEqual([sp["name"] for sp in self.call("GET", "/api/spaces", token="tok-work")["spaces"]], ["work"])
+        cfg = self.call("GET", "/api/config", token="tok-work")
+        self.assertEqual((cfg["admin"], cfg["space"], [s["name"] for s in cfg["spaces"]]), (False, "work", ["work"]))
+        self.assertTrue(self.call("GET", "/api/config")["admin"])
 
-class SpacesConfigTest(unittest.TestCase):
-    def load(self, text):
-        from decisions.config import load_config
-        path = os.path.join(tempfile.mkdtemp(), "c.toml")
-        with open(path, "w") as fh:
-            fh.write(text)
-        return load_config(path)
+    def test_tokens_are_hashed_shown_once_rolled_and_revoked(self):
+        secret, tid = self.tokens["tok-work"], self.tokens["id-work"]
+        self.assertTrue(secret.startswith("dk_"))
+        conn = sqlite3.connect(self.cfg.db_path)
+        stored = conn.execute("SELECT hash FROM tokens WHERE id=?", (tid,)).fetchone()[0]
+        conn.close()
+        self.assertNotIn(secret, stored)
+        listed = {t["id"]: t for t in self.call("GET", "/api/tokens")["tokens"]}
+        self.assertNotIn("token", listed[tid])
+        self.assertIsNone(listed[tid]["last_used_at"])
+        self.call("POST", "/api/resumer/heartbeat", {"machine": "laptop"}, token="tok-work", expect=200)
+        t = {t["id"]: t for t in self.call("GET", "/api/tokens")["tokens"]}[tid]
+        self.assertIsNotNone(t["last_used_at"])
+        self.assertEqual((t["resumer"]["machine"], t["resumer"]["online"]), ("laptop", True))
+        rolled = self.call("POST", f"/api/tokens/{tid}/roll", expect=200)
+        self.assertEqual((rolled["id"], rolled["space"]), (tid, "work"))
+        self.call("GET", "/api/decisions", token="tok-work", expect=401)
+        self.assertEqual(self.call("GET", "/api/config", token=rolled["token"])["space"], "work")
+        self.call("DELETE", f"/api/tokens/{tid}", expect=200)
+        self.call("GET", "/api/decisions", token=rolled["token"], expect=401)
+        self.call("POST", "/api/tokens", {"name": "x", "space": "nope"}, expect=404)
+        types = [e["type"] for e in self.call("GET", "/api/events?limit=500")["events"]]
+        self.assertEqual([t for t in types if t.startswith("token.")],
+                         ["token.created", "token.created", "token.rolled", "token.revoked"])
+        self.assertNotIn(rolled["token"], json.dumps(self.call("GET", "/api/events?limit=500")))
 
-    def test_spaces_from_toml(self):
-        cfg = self.load('token = "admin"\n[spaces.work]\ntokens = ["a", "b"]\ndeadline_days = 2\n'
-                        '[spaces.private]\ntokens = "c"\n')
-        self.assertEqual(cfg.space_names, ["default", "private", "work"])
-        self.assertEqual((cfg.deadline_days_for("work"), cfg.deadline_days_for("private")), (2, cfg.deadline_days))
-        self.assertEqual(cfg.scope_for("b").spaces, frozenset({"work"}))
-        self.assertTrue(cfg.scope_for("admin").everything)
-        self.assertIsNone(cfg.scope_for("nope"))
+    def test_space_lifecycle(self):
+        self.call("POST", "/api/spaces", {"name": "work"}, expect=409)
+        self.call("POST", "/api/spaces", {"name": "Not OK"}, expect=400)
+        self.call("POST", "/api/spaces", {"name": "home", "deadline_days": -1}, expect=400)
+        sp = self.call("PATCH", "/api/spaces/private", {"deadline_days": 30}, expect=200)
+        self.assertEqual((sp["deadline_days"], sp["effective_deadline_days"]), (30, 30))
+        sp = self.call("PATCH", "/api/spaces/private", {"deadline_days": None}, expect=200)
+        self.assertEqual((sp["deadline_days"], sp["effective_deadline_days"]), (None, self.cfg.deadline_days))
+        self.create("tok-work")
+        self.call("DELETE", "/api/spaces/work", expect=409)
+        self.call("DELETE", "/api/spaces/default", expect=409)
+        gone = self.call("DELETE", "/api/spaces/private", expect=200)
+        self.assertEqual(gone["revoked_tokens"], [self.tokens["id-private"]])
+        self.call("GET", "/api/decisions", token="tok-private", expect=401)
+        self.assertEqual([s["name"] for s in self.call("GET", "/api/spaces")["spaces"]], ["default", "work"])
+        # Its chain stays verifiable after it's gone.
+        self.assertTrue(self.call("GET", "/api/events/verify")["chains"]["private"]["ok"])
 
-    def test_rejects_shared_tokens_and_bad_names(self):
-        with self.assertRaises(SystemExit):
-            self.load('[spaces.a]\ntokens = ["x"]\n[spaces.b]\ntokens = ["x"]\n')
-        with self.assertRaises(SystemExit):
-            self.load('token = "x"\n[spaces.a]\ntokens = ["x"]\n')
-        with self.assertRaises(SystemExit):
-            self.load('[spaces.Work]\ntokens = ["x"]\n')
-
-    def test_without_admin_token_space_tokens_still_route(self):
-        from decisions.config import Space
-        cfg = Config(spaces={"work": Space("work", ["w"])})
-        self.assertTrue(cfg.scope_for("").everything)
-        self.assertEqual(cfg.scope_for("w").default, "work")
+    def test_without_an_admin_token_machine_tokens_still_route(self):
+        from decisions.store import Store
+        store = Store(Config(db=os.path.join(self.tmp, "open.db")))
+        store.create_space({"name": "work"}, "me")
+        t = store.create_token({"name": "laptop", "space": "work"}, "me")
+        self.assertTrue(store.scope_for("").everything)
+        self.assertTrue(store.scope_for("anything").everything)
+        self.assertEqual((store.scope_for(t["token"]).default, store.scope_for(t["token"]).token), ("work", t["id"]))
 
 
 if __name__ == "__main__":
