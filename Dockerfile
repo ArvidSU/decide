@@ -15,7 +15,7 @@ ENV PYTHONUNBUFFERED=1 \
     DECISIONS_CALLBACK_HOST=host.docker.internal
 
 WORKDIR /src
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md LICENSE ./
 COPY decisions ./decisions
 RUN pip install --no-cache-dir . && rm -rf /src
 

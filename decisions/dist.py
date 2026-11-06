@@ -10,6 +10,7 @@ import hashlib
 import io
 import zipfile
 from functools import lru_cache
+from importlib.metadata import distribution
 from pathlib import Path
 
 from . import __version__
@@ -28,13 +29,15 @@ def _digest(data: bytes) -> str:
 
 
 @lru_cache(maxsize=4)
-def _build(fingerprint: str) -> tuple[str, bytes]:
+def _build(fingerprint: str, license_text: str) -> tuple[str, bytes]:
     version = f"{__version__}+{fingerprint[:10]}"
     dist_info = f"decisions-{version}.dist-info"
     files = {f"decisions/{p.relative_to(PACKAGE).as_posix()}": p.read_bytes() for p in _package_files()}
     files[f"{dist_info}/METADATA"] = (
-        f"Metadata-Version: 2.1\nName: decisions\nVersion: {version}\nRequires-Python: >=3.11\n"
+        f"Metadata-Version: 2.4\nName: decisions\nVersion: {version}\nRequires-Python: >=3.11\n"
+        "License-Expression: MIT\nLicense-File: LICENSE\n"
         "Summary: General-purpose decision log (installed from a decisions server)\n").encode()
+    files[f"{dist_info}/licenses/LICENSE"] = license_text.encode()
     files[f"{dist_info}/WHEEL"] = b"Wheel-Version: 1.0\nGenerator: decisions\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
     files[f"{dist_info}/entry_points.txt"] = b"[console_scripts]\ndecide = decisions.cli:main\n"
     record = "".join(f"{name},sha256={_digest(data)},{len(data)}\n" for name, data in files.items())
@@ -48,10 +51,15 @@ def _build(fingerprint: str) -> tuple[str, bytes]:
 
 def wheel() -> tuple[str, bytes]:
     """(filename, bytes) of a wheel of the code this server is running."""
-    h = hashlib.sha256()
+    source_license = PACKAGE.parent / "LICENSE"
+    license_text = (source_license.read_text() if source_license.is_file()
+                    else distribution("decisions").read_text("licenses/LICENSE"))
+    if not license_text:
+        raise RuntimeError("package is missing its LICENSE")
+    h = hashlib.sha256(license_text.encode())
     for p in _package_files():
         h.update(p.relative_to(PACKAGE).as_posix().encode() + b"\0" + p.read_bytes())
-    return _build(h.hexdigest())
+    return _build(h.hexdigest(), license_text)
 
 
 INSTALL_SH = r'''#!/bin/sh

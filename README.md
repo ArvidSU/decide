@@ -6,8 +6,20 @@ It doesn't care what is being decided: a jacket to buy, the next feature to buil
 
 Zero dependencies: Python ≥ 3.11 stdlib + SQLite + a vanilla-JS GUI.
 
+Early development: ready for experimentation, with APIs and storage still subject to change.
+
+Clone the repository and start the server (Python 3.11 or newer):
+
 ```sh
+git clone https://github.com/ArvidSU/decide.git
+cd decide
 python3 -m decisions serve            # GUI + API on http://127.0.0.1:8787
+```
+
+Open http://127.0.0.1:8787 in your browser. Leave the server running and, in a second terminal
+in the cloned repository, optionally load demo decisions or install the CLI:
+
+```sh
 python3 examples/seed.py              # optional: demo decisions
 python3 -m unittest discover tests    # tests
 uv tool install --editable .          # puts `decide` on PATH
@@ -45,6 +57,11 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 ## API
 
 Base: `http://127.0.0.1:8787/api`. JSON in and out. Send `X-Actor: <name>` so the log records who did what. If a token is configured, send `Authorization: Bearer <token>`.
+
+Browser API requests must come from the GUI's own origin; unrelated website origins are
+rejected, including preflight requests. CLI and agent clients can connect without an
+`Origin` header. Behind an HTTPS reverse proxy, set `base_url` to the GUI's public URL
+so its origin is recognized. Cross-origin browser integrations are not supported.
 
 | Method & path | |
 |---|---|
@@ -195,3 +212,7 @@ Spaces and machine tokens live in the database, not here: manage them in Setting
 Answer attribute requests from the CLI with `decide fill D-12 < patches.json` (`[{"id", "attributes"}]`).
 
 Client commands (`decide create/get/list/wait/watch/fill/ack/verify/resumer/space/token`) find the server from `DECISIONS_URL` / `DECISIONS_TOKEN`, then `~/.config/decisions/client.toml` (written by `decide connect`), then `http://127.0.0.1:8787`. `DECISIONS_ACTOR` names who is acting; `DECISIONS_MACHINE` overrides the machine name.
+
+## License
+
+[MIT](LICENSE) © 2026 ArvidSU.

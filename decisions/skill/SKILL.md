@@ -9,6 +9,8 @@ The user runs a decision log, possibly on another machine; `decide` already know
 
 Use the `decide` CLI. The log records who did what: inside Claude Code or Codex, `decide` names you automatically (`claude-code`, `codex`). In any other agent, prefix commands with `DECISIONS_ACTOR=<your name>`, e.g. `DECISIONS_ACTOR=gemini decide …`. If `decide` isn't on PATH, the raw API equivalents are in the project README.
 
+The API accepts browser requests only from the GUI's own origin. Use the CLI or a server-side HTTP client for integrations; behind an HTTPS proxy, configure the server's `base_url` to match the GUI URL.
+
 ## 1. Create the decision
 
 Write the body to a JSON file with your file-writing tool, then pass the path. Heredocs and inline JSON in shell commands are often blocked by permission checks. `-q` prints just the ID.

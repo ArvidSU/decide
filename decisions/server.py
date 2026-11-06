@@ -50,7 +50,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -76,11 +75,35 @@ class Handler(BaseHTTPRequestHandler):
         return self.store.scope_for(supplied)
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Actor, X-Api-Key")
-        self.end_headers()
+        try:
+            self._check_browser_origin()
+        except ApiError as exc:
+            return self._send(exc.status, {"error": exc.message})
+        self._send(204, b"")
+
+    def _check_browser_origin(self):
+        """Only our own GUI may use the API from a browser; CLI clients omit Origin.
+
+        base_url is authoritative behind a proxy. Never trust forwarded headers
+        to decide which browser origins may access an unauthenticated server.
+        """
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            raise ApiError(403, "cross-origin browser requests are not allowed")
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return
+        expected = self.cfg.base_url or f"http://{self.headers.get('Host', '')}"
+        try:
+            supplied, target = urlparse(origin), urlparse(expected)
+            def authority(url):
+                if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+                    raise ValueError("invalid origin")
+                return url.scheme, url.hostname, url.port or (443 if url.scheme == "https" else 80)
+            if (supplied.path or supplied.params or supplied.query or supplied.fragment
+                    or authority(supplied) != authority(target)):
+                raise ValueError("origin mismatch")
+        except ValueError:
+            raise ApiError(403, "cross-origin browser requests are not allowed") from None
 
     def do_GET(self):
         self._dispatch("GET")
@@ -105,6 +128,8 @@ class Handler(BaseHTTPRequestHandler):
         self.qs = parse_qs(url.query)
         path = url.path.rstrip("/") or "/"
         try:
+            if path.startswith("/api/"):
+                self._check_browser_origin()
             if path == "/install.sh" or path.startswith("/install/"):
                 return self._install(path)
             if not path.startswith("/api/"):

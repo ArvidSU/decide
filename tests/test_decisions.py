@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from datetime import datetime
 import urllib.error
 import urllib.request
@@ -100,6 +101,44 @@ class DecisionsTest(unittest.TestCase):
         return self.call("POST", "/api/decisions", body, expect=201)
 
     # ---------------------------------------------------------------- core
+
+    def test_browser_origins(self):
+        def request(method, origin=None, fetch_site=None):
+            headers = {"Content-Type": "application/json"}
+            if origin is not None:
+                headers["Origin"] = origin
+            if fetch_site:
+                headers["Sec-Fetch-Site"] = fetch_site
+            req = urllib.request.Request(
+                self.base + "/api/decisions", method=method, headers=headers,
+                data=b'{"title":"Browser test"}' if method == "POST" else None)
+            try:
+                response = urllib.request.urlopen(req, timeout=5)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                response.read()
+                self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
+                return response.status
+
+        for origin in ("https://unrelated.example", "null", self.base + ".evil.example",
+                       "http://[invalid", self.base + "/path", "http://localhost:1"):
+            for method in ("GET", "POST", "OPTIONS"):
+                with self.subTest(origin=origin, method=method):
+                    self.assertEqual(request(method, origin), 403)
+        self.assertEqual(self.call("GET", "/api/decisions"), {"decisions": []})
+        self.assertEqual(request("POST", fetch_site="cross-site"), 403)
+        self.assertEqual(request("POST", self.base, "same-origin"), 201)
+        self.assertEqual(request("OPTIONS", self.base), 204)
+        self.assertEqual(request("POST"), 201)  # CLI/agent clients
+
+        self.cfg.base_url = "https://decisions.example"
+        self.assertEqual(request("POST", "https://decisions.example:443"), 201)
+        self.assertEqual(request("POST", self.base), 403)
+        self.assertEqual(request("POST", "http://decisions.example"), 403)
+        self.cfg.token = "test-admin-token"
+        self.assertEqual(request("GET", "https://unrelated.example"), 403)
+        self.assertEqual(request("GET", "https://decisions.example"), 401)
 
     def test_create_get_and_ids(self):
         d = self.create(links=["https://linear.app/x/issue/ABC-1"], metadata={"session_id": "s1"})
@@ -601,6 +640,9 @@ class RemoteTest(unittest.TestCase):
         whl = os.path.join(self.tmp, name)
         with open(whl, "wb") as fh:
             fh.write(self.get(f"/install/{name}"))
+        with zipfile.ZipFile(whl) as archive:
+            license_path = next(p for p in archive.namelist() if p.endswith("/licenses/LICENSE"))
+            self.assertIn(b"MIT License", archive.read(license_path))
         self.assertIn(b"name: decisions", self.get("/install/SKILL.md"))
         target = os.path.join(self.tmp, "site")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--no-index",
