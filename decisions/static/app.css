@@ -145,6 +145,8 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible { outlin
 .si.resolved { color: var(--good); }
 .si.cancelled { color: var(--faint); }
 .si.expired { color: var(--bad); }
+.si.open.waiting { color: var(--faint); }
+.dl-item.waiting .dl-title { color: var(--muted); font-weight: 500; }
 
 /* ---------------------------------------------------------------- main */
 .main { overflow-y: auto; min-width: 0; scroll-padding-bottom: 120px; }
@@ -478,6 +480,29 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 .listener .eye.off { color: var(--bad); }
 .listener.silenced .l-body, .listener.silenced .live { opacity: .45; }
 .listener.silenced .l-body strong { text-decoration: line-through; }
+
+/* dependencies: what a decision waits on, and what deciding it does to others */
+.callout.waiting { background: var(--accent-soft); }
+.callout.waiting > .i { color: var(--accent); }
+.dep-head { font-size: 12.5px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 14px 0 4px; }
+.dep-head:first-of-type { margin-top: 0; }
+.dep { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 13.5px; padding: 8px 0; border-bottom: 1px solid var(--border); min-height: 44px; }
+.dep-head + .dep { border-top: 1px solid var(--border); }
+.dep-title { display: inline-flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 220px; color: var(--text); }
+.dep-title:hover { text-decoration: none; }
+.dep-title:hover .dep-name { text-decoration: underline; }
+.dep-id { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.dep-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dep-cond { flex: none; }
+.dep-effect { flex: none; margin-left: auto; color: var(--muted); font-weight: 550; }
+.dep-effect.ok { color: var(--good); }
+.dep-effect.warn { color: var(--warn); }
+.dep-effect.bad { color: var(--bad); }
+.dep .icon-btn { flex: none; width: 28px; height: 28px; }
+.dep-note { flex-basis: 100%; color: var(--muted); font-size: 12.5px; padding-left: 24px; }
+.decide-bar.locked .sel { max-width: none; padding: 6px 4px; }
+.bar-note.info { color: var(--muted); }
+.bar-note.info strong { color: var(--text); }
 .estimate { font-style: italic; }
 .install-cmd { background: var(--sunken); padding: 10px 12px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; margin: 0; user-select: all; border: 1px solid var(--border); }
 .deliveries { margin-top: 18px; }

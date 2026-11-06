@@ -39,6 +39,7 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 | **Attribute request** | You ask for a new attribute in the GUI. The decision's `pending_attribute_requests` lists which options are missing it, and an `attributes.requested` webhook fires. The requester PATCHes the values in. |
 | **Attribute meta** | Per-option provenance for values: `attribute_meta: {"price": {"estimate": true, "source": "…", "note": "…"}}`. Estimates show as "≈ value" in the GUI and "~value" in markdown. |
 | **Listening** | The decision page shows who will hear about it: agents long-polling right now (by `X-Actor`) and webhooks. `GET /api/decisions/{id}/listeners`. Click the eye next to a listener to resolve without notifying it (global webhooks always hear). |
+| **Dependency** | `D-13` `depends_on` `D-12` when it only makes sense once D-12 is decided. Until then D-13 is **locked**: it can't be resolved (409), it doesn't count as waiting on you, it sorts last, and it doesn't expire. Its deadline starts when it unlocks (`decision.unblocked`). With `when: [option ids]` it only applies if D-12 picks one of them. Any other outcome, including D-12 being cancelled or expiring, **cancels D-13** (actor `dependency`, with the reason), and so on down the chain. Without `when`, any outcome unlocks it. A dependent that was already decided is never changed. If D-12 is reopened or changes afterwards, it's flagged in `outdated_by` for a second look, and its listeners hear `dependency.changed`. Dependencies stay within a space, and cycles are refused. Best of all, avoid them: ask in order, or merge tightly coupled choices into one decision. |
 | **Exclusion** | Ruling an option out (✕, or "Exclude N hidden" to turn current filters into exclusions). It's persisted with a reason, so the log shows *why* options were dropped. |
 | **Event log** | Append-only and SHA-256 hash-chained, with one chain per space, so a space's history can be verified or shared without the others. SQLite triggers reject UPDATE/DELETE. `GET /api/events/verify` checks each chain the token can see. |
 | **Reference** | Click the `D-12` chip to copy `[D-12: title](url)` for Slack / Linear. "Copy summary" copies a markdown table of options and the outcome. |
@@ -51,6 +52,7 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 * Best value per attribute is marked when `better` is set. Click column headers to sort. Table or card view (cards when options have images, and on phones).
 * Keyboard: `j`/`k` move, `space` select, `x` rule out, `/` search, `⌘/Ctrl+Enter` decide (listed under the options). Every rule-out offers Undo and Add reason; Alt-click Rule out to give the reason up front.
 * Resolved, expired and cancelled decisions open as a read-only record: the outcome and its reason, every option considered and the log. Reopen to change one. "Next open" jumps to the most urgent open decision.
+* Dependencies: a decision waiting on another says "Don't worry about this yet", links to the one to decide first, and can't be decided until then ("Decide anyway" removes the dependency). Its upstream lists what it affects, and as you select options the decide bar says what deciding would do: cancel, unlock, or flag a decided one for a second look. A decided decision whose upstream changed shows "Worth a second look", with "Still holds" to confirm it without waking its listeners. "Depends on…" (or ⌘K) adds one.
 * Live: new options and attribute values appear as the agent adds them.
 * Settings: connect a machine, global webhooks (pick the events), delivery policy, log integrity.
 
@@ -65,18 +67,18 @@ so its origin is recognized. Cross-origin browser integrations are not supported
 
 | Method & path | |
 |---|---|
-| `POST /decisions` | Create. Body: `title`, `context`, `source`, `options[]`, `attributes{}`, `min_select`, `max_select`, `links[]`, `tags[]`, `metadata{}`, `due_at` (ISO 8601; default now + the space's `deadline_days`), `idempotency_key` (per space), `webhooks[]`, `space` (default: the token's space, or `default` for the admin token). Returns 201, or 200 with the existing decision if `idempotency_key` matches. |
+| `POST /decisions` | Create. Body: `title`, `context`, `source`, `options[]`, `attributes{}`, `min_select`, `max_select`, `links[]`, `tags[]`, `metadata{}`, `due_at` (ISO 8601; default now + the space's `deadline_days`, counted from when it unlocks if it waits on another decision), `depends_on[]` (`"D-12"` or `{decision, when?: [option ids], note?}`; 409 if `when` can no longer be met), `idempotency_key` (per space), `webhooks[]`, `space` (default: the token's space, or `default` for the admin token). Returns 201, or 200 with the existing decision if `idempotency_key` matches. |
 | `GET /decisions?status=open&q=&tag=&source=&space=` | List (`status`: `open`, `resolved`, `cancelled`, `expired`, `all`), limited to the token's spaces |
-| `GET /decisions/{id}` | Full decision incl. options, resolution, `selected_options`, `pending_attribute_requests` |
-| `PATCH /decisions/{id}` | Edit any field (`metadata` merges; `null` removes a key) |
+| `GET /decisions/{id}` | Full decision incl. options, resolution, `selected_options`, `pending_attribute_requests`, and dependencies: `depends_on` (each with the upstream's `status` and `state`: `waiting` / `met` / `unmet`), `waiting_on` (what locks it), `affects` (decisions depending on this one) and `outdated_by` (upstreams that changed after this was decided) |
+| `PATCH /decisions/{id}` | Edit any field (`metadata` merges; `null` removes a key; `depends_on` replaces the list, and dropping the last one it waits on unlocks it) |
 | `GET /decisions/{id}/markdown` | Markdown summary |
 | `POST /decisions/{id}/options` | Add one, a list, or `{options: [...]}` |
 | `PATCH /decisions/{id}/options` | Bulk patch `[{id, attributes: {...}}]`; attributes merge, `null` deletes |
 | `PATCH` / `DELETE /decisions/{id}/options/{oid}` | Edit / remove one option |
 | `POST /decisions/{id}/exclude` · `/include` | `{option_ids, reason?}` |
 | `POST /decisions/{id}/attribute-requests` | `{key, description}` (normally done from the GUI) |
-| `POST /decisions/{id}/resolve` | `{selected: [ids], note?, silence?: [listener ids]}`. `silence` skips notifying those listeners, e.g. when fixing a typo: `resumer`, `poll:<actor>`, or the id of a webhook on this decision. Global webhooks always hear. Recorded as `silenced` on the event. |
-| `POST /decisions/{id}/reopen` · `/cancel` · `/comments` | |
+| `POST /decisions/{id}/resolve` | `{selected: [ids], note?, silence?: [listener ids]}`. 409 while it waits on another decision. `silence` skips notifying those listeners, e.g. when fixing a typo: `resumer`, `poll:<actor>`, or the id of a webhook on this decision. Global webhooks always hear. Recorded as `silenced` on the event. |
+| `POST /decisions/{id}/reopen` · `/cancel` · `/comments` | Reopening is refused (409) while a `when` dependency can't be met. |
 | `GET /decisions/{id}/wait?timeout=60&types=…&after=…` | Long-poll until resolved/cancelled/expired (or other event types). Returns immediately if already in one of those states. |
 | `GET /decisions/{id}/events` · `GET /events?after=N&wait=30` | Event log; the global feed can be long-polled instead of using webhooks |
 | `GET /spaces` · `POST /spaces` · `PATCH/DELETE /spaces/{name}` | Spaces with their decision counts. Create: `{name, deadline_days?}`. PATCH `{deadline_days}` (`null` = the server's). Only an empty space can be deleted, which revokes its tokens; `default` can't be. Everything except listing needs the admin token (403). |
@@ -88,7 +90,7 @@ so its origin is recognized. Cross-origin browser integrations are not supported
 
 ### Webhooks
 
-Subscription: `{url, secret?, events?, require_ack?, max_attempts?, refire_interval?}`. Default events: `decision.resolved`, `decision.reopened`, `decision.cancelled`, `decision.expired`, `attributes.requested`. Use `["*"]` or `["decision.*"]` for more. If you omit `secret`, one is generated; it is returned only in the creating response.
+Subscription: `{url, secret?, events?, require_ack?, max_attempts?, refire_interval?}`. Default events: `decision.resolved`, `decision.reopened`, `decision.cancelled`, `decision.expired`, `attributes.requested`. Use `["*"]` or `["decision.*"]` for more, e.g. `decision.unblocked` (what it waited on is settled) and `dependency.changed` (something it depends on was reopened or decided again). If you omit `secret`, one is generated; it is returned only in the creating response.
 
 ```http
 POST <your url>

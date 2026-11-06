@@ -103,7 +103,18 @@ def _until(iso: str) -> str:
 def _summary(d: dict) -> str:
     by_id = {o["id"]: o for o in d["options"]}
     lines = [f"{d['id']}  [{d['status']}]  {d['title']}", f"  {d['url']}"]
-    if d.get("due_at") and d["status"] == "open":
+    for x in d.get("depends_on", []):
+        cond = f", only applies if it picks {' or '.join(x['when'])}" if x["when"] else ""
+        state = {"waiting": "locked until it's decided", "met": "settled", "unmet": "doesn't apply"}[x["state"]]
+        lines.append(f"  depends on {x['decision']} [{x['status']}] {x['title']}{cond}: {state}")
+    for x in d.get("affects", []):
+        cond = f" (only if this picks {' or '.join(x['when'])})" if x["when"] else ""
+        lines.append(f"  affects {x['decision']} [{x['status']}] {x['title']}{cond}")
+    if d.get("outdated_by"):
+        lines.append(f"  outdated: {', '.join(d['outdated_by'])} changed after this was decided")
+    if d.get("waiting_on"):
+        lines.append(f"  waiting on {', '.join(d['waiting_on'])}: it can't be decided or expire until then")
+    elif d.get("due_at") and d["status"] == "open":
         lines.append(f"  expires {_until(d['due_at'])} ({d['due_at']}) unless decided")
     elif d["status"] == "expired":
         lines.append(f"  expired {_until(d['due_at']) if d.get('due_at') else ''}: nobody decided before the deadline")
@@ -210,6 +221,9 @@ def cmd_create(args):
         body.setdefault("metadata", {}).update(dict(m.split("=", 1) for m in args.meta))
     if args.due:
         body["due_at"] = _parse_due(args.due)
+    for dep in args.depends_on or []:
+        up, _, when = dep.partition("=")
+        body.setdefault("depends_on", []).append({"decision": up, **({"when": when.split(",")} if when else {})})
     # Inside an agent session, remember how to resume it once the decision is made.
     detected = (args.agent or agents.detect_agent() or "agent", args.session) if args.session \
         else agents.detect_session()
@@ -250,7 +264,10 @@ def cmd_list(args):
     show_space = len({d["space"] for d in decisions}) > 1
     for d in decisions:
         pending = " (attributes requested)" if d["pending_attribute_requests"] else ""
-        due = f"  [expires {_until(d['due_at'])}]" if d.get("due_at") and d["status"] == "open" else ""
+        due = (f"  [waiting on {', '.join(d['waiting_on'])}]" if d.get("waiting_on") else
+               f"  [expires {_until(d['due_at'])}]" if d.get("due_at") and d["status"] == "open" else "")
+        if d.get("outdated_by"):
+            due += f"  [outdated by {', '.join(d['outdated_by'])}]"
         space = f"{d['space']:<10} " if show_space else ""
         print(f"{d['id']:>7}  {space}{d['status']:<9} {d['title']}{pending}{due}")
 
@@ -872,6 +889,9 @@ def main(argv=None):
     s.add_argument("--meta", action="append", help="metadata key=value (repeatable)")
     s.add_argument("--due", help="deadline, after which the undecided decision expires: 36h, 2d, 1w, or an ISO "
                                  "timestamp (default: the server's deadline_days, normally 4 days)")
+    s.add_argument("--depends-on", action="append", metavar="D-N[=OPT,...]",
+                   help="locked until decision D-N is decided; with =OPT,... it only applies if D-N picks one "
+                        "of those options, and is cancelled otherwise (repeatable)")
     s.add_argument("--json", help="read the request body from a file, or - for stdin")
     s.add_argument("--quiet", "-q", action="store_true", help="print only the decision id")
     s.add_argument("--no-resume", action="store_true",

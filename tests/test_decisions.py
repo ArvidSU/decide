@@ -603,6 +603,121 @@ class DecisionsTest(unittest.TestCase):
         self.assertTrue(line.startswith("decision.expired|[decisions] "))
         self.assertIn("expired", line)
 
+    # ---------------------------------------------------------------- dependencies
+
+    def caching(self):
+        return self.create(title="Which cache?", options=[{"id": "redis", "label": "Redis"},
+                                                          {"id": "http", "label": "HTTP cache"}])
+
+    def types(self, did):
+        return [(e["type"], e["actor"]) for e in self.call("GET", f"/api/decisions/{did}/events")["events"]]
+
+    def test_a_dependent_decision_is_locked_until_its_upstream_is_decided(self):
+        up = self.caching()
+        client = self.create(title="Which Redis client?",
+                             depends_on=[{"decision": up["id"], "when": ["redis"], "note": "only with Redis"}])
+        later = self.create(title="Cache TTL?", depends_on=[up["id"]], due_at=self.past())
+        self.assertEqual(client["waiting_on"], [up["id"]])
+        self.assertIsNone(client["due_at"])  # the clock starts once it can be decided
+        dep = client["depends_on"][0]
+        self.assertEqual((dep["state"], dep["when"], dep["when_labels"], dep["note"]),
+                         ("waiting", ["redis"], ["Redis"], "only with Redis"))
+        affects = self.call("GET", f"/api/decisions/{up['id']}")["affects"]
+        self.assertEqual([(a["decision"], a["when"]) for a in affects], [(client["id"], ["redis"]), (later["id"], None)])
+        listed = {d["id"]: d for d in self.call("GET", "/api/decisions")["decisions"]}
+        self.assertEqual(listed[client["id"]]["waiting_on"], [up["id"]])
+        self.assertIn("waits on", self.call("POST", f"/api/decisions/{client['id']}/resolve", {"selected": ["1"]},
+                                            expect=409)["error"])
+        # Waiting decisions don't expire, even past their own due_at.
+        self.assertEqual(self.store.expire_due(), [])
+        self.assertIn(f"Depends on:** {up['id']}", self.call("GET", f"/api/decisions/{client['id']}/markdown"))
+
+        self.call("POST", f"/api/decisions/{up['id']}/resolve", {"selected": ["redis"]}, actor="me", expect=200)
+        for d in (client, later):
+            d = self.call("GET", f"/api/decisions/{d['id']}")
+            self.assertEqual((d["status"], d["waiting_on"]), ("open", []))
+            self.assertGreater(d["due_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3 * 86400)))
+            self.assertEqual(self.types(d["id"])[-1], ("decision.unblocked", "dependency"))
+        self.call("POST", f"/api/decisions/{client['id']}/resolve", {"selected": ["1"]}, expect=200)
+
+    def test_a_conditional_dependency_cancels_down_the_chain(self):
+        rx = Receiver()
+        self.call("POST", "/api/webhooks", {"url": rx.url, "events": ["decision.cancelled"]}, expect=201)
+        up = self.caching()
+        client = self.create(title="Which Redis client?", depends_on=[{"decision": up["id"], "when": "redis"}])
+        pool = self.create(title="Pool size?", depends_on=[{"decision": client["id"], "when": ["1"]}])
+        docs = self.create(title="Document it?", depends_on=[client["id"]])
+        self.assertEqual(pool["waiting_on"], [client["id"]])
+        self.call("POST", f"/api/decisions/{up['id']}/resolve", {"selected": ["http"]}, actor="me", expect=200)
+        status = lambda d: self.call("GET", f"/api/decisions/{d['id']}")["status"]
+        self.assertEqual([status(d) for d in (client, pool, docs)], ["cancelled", "cancelled", "open"])
+        ev = self.call("GET", f"/api/decisions/{client['id']}/events")["events"][-1]
+        self.assertEqual((ev["type"], ev["actor"]), ("decision.cancelled", "dependency"))
+        self.assertIn(f"{up['id']} was resolved with http", ev["data"]["note"])
+        # Depending on something cancelled is settled for a plain dependency: it can be decided now.
+        self.assertEqual(self.types(docs["id"])[-1], ("decision.unblocked", "dependency"))
+        self.assertTrue(rx.wait_for(2))
+        # It can't come back while the premise is false, nor can a new one be built on it.
+        self.assertIn("only applies if", self.call("POST", f"/api/decisions/{client['id']}/reopen", {},
+                                                   expect=409)["error"])
+        self.call("POST", "/api/decisions", {"title": "x", "depends_on": [{"decision": up["id"], "when": ["redis"]}]},
+                  expect=409)
+        # Change the upstream, and it can.
+        self.call("POST", f"/api/decisions/{up['id']}/resolve", {"selected": ["redis"]}, actor="me", expect=200)
+        self.assertEqual(self.call("POST", f"/api/decisions/{client['id']}/reopen", {}, expect=200)["waiting_on"], [])
+
+    def test_changing_an_upstream_flags_what_was_decided_on_it(self):
+        up = self.caching()
+        down = self.create(title="Cache TTL?", depends_on=[up["id"]])
+        self.call("POST", f"/api/decisions/{up['id']}/resolve", {"selected": ["redis"]}, actor="me", expect=200)
+        down = self.call("POST", f"/api/decisions/{down['id']}/resolve", {"selected": ["1"]}, actor="me", expect=200)
+        self.assertEqual(down["outdated_by"], [])
+        self.call("POST", f"/api/decisions/{up['id']}/reopen", {}, actor="me", expect=200)
+        down = self.call("GET", f"/api/decisions/{down['id']}")
+        # Left as decided, but flagged, and its listeners hear why.
+        self.assertEqual((down["status"], down["outdated_by"]), ("resolved", [up["id"]]))
+        self.assertEqual(self.types(down["id"])[-1], ("dependency.changed", "dependency"))
+        self.assertEqual(self.call("GET", "/api/decisions?status=resolved")["decisions"][0]["outdated_by"], [up["id"]])
+        self.call("POST", f"/api/decisions/{down['id']}/resolve", {"selected": ["1"]}, expect=409)
+        self.call("POST", f"/api/decisions/{up['id']}/resolve", {"selected": ["http"]}, actor="me", expect=200)
+        self.assertEqual(self.call("GET", f"/api/decisions/{down['id']}")["outdated_by"], [up["id"]])
+        # Deciding it again (even the same way) confirms it against the new outcome.
+        down = self.call("POST", f"/api/decisions/{down['id']}/resolve", {"selected": ["1"]}, actor="me", expect=200)
+        self.assertEqual(down["outdated_by"], [])
+
+    def test_dependencies_are_validated_and_can_be_dropped(self):
+        up, other = self.caching(), self.create()
+        self.call("POST", "/api/decisions", {"title": "x", "depends_on": ["D-999"]}, expect=404)
+        self.call("POST", "/api/decisions", {"title": "x", "depends_on": [{"decision": up["id"], "when": ["nope"]}]},
+                  expect=400)
+        self.call("POST", "/api/decisions", {"title": "x", "depends_on": "D-1"}, expect=400)
+        down = self.create(depends_on=[up["id"]])
+        self.call("PATCH", f"/api/decisions/{down['id']}", {"depends_on": [down["id"]]}, expect=400)
+        self.assertIn("cycle", self.call("PATCH", f"/api/decisions/{up['id']}", {"depends_on": [down["id"]]},
+                                         expect=400)["error"])
+        # Adding one locks it; dropping the last one it waits on unlocks it and starts its deadline.
+        d = self.call("PATCH", f"/api/decisions/{down['id']}", {"depends_on": [up["id"], other["id"]]}, expect=200)
+        self.assertEqual(d["waiting_on"], [up["id"], other["id"]])
+        d = self.call("PATCH", f"/api/decisions/{down['id']}", {"depends_on": [other["id"]]}, expect=200)
+        self.assertEqual(self.types(d["id"])[-1][0], "decision.updated")
+        d = self.call("PATCH", f"/api/decisions/{down['id']}", {"depends_on": []}, actor="me", expect=200)
+        self.assertEqual((d["waiting_on"], self.types(d["id"])[-1]), ([], ("decision.unblocked", "dependency")))
+        self.assertIsNotNone(d["due_at"])
+
+    def test_cli_depends_on(self):
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT}
+        run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,
+                                        capture_output=True, text=True)
+        up = self.caching()
+        did = run("create", "--title", "Client?", "-o", "a", "--depends-on", f"{up['id']}=redis", "-q",
+                  "--no-resume").stdout.strip()
+        self.assertEqual(self.call("GET", f"/api/decisions/{did}")["depends_on"][0]["when"], ["redis"])
+        shown = run("get", did).stdout
+        self.assertIn(f"depends on {up['id']} [open] Which cache?, only applies if it picks redis", shown)
+        self.assertIn(f"waiting on {up['id']}", shown)
+        self.assertIn(f"[waiting on {up['id']}]", run("list").stdout)
+        self.assertIn(f"affects {did}", run("get", up["id"]).stdout)
+
 
 class RemoteTest(unittest.TestCase):
     """The server on one machine, agents on others: token auth, installing from the server, connect."""
@@ -784,6 +899,9 @@ class SpacesTest(unittest.TestCase):
         self.call("GET", f"/api/webhooks?decision={p['id']}", token="tok-work", expect=404)
         self.call("POST", "/api/webhooks", {"url": "http://127.0.0.1:9/", "decision_id": p["id"]},
                   token="tok-work", expect=404)
+        # Dependencies stay inside a space too, even for the admin token.
+        self.call("POST", "/api/decisions", {"title": "x", "depends_on": [p["id"]]}, token="tok-work", expect=404)
+        self.call("POST", "/api/decisions", {"title": "x", "space": "work", "depends_on": [p["id"]]}, expect=404)
         # ...and none of it changed anything.
         self.assertEqual(self.call("GET", f"/api/decisions/{p['id']}", token="tok-private")["status"], "open")
 

@@ -84,6 +84,18 @@ CREATE TABLE IF NOT EXISTS options (
   PRIMARY KEY (decision_id, id)
 );
 
+-- decision_id can't be decided before depends_on is settled. With when_selected (option ids), it only
+-- applies if depends_on picks one of them; any other outcome cancels it. Both are in the same space.
+CREATE TABLE IF NOT EXISTS dependencies (
+  decision_id TEXT NOT NULL REFERENCES decisions(id),
+  depends_on TEXT NOT NULL REFERENCES decisions(id),
+  when_selected TEXT,
+  note TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL,
+  PRIMARY KEY (decision_id, depends_on)
+);
+CREATE INDEX IF NOT EXISTS dependencies_by_upstream ON dependencies(depends_on);
+
 -- Each space has its own hash chain; space NULL is the server's own (webhooks across all spaces).
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,6 +184,10 @@ TERMINAL_EVENTS = {"resolved": "decision.resolved", "cancelled": "decision.cance
 # Events that wake the requesting agent's session (via the resumer).
 RESUME_TRIGGERS = {"resolved": "decision.resolved", "expired": "decision.expired"}
 DEADLINE_ACTOR = "deadline"
+# Actor for what a decision's dependencies do to it: cancel it when it no longer applies, unlock it.
+DEPENDENCY_ACTOR = "dependency"
+# Events after which a decision that depends on this one may need another look.
+SETTLING_EVENTS = ("decision.resolved", "decision.reopened", "decision.cancelled", "decision.expired")
 GENESIS = "0" * 64
 DEFAULT_SPACE = "default"
 SPACE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
@@ -283,6 +299,27 @@ def _links(value) -> list:
         else:
             raise ApiError(400, "links must be URLs or {url, title?, kind?} objects")
     return out
+
+
+def _dependencies(value) -> list[dict]:
+    """`depends_on`: ["D-12", {"decision": "D-12", "when": ["redis"], "note": "…"}, …]."""
+    if not isinstance(value, list):
+        raise ApiError(400, "depends_on must be a list of decision ids or {decision, when?, note?} objects")
+    out = {}
+    for item in value:
+        if isinstance(item, str):
+            item = {"decision": item}
+        if not isinstance(item, dict) or not isinstance(item.get("decision"), str):
+            raise ApiError(400, "depends_on must be a list of decision ids or {decision, when?, note?} objects")
+        when = item.get("when")
+        if isinstance(when, str):
+            when = [when]
+        if when is not None and (not isinstance(when, list) or not when):
+            raise ApiError(400, "depends_on[].when must be a non-empty list of option ids (or left out)")
+        did = norm_id(item["decision"])
+        out[did] = {"decision": did, "when": [str(w) for w in dict.fromkeys(when)] if when else None,
+                    "note": _opt_type(item, "note", str, "")}
+    return list(out.values())
 
 
 def _resume(value) -> dict | None:
@@ -500,7 +537,138 @@ class Store:
             "options": options,
             "webhooks": [self._sub_dict(s) for s in subs],
         }
-        return out
+        return out | self._dependency_view(did, row)
+
+    # ------------------------------------------------------------------ dependencies
+
+    @staticmethod
+    def _dep_state(up, when) -> str:
+        """`waiting` while the upstream is open; `met` once it's settled in a way this decision applies to;
+        `unmet` when it settled any other way (a conditional dependency on something cancelled, expired or
+        decided otherwise)."""
+        if up["status"] == "open":
+            return "waiting"
+        if when is None:
+            return "met"
+        selected = json.loads(up["resolution"])["selected"] if up["status"] == "resolved" else []
+        return "met" if set(selected) & set(when) else "unmet"
+
+    def _dep_specs(self, did: str) -> list[dict]:
+        return [{"decision": r["depends_on"], "when": json.loads(r["when_selected"]) if r["when_selected"] else None,
+                 "note": r["note"]} for r in self.conn.execute(
+            "SELECT * FROM dependencies WHERE decision_id=? ORDER BY position", (did,))]
+
+    def _open_upstreams(self, did: str) -> list[str]:
+        return [r["id"] for r in self.conn.execute(
+            "SELECT d.id FROM dependencies x JOIN decisions d ON d.id = x.depends_on "
+            "WHERE x.decision_id=? AND d.status='open' ORDER BY x.position", (did,))]
+
+    def _dependency_view(self, did: str, row) -> dict:
+        """What this decision waits on, what it affects, and which upstream changed after it was decided."""
+        depends_on, outdated = [], []
+        last_resolved = self.conn.execute(
+            "SELECT MAX(seq) FROM events WHERE decision_id=? AND type='decision.resolved'", (did,)).fetchone()[0]
+        for spec in self._dep_specs(did):
+            up = self.conn.execute("SELECT * FROM decisions WHERE id=?", (spec["decision"],)).fetchone()
+            labels = dict(self.conn.execute("SELECT id, label FROM options WHERE decision_id=?", (up["id"],)).fetchall())
+            depends_on.append(spec | {
+                "title": up["title"], "status": up["status"], "state": self._dep_state(up, spec["when"]),
+                "when_labels": [labels.get(w, w) for w in spec["when"] or []],
+                "selected": json.loads(up["resolution"])["selected"] if up["resolution"] else [],
+            })
+            if row["status"] == "resolved" and (up["status"] == "open" or self.conn.execute(
+                    f"SELECT 1 FROM events WHERE decision_id=? AND seq>? AND type IN ({','.join('?' * len(SETTLING_EVENTS))})",
+                    (up["id"], last_resolved or 0, *SETTLING_EVENTS)).fetchone()):
+                outdated.append(up["id"])
+        affects = [{"decision": r["decision_id"], "title": r["title"], "status": r["status"],
+                    "when": json.loads(r["when_selected"]) if r["when_selected"] else None, "note": r["note"],
+                    "waiting_on": self._open_upstreams(r["decision_id"]) if r["status"] == "open" else []}
+                   for r in self.conn.execute(
+                       "SELECT x.*, d.title, d.status FROM dependencies x JOIN decisions d ON d.id = x.decision_id "
+                       "WHERE x.depends_on=? ORDER BY d.num", (did,))]
+        return {"depends_on": depends_on, "affects": affects, "outdated_by": outdated,
+                "waiting_on": [x["decision"] for x in depends_on if x["state"] == "waiting"]
+                if row["status"] == "open" else []}
+
+    def _check_dependencies(self, did: str, space: str, specs: list[dict], applies: bool) -> list[dict]:
+        """Validate a decision's `depends_on`. `applies`: refuse dependencies it already couldn't meet."""
+        for spec in specs:
+            up = spec["decision"]
+            if up == did:
+                raise ApiError(400, "a decision can't depend on itself")
+            row = self.conn.execute("SELECT * FROM decisions WHERE id=?", (up,)).fetchone()
+            if not row or row["space"] != space:
+                raise ApiError(404, f"no decision {up}")
+            if spec["when"]:
+                ids = {r["id"] for r in self.conn.execute("SELECT id FROM options WHERE decision_id=?", (up,))}
+                unknown = [w for w in spec["when"] if w not in ids]
+                if unknown:
+                    raise ApiError(400, f"{up} has no option {', '.join(map(repr, unknown))}")
+            if applies and self._dep_state(row, spec["when"]) == "unmet":
+                raise ApiError(409, f"{up} is already {row['status']} without picking "
+                                    f"{' or '.join(spec['when'])}, so this wouldn't apply")
+            # Following the chain upstream must never lead back here.
+            seen, todo = set(), [up]
+            while todo:
+                cur = todo.pop()
+                if cur == did:
+                    raise ApiError(400, f"depending on {up} would make a cycle")
+                if cur not in seen:
+                    seen.add(cur)
+                    todo += [r["depends_on"] for r in self.conn.execute(
+                        "SELECT depends_on FROM dependencies WHERE decision_id=?", (cur,))]
+        return specs
+
+    def _write_dependencies(self, did: str, specs: list[dict]):
+        self.conn.execute("DELETE FROM dependencies WHERE decision_id=?", (did,))
+        for i, spec in enumerate(specs):
+            self.conn.execute(
+                "INSERT INTO dependencies (decision_id, depends_on, when_selected, note, position) VALUES (?,?,?,?,?)",
+                (did, spec["decision"], canonical(spec["when"]) if spec["when"] else None, spec["note"], i))
+
+    def _restart_deadline(self, row) -> str | None:
+        """The due_at a decision gets when it becomes decidable again: its own, unless that has passed or is missing."""
+        due = parse_ts(row["due_at"])
+        if (due is None and self.deadline_days_for(row["space"]) > 0) or (due and due <= datetime.now(timezone.utc)):
+            return self.default_due_at(row["space"])
+        return row["due_at"]
+
+    def _unlock(self, did: str, after: str):
+        """Every upstream is settled: the decision can be decided now, and its deadline starts."""
+        row = self._decision_row(did)
+        due_at = self._restart_deadline(row)
+        self.conn.execute("UPDATE decisions SET due_at=?, updated_at=? WHERE id=?", (due_at, now_iso(), did))
+        self._event(did, "decision.unblocked", DEPENDENCY_ACTOR, {"after": after, "due_at": due_at})
+
+    def _settle_dependents(self, upstream: str, was_open: bool):
+        """Bring the decisions that depend on `upstream` in line with its new status. Call inside tx().
+        Open ones that no longer apply are cancelled (and so on down the chain); open ones it was holding
+        back are unlocked; anything already decided is left as is and shows up as outdated."""
+        up = self._decision_row(upstream)
+        selected = json.loads(up["resolution"])["selected"] if up["resolution"] else []
+        for dep in self.conn.execute("SELECT * FROM dependencies WHERE depends_on=?", (upstream,)).fetchall():
+            did = dep["decision_id"]
+            row = self._decision_row(did)
+            when = json.loads(dep["when_selected"]) if dep["when_selected"] else None
+            state = self._dep_state(up, when)
+            change = {"decision": upstream, "status": up["status"], "selected": selected}
+            if row["status"] == "resolved" or (row["status"] == "open" and state == "waiting"):
+                self._event(did, "dependency.changed", DEPENDENCY_ACTOR, change)
+            elif row["status"] != "open":
+                continue
+            elif state == "unmet":
+                picked = ", ".join(selected) if selected else "nothing"
+                note = (f"No longer applies: {upstream} was {up['status']}" +
+                        (f" with {picked}" if up["status"] == "resolved" else "") +
+                        f", and this only applied if it picked {' or '.join(when)}.")
+                self.conn.execute("UPDATE decisions SET status='cancelled', updated_at=? WHERE id=?", (now_iso(), did))
+                self._event(did, "decision.cancelled", DEPENDENCY_ACTOR,
+                            {"note": note, "previous_status": "open", "previous_resolution": None, "dependency": change})
+                self._settle_dependents(did, was_open=True)
+            elif not was_open:
+                self._event(did, "dependency.changed", DEPENDENCY_ACTOR, change)
+            elif not self._open_upstreams(did):
+                self._unlock(did, upstream)
 
     def _resume_state(self, did: str, row) -> dict | None:
         """Where the requester's resumption stands for the latest resolution (or expiry)."""
@@ -561,6 +729,14 @@ class Store:
             max_select = _opt_type(body, "max_select", int, None) if "max_select" in body else 1
             self._check_select_bounds(min_select, max_select)
             defs = self._clean_defs(_opt_type(body, "attributes", dict, {}))
+            deps = self._check_dependencies(did, space, _dependencies(body.get("depends_on", [])), applies=True)
+            if body.get("due_at") is not None:
+                due_at = _due_at(body["due_at"])
+            else:
+                # The clock starts once it can be decided, not while it waits on another decision.
+                waiting = any(self.conn.execute("SELECT status FROM decisions WHERE id=?", (x["decision"],))
+                              .fetchone()["status"] == "open" for x in deps)
+                due_at = None if waiting else self.default_due_at(space)
             self.conn.execute(
                 """INSERT INTO decisions (id, num, space, title, context, source, min_select, max_select,
                    attribute_defs, links, tags, metadata, due_at, idempotency_key, created_at, updated_at, resume)
@@ -568,10 +744,10 @@ class Store:
                 (did, num, space, title, _opt_type(body, "context", str, ""),
                  _opt_type(body, "source", str, actor), min_select, max_select, canonical(defs),
                  canonical(_links(body.get("links"))), canonical(_opt_type(body, "tags", list, [])),
-                 canonical(_opt_type(body, "metadata", dict, {})),
-                 _due_at(body["due_at"]) if body.get("due_at") is not None else self.default_due_at(space),
+                 canonical(_opt_type(body, "metadata", dict, {})), due_at,
                  key, ts, ts, canonical(r) if (r := _resume(body.get("resume"))) else None),
             )
+            self._write_dependencies(did, deps)
             self._insert_options(did, _opt_type(body, "options", list, []))
             hooks = body.get("webhooks") or ([body["webhook"]] if body.get("webhook") else [])
             created_subs = [self._create_sub(h, did, space) for h in hooks]
@@ -634,7 +810,8 @@ class Store:
                 out.append({
                     k: d[k] for k in ("id", "space", "url", "title", "source", "status", "tags", "created_at",
                                       "updated_at", "resolved_at", "due_at", "resolution",
-                                      "pending_attribute_requests", "min_select", "max_select", "resume_state")
+                                      "pending_attribute_requests", "min_select", "max_select", "resume_state",
+                                      "waiting_on", "outdated_by")
                 } | {"option_count": counts[0], "excluded_count": counts[1] or 0})
         return out
 
@@ -671,6 +848,14 @@ class Store:
                 if val != old:
                     changes["resume"] = [old, val]
                     sets["resume"] = canonical(val) if val else None
+            if "depends_on" in body:
+                old = self._dep_specs(did)
+                val = self._check_dependencies(did, row["space"], _dependencies(body["depends_on"]),
+                                               applies=row["status"] == "open")
+                if val != old:
+                    changes["depends_on"] = [old, val]
+                    was_waiting = bool(self._open_upstreams(did))
+                    self._write_dependencies(did, val)
             if "links" in body:
                 val, old = _links(body["links"]), json.loads(row["links"])
                 if val != old:
@@ -698,6 +883,9 @@ class Store:
                     f"UPDATE decisions SET {', '.join(f'{k}=?' for k in sets)} WHERE id=?",
                     (*sets.values(), did))
                 self._event(did, "decision.updated", actor, {"changes": changes})
+                # Dropping the last dependency it was waiting on lets it be decided now.
+                if "depends_on" in changes and row["status"] == "open" and was_waiting and not self._open_upstreams(did):
+                    self._unlock(did, None)
             return self._decision_dict(did)
 
     def resolve(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
@@ -711,6 +899,10 @@ class Store:
         silence = _opt_type(body, "silence", list, [])
         with self.tx():
             row = self._decision_row(did, scope)
+            waiting = self._open_upstreams(did)
+            if waiting:
+                raise ApiError(409, f"{did} waits on {', '.join(waiting)}: decide that first, "
+                                    f"or remove the dependency")
             silence = self._check_silence(did, silence)
             ids = {r["id"] for r in self.conn.execute("SELECT id FROM options WHERE decision_id=?", (did,))}
             unknown = [s for s in selected if s not in ids]
@@ -736,6 +928,7 @@ class Store:
             if silence:
                 data["silenced"] = silence
             self._event(did, "decision.resolved", actor, data)
+            self._settle_dependents(did, was_open=row["status"] == "open")
             return self._decision_dict(did)
 
     def _check_silence(self, did: str, silence: list) -> list[str]:
@@ -763,15 +956,20 @@ class Store:
             data = {"note": note, "previous_status": row["status"], "previous_resolution": previous}
             due_at = row["due_at"]
             if status == "open":
+                unmet = [x for x in self._dependency_view(did, row)["depends_on"] if x["state"] == "unmet"]
+                if unmet:
+                    x = unmet[0]
+                    raise ApiError(409, f"{did} only applies if {x['decision']} picks {' or '.join(x['when'])}, "
+                                        f"and it's {x['status']}: change {x['decision']} or remove the dependency first")
                 # Reopening restarts a passed (or missing) deadline; otherwise it would expire again at once.
-                due = parse_ts(due_at)
-                if (due is None and self.deadline_days_for(row["space"]) > 0) or \
-                        (due and due <= datetime.now(timezone.utc)):
-                    due_at = data["due_at"] = self.default_due_at(row["space"])
+                if (new_due := self._restart_deadline(row)) != due_at:
+                    due_at = data["due_at"] = new_due
             self.conn.execute(
                 "UPDATE decisions SET status=?, resolution=NULL, resolved_at=NULL, due_at=?, updated_at=? WHERE id=?",
                 (status, due_at, now_iso(), did))
             self._event(did, etype, actor, data)
+            if status != row["status"]:
+                self._settle_dependents(did, was_open=row["status"] == "open")
             return self._decision_dict(did)
 
     def expire_due(self) -> list[str]:
@@ -780,15 +978,21 @@ class Store:
         now = datetime.now(timezone.utc)
         expired = []
         with self.tx():
-            for row in self.conn.execute(
-                    "SELECT id, due_at FROM decisions WHERE status='open' AND due_at IS NOT NULL").fetchall():
+            for (did,) in self.conn.execute(
+                    "SELECT id FROM decisions WHERE status='open' AND due_at IS NOT NULL").fetchall():
+                # Re-read: expiring one can cancel or unlock others further down the list.
+                row = self._decision_row(did)
+                if row["status"] != "open":
+                    continue
                 due = parse_ts(row["due_at"])
-                if due is None or due > now:
+                # A decision waiting on another can't be decided yet, so it can't run out of time either.
+                if due is None or due > now or self._open_upstreams(row["id"]):
                     continue
                 self.conn.execute("UPDATE decisions SET status='expired', updated_at=? WHERE id=?",
                                   (now_iso(), row["id"]))
                 self._event(row["id"], "decision.expired", DEADLINE_ACTOR,
                             {"due_at": row["due_at"], "previous_status": "open"})
+                self._settle_dependents(row["id"], was_open=True)
                 expired.append(row["id"])
         return expired
 

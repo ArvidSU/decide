@@ -56,10 +56,12 @@ def server():
     except Exception as exc:  # unreachable is a state to show, not a crash
         out({"state": "error", "detail": "Not reachable at %s (%s). Start it from Develop → Serve." % (BASE, reason(exc))})
         return
-    open_n = len(get("/decisions?status=open")["decisions"])
+    ds = get("/decisions?status=open")["decisions"]
+    waiting = sum(1 for d in ds if d.get("waiting_on"))
     auth = "token required" if cfg.get("auth") else "no token"
     out({"state": "healthy",
-         "detail": "Up at %s · v%s · %s · %d open" % (BASE, cfg.get("version", "?"), auth, open_n)})
+         "detail": "Up at %s · v%s · %s · %d open%s" % (BASE, cfg.get("version", "?"), auth, len(ds) - waiting,
+                                                        " (+%d waiting on others)" % waiting if waiting else "")})
 
 
 def resumer():
@@ -123,14 +125,16 @@ def open_list():
         pending = d.get("pending_attribute_requests") or {}
         if pending:
             bits.append("waiting on requester for: " + ", ".join(sorted(pending)))
+        if d.get("waiting_on"):
+            bits.append("locked until %s is decided" % ", ".join(d["waiting_on"]))
         bits += ["from " + (d.get("source") or "unknown"), "opened " + ago(d.get("created_at"))]
-        if d.get("due_at"):
+        if d.get("due_at") and not d.get("waiting_on"):
             bits.append("expires " + d["due_at"][:16].replace("T", " ") + " UTC")
         items.append({
             "id": d["id"],
             "title": "%s · %s" % (d["id"], d["title"]),
             "detail": " · ".join(bits),
-            "state": "warning" if pending else "pending",
+            "state": "warning" if pending else "unknown" if d.get("waiting_on") else "pending",
             "tags": d.get("tags") or [],
             "url": d["url"],
             "decision": d["id"],
@@ -160,6 +164,9 @@ def recent_list():
             bits.append("“%s”" % res["note"][:80])
         if rs.get("status"):
             bits.append("agent resume: " + rs["status"])
+        if d.get("outdated_by"):
+            bits.append("outdated: %s changed since" % ", ".join(d["outdated_by"]))
+            state = "warning"
         items.append({"id": d["id"], "title": "%s · %s" % (d["id"], d["title"]), "detail": " · ".join(bits),
                       "state": state, "tags": d.get("tags") or [], "url": d["url"], "decision": d["id"]})
     out(items)

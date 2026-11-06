@@ -50,6 +50,20 @@ Make it easy to decide:
 
 Then tell the user the ID and link in one line, and don't also ask the question in chat.
 
+### Decisions that depend on each other
+
+The user's attention is the scarce resource. Never make them decide something that another open decision could make moot or change. Before creating a decision, run `decide list` and check whether it hangs on one that's still open (yours or another agent's). If it does, in order of preference:
+
+1. **Ask in order.** Wait for the other one to be decided, then create yours with that outcome in its context. This is the default.
+2. **Merge.** If two choices only make sense together, make them one decision whose options are the combinations ("Redis + redis-py", "Redis + valkey-py", "HTTP cache").
+3. **Declare the dependency**, when asking now saves real time (e.g. you'll be gone when the first is decided):
+   ```json
+   "depends_on": [{"decision": "D-12", "when": ["redis"], "note": "Only matters if we run Redis"}]
+   ```
+   or `decide create … --depends-on D-12=redis`. Your decision stays locked, out of the user's way, until D-12 is decided, and its deadline starts then. With `when`, it only applies if D-12 picks one of those options. Otherwise it's **cancelled for you** (`decision.cancelled` by actor `dependency`; the note says why), so you stop that branch. Leave out `when` if any outcome of D-12 just changes the trade-offs. If you need to revise your options once it unlocks, also wait for `decision.unblocked`.
+
+Say in `context` how the decisions relate, so the user sees it while deciding the upstream one.
+
 ## 2. Wait — without blocking yourself
 
 Run this **in the background** if your agent can (e.g. Claude Code's `run_in_background: true`), so you are re-invoked when it exits and can keep working meanwhile. Otherwise run it in the foreground; it has no time limit:
@@ -60,7 +74,7 @@ decide wait D-12 --on decision.resolved,decision.cancelled,decision.expired,attr
 
 It exits `0` whenever something you're waiting for happens. Read the first output line to see what happened:
 - `event: decision.resolved` → go to step 4.
-- `event: decision.cancelled` → the user closed it on purpose: stop, and tell the user.
+- `event: decision.cancelled` → the user closed it on purpose, or (actor `dependency`) a decision it depended on went the other way: stop that part, and tell the user.
 - `event: decision.expired` → nobody decided before the deadline, so treat it as not important enough to block on. Continue with your own best judgement where the task needs an answer, or drop that part. Say what you chose and why. Don't create the same decision again unless the user asks.
 - `event: attributes.requested` → go to step 3.
 
@@ -90,4 +104,4 @@ Then run the `to keep waiting: …` command from the previous `decide wait` outp
 
 `decide get D-12 --json` returns `resolution.selected` (option IDs), `selected_options`, and `resolution.note`. The note is the user's rationale or extra instructions; follow it. Where you act on the decision (commit, PR, Linear comment, a written summary), reference it as `[D-12: title](url)`.
 
-The user may revise a decision later (another `decision.resolved`, or `decision.reopened`). The latest resolution is authoritative. A revision may skip notifying you (e.g. a typo fix), so check `decide get` before acting on an older one.
+The user may revise a decision later (another `decision.resolved`, or `decision.reopened`). The latest resolution is authoritative. If `outdated_by` is non-empty, a decision this one depends on changed after it was made. Check with the user before acting on it. A revision may skip notifying you (e.g. a typo fix), so check `decide get` before acting on an older one.

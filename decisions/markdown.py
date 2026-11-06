@@ -20,6 +20,17 @@ def decision_markdown(d: dict) -> str:
         label = "Expires" if d["status"] == "open" else "Expired"
         meta.append(f"**{label}:** {d['due_at'][:16].replace('T', ' ')} UTC")
     lines += [" · ".join(meta), ""]
+    for x in d.get("depends_on", []):
+        cond = f" — only if it picks {' or '.join(x['when_labels'])}" if x["when"] else ""
+        lines.append(f"**Depends on:** {x['decision']}: {x['title']} ({x['status']}){cond}")
+    for x in d.get("affects", []):
+        labels = {o["id"]: o["label"] for o in d["options"]}
+        cond = f" — only if this picks {' or '.join(labels.get(w, w) for w in x['when'])}" if x["when"] else ""
+        lines.append(f"**Affects:** {x['decision']}: {x['title']} ({x['status']}){cond}")
+    if d.get("outdated_by"):
+        lines.append(f"**Outdated:** {', '.join(d['outdated_by'])} changed after this was decided")
+    if d.get("depends_on") or d.get("affects"):
+        lines.append("")
     if d["context"]:
         lines += [d["context"].strip(), ""]
 

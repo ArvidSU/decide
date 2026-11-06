@@ -91,6 +91,8 @@ const ICONS = {
   sort: '<path d="m7 15 5 5 5-5M7 9l5-5 5 5"/>',
   wifi: '<path d="M12 20h.01M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 14 0M2 9.3a15 15 0 0 1 20 0"/>',
   play: '<path d="m6 3 14 9-14 9z"/>',
+  lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  unlock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.8-1.3"/>',
 };
 const icon = (name, size = 16) =>
   `<svg class="i" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ""}</svg>`;
@@ -104,7 +106,7 @@ function statusIcon(d, size = 14) {
     cancelled: `<circle cx="8" cy="8" r="6.5" fill="currentColor"/><path d="m5.6 5.6 4.8 4.8m0-4.8-4.8 4.8" fill="none" stroke="var(--panel)" stroke-width="1.6" stroke-linecap="round"/>`,
     expired: `<circle cx="8" cy="8" r="6.5" fill="currentColor"/><path d="M8 4.8V8l2 1.3" fill="none" stroke="var(--panel)" stroke-width="1.6" stroke-linecap="round"/>`,
   }[d.status] || "";
-  return `<svg class="si ${d.status} ${u}" viewBox="0 0 16 16" width="${size}" height="${size}" aria-label="${esc(d.status)}">${g}</svg>`;
+  return `<svg class="si ${d.status} ${u} ${isWaiting(d) ? "waiting" : ""}" viewBox="0 0 16 16" width="${size}" height="${size}" aria-label="${esc(d.status)}">${g}</svg>`;
 }
 
 // ------------------------------------------------------------------ helpers
@@ -157,11 +159,14 @@ function until(iso) {
 }
 // How pressing an open decision's deadline is: "urgent" under 6h, "soon" under a day.
 function urgency(d) {
-  if (d.status !== "open" || !d.due_at) return "";
+  if (d.status !== "open" || !d.due_at || isWaiting(d)) return "";
   const s = (new Date(d.due_at).getTime() - Date.now()) / 1000;
   return s < 6 * 3600 ? "urgent" : s < 86400 ? "soon" : "";
 }
 const byDeadline = (a, b) => (a.due_at || "9999").localeCompare(b.due_at || "9999");
+// Waiting on another open decision: it can't be decided, or expire, until that one is. Not your concern yet.
+const isWaiting = (d) => d.status === "open" && !!d.waiting_on?.length;
+const actionable = (d) => d.status === "open" && !isWaiting(d);
 
 // Errors stay until dismissed; actions are [{label, run}] (`undo` is shorthand for one "Undo" action).
 let toastTimer;
@@ -468,7 +473,7 @@ async function route() {
     S.d = null;
     renderSidebar();
     if (path === "/settings") return await renderSettings();
-    const first = S.list.filter((d) => d.status === "open" && inSpace(d)).sort(byDeadline)[0];
+    const first = S.list.filter((d) => actionable(d) && inSpace(d)).sort(byDeadline)[0];
     if (first) return navigate(`/d/${first.id}`, true);
     renderEmpty();
   } catch (e) {
@@ -492,17 +497,19 @@ function renderSidebar() {
   const spaceTabs = $("#space-tabs");
   spaceTabs.hidden = !multiSpace();
   if (multiSpace()) {
-    const openIn = (s) => S.list.filter((d) => d.status === "open" && (!s || d.space === s)).length;
+    const openIn = (s) => S.list.filter((d) => actionable(d) && (!s || d.space === s)).length;
     setHtml(spaceTabs, ["", ...spaces].map((s) => { const n = openIn(s);
       return `<button class="tab ${S.space === s ? "active" : ""} ${n ? "has-open" : ""}" data-space="${esc(s)}" aria-pressed="${S.space === s}">${s ? esc(s) : "All spaces"}<span class="n">${n || ""}</span></button>`; }).join(""));
   }
   const list = S.list.filter(inSpace);
   S.counts = { open: 0, resolved: 0, expired: 0, cancelled: 0, all: list.length };
   for (const d of list) S.counts[d.status]++;
+  // The badge counts what you can act on; decisions waiting on another one come later.
+  const open = list.filter(actionable).sort(byDeadline);
+  const later = list.filter(isWaiting).length;
   setHtml($("#status-tabs"), Object.keys(STATUS_NAMES).map((t) =>
-    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && S.counts.open ? "has-open" : ""}" data-status="${t}" aria-pressed="${S.status === t}" title="${S.counts[t]} ${STATUS_NAMES[t].toLowerCase()}">${STATUS_NAMES[t]}${t === "open" && S.counts.open ? `<span class="n">${S.counts.open}</span>` : ""}</button>`).join(""));
+    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && open.length ? "has-open" : ""}" data-status="${t}" aria-pressed="${S.status === t}" title="${S.counts[t]} ${STATUS_NAMES[t].toLowerCase()}${t === "open" && later ? `, ${later} waiting on another decision` : ""}">${STATUS_NAMES[t]}${t === "open" && open.length ? `<span class="n">${open.length}</span>` : ""}</button>`).join(""));
   $("#settings-btn").classList.toggle("active", location.pathname === "/settings");
-  const open = list.filter((d) => d.status === "open").sort(byDeadline);
   document.title = (open.length ? `(${open.length}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : "Decisions");
   setHtml($("#mb-title"), `Decisions${open.length ? `<span class="n" aria-label="${open.length} open">${open.length}</span>` : ""}`);
   setHtml($("#attention"), open.length
@@ -510,16 +517,16 @@ function renderSidebar() {
         <span class="att-ic">${icon(urgency(open[0]) ? "clock" : "inbox", 15)}</span>
         <div><strong>${open.length} waiting on you</strong>
         <span>${open[0].due_at ? `Next expires in ${until(open[0].due_at)} · ${esc(open[0].id)}` : `Oldest: ${esc(open[0].id)}`}</span></div></a>`
-    : `<div class="attention clear"><span class="att-ic">${icon("check", 15)}</span><div><strong>All caught up</strong><span>Nothing is waiting on you</span></div></div>`);
+    : `<div class="attention clear"><span class="att-ic">${icon("check", 15)}</span><div><strong>All caught up</strong><span>${later ? `${later} more once others are decided` : "Nothing is waiting on you"}</span></div></div>`);
   const q = S.q.toLowerCase();
   let items = list.filter((d) => (S.status === "all" || d.status === S.status) &&
     (!q || d.title.toLowerCase().includes(q) || d.id.toLowerCase().includes(q) || (d.source || "").toLowerCase().includes(q)));
-  // Most urgent first: open decisions by deadline, ahead of everything else.
-  items = [...items.filter((d) => d.status === "open").sort(byDeadline), ...items.filter((d) => d.status !== "open")];
+  // Most urgent first: open decisions by deadline, then those waiting on another one, then everything else.
+  items = [...items.filter(actionable).sort(byDeadline), ...items.filter(isWaiting), ...items.filter((d) => d.status !== "open")];
   const sep = `<span class="sep" aria-hidden="true">·</span>`;
   setHtml($("#decision-list"), items.length ? items.map((d) => {
     const pending = Object.keys(d.pending_attribute_requests || {}).length;
-    const due = d.status === "open" && d.due_at;
+    const due = actionable(d) && d.due_at;
     const live = d.option_count - d.excluded_count;
     const meta = [
       `<span class="dl-id" title="${d.excluded_count ? `${live} of ` : ""}${d.option_count} option${d.option_count === 1 ? "" : "s"}${d.excluded_count ? " in play" : ""}">${esc(d.id)}</span>`,
@@ -527,12 +534,14 @@ function renderSidebar() {
       d.source ? `<span class="dl-source">${esc(d.source)}</span>` : "",
     ].filter(Boolean).join(sep);
     const current = S.d && S.d.id === d.id;
-    return `<a href="/d/${esc(d.id)}" data-nav class="dl-item ${current ? "active" : ""} ${d.status} ${urgency(d)}" ${current ? `aria-current="page"` : ""}>
+    return `<a href="/d/${esc(d.id)}" data-nav class="dl-item ${current ? "active" : ""} ${d.status} ${urgency(d)} ${isWaiting(d) ? "waiting" : ""}" ${current ? `aria-current="page"` : ""}>
       ${statusIcon(d)}<span class="dl-title">${esc(d.title)}</span>
       <div class="dl-meta">${meta}
         ${pending ? `<span class="dl-flag" title="Waiting for requested attributes"><span class="dot"></span>attrs</span>` : ""}
         ${["pending", "failed"].includes(d.resume_state?.status) && d.status === "resolved" ? `<span class="dl-flag bad" title="The requesting agent hasn't been resumed"><span class="dot bad"></span>not resumed</span>` : ""}
-        ${due ? `<span class="dl-due" title="Expires ${esc(fullTime(d.due_at))} unless decided">${until(d.due_at)}</span>`
+        ${d.outdated_by?.length && d.status === "resolved" ? `<span class="dl-flag" title="${esc(d.outdated_by.join(", "))} changed after this was decided"><span class="dot"></span>outdated</span>` : ""}
+        ${isWaiting(d) ? `<span class="dl-due" title="Can't be decided until ${esc(d.waiting_on.join(", "))} is">after ${esc(d.waiting_on[0])}</span>`
+          : due ? `<span class="dl-due" title="Expires ${esc(fullTime(d.due_at))} unless decided">${until(d.due_at)}</span>`
               : `<span class="dl-due" title="${esc(fullTime(d.created_at))}">${d.status === "expired" ? "expired" : ago(d.updated_at || d.created_at)}</span>`}
       </div></a>`;
   }).join("") : `<div class="list-empty">${q ? `No decisions match “${esc(S.q)}”.` : `No ${S.status === "all" ? "" : esc(STATUS_NAMES[S.status].toLowerCase()) + " "}decisions.`}</div>`);
@@ -582,6 +591,7 @@ const HOOK_EVENTS = {
   "Outcome": { "decision.resolved": "Decided", "decision.expired": "Expired undecided", "decision.cancelled": "Cancelled", "decision.reopened": "Reopened" },
   "Activity": { "decision.created": "Created", "decision.updated": "Edited or deadline moved", "decision.commented": "Commented", "attributes.requested": "Attributes requested" },
   "Options": { "options.added": "Options added", "options.updated": "Options updated", "options.excluded": "Options ruled out" },
+  "Dependencies": { "decision.unblocked": "Unlocked: what it waited on is settled", "dependency.changed": "Something it depends on changed" },
 };
 
 async function renderSettings() {
@@ -795,6 +805,7 @@ function renderDecision() {
     ${headerHtml(d)}
     <div id="deadline-card">${deadlineHtml(d)}</div>
     <div id="resume-card">${resumeHtml(d)}</div>
+    <div id="deps-panel">${depsHtml(d)}</div>
     <section class="block" aria-labelledby="opts-h">
       <div class="block-head">
         <h2 id="opts-h">Options</h2><span class="count">${visible.length} of ${d.options.length} in play</span>
@@ -831,7 +842,7 @@ function renderDecision() {
 // record read-only: context, every option with its attributes, and the activity log. Reopen to change it.
 function renderClosed(d) {
   const r = d.resolution;
-  const others = S.list.filter((x) => x.status === "open" && x.id !== d.id && inSpace(x)).sort(byDeadline);
+  const others = S.list.filter((x) => actionable(x) && x.id !== d.id && inSpace(x)).sort(byDeadline);
   const main = $("#main");
   const scroll = main.scrollTop;
   const html = `<div class="page narrow">
@@ -839,6 +850,7 @@ function renderClosed(d) {
     <h1 class="d-title">${esc(d.title)}</h1>
     <div class="d-sub">${subHtml(d)}</div>
     ${outcomeHtml(d)}
+    ${outdatedHtml(d)}
     <div id="resume-card">${resumeHtml(d)}</div>
     <div class="closed-actions">
       ${r ? `<button class="btn primary" data-action="copy-provenance" title="Copy the choice, reason and link, e.g. for a commit message or PR">${icon("copy", 15)}Copy decision record</button>` : ""}
@@ -849,6 +861,7 @@ function renderClosed(d) {
     </div>
     ${d.context || linksHtml(d) ? `<section class="block"><div class="block-head"><h2>Context</h2></div>
       ${d.context ? `<div class="context" style="margin-top:0">${md(d.context)}</div>` : ""}${linksHtml(d)}</section>` : ""}
+    ${depsHtml(d)}
     ${d.options.length ? `<section class="block">${closedOptionsHtml(d)}</section>` : ""}
     <section class="block">${activityHtml(d)}</section>
   </div>`;
@@ -873,7 +886,7 @@ function outcomeHtml(d) {
     const ev = [...S.events].reverse().find((e) => e.type === "decision.cancelled");
     return `<div class="outcome cancelled">${icon("ban", 20)}<div>
       <div class="o-label">Cancelled</div>
-      <div class="o-pick">Withdrawn without a choice${ev?.data.note ? `: “${esc(ev.data.note)}”` : ""}</div>
+      <div class="o-pick">${ev?.actor === "dependency" ? esc(ev.data.note) : `Withdrawn without a choice${ev?.data.note ? `: “${esc(ev.data.note)}”` : ""}`}</div>
       ${ev ? `<div class="note" title="${esc(fullTime(ev.ts))}">by ${esc(ev.actor)} · ${ago(ev.ts)}</div>` : ""}</div></div>`;
   }
   const days = S.config?.deadline_days;
@@ -949,6 +962,7 @@ function headerHtml(d) {
       <div class="d-actions">
         <button class="btn small" data-action="copy-md" title="Copy a markdown summary with the options table">${icon("copy", 14)}Copy summary</button>
         <button class="btn small ghost" data-action="edit">${icon("pencil", 14)}Edit</button>
+        <button class="btn small ghost" data-action="add-dep" title="Lock this until another decision is made">${icon("link", 14)}Depends on…</button>
         <button class="btn small ghost danger" data-action="cancel-decision" title="Withdraw it without picking anything">${icon("ban", 14)}Cancel</button>
       </div>
     </div>
@@ -958,6 +972,7 @@ function headerHtml(d) {
 
 // Open decisions expire at their deadline. Keep the countdown and its consequence in plain view.
 function deadlineHtml(d) {
+  if (isWaiting(d)) return waitingHtml(d);
   if (d.status !== "open" || !d.due_at) return "";
   const who = esc(d.source || "the requester");
   const days = S.config?.deadline_days || 4;
@@ -968,6 +983,80 @@ function deadlineHtml(d) {
     <div class="callout-actions">
       <button class="btn small" data-action="extend" data-days="1" title="Move the deadline a day later">${icon("plus", 14)}1 day</button>
       <button class="btn small" data-action="extend" data-days="${days}" title="Move the deadline ${days} days later">${icon("plus", 14)}${days} days</button></div>
+  </div>`;
+}
+
+// A decision waiting on another can't be decided yet. Say so first, and point at the one to decide instead.
+function waitingHtml(d) {
+  const ups = d.depends_on.filter((x) => x.state === "waiting");
+  const names = ups.map((x) => `<a href="/d/${esc(x.decision)}" data-nav>${esc(x.decision)}</a> “${esc(x.title)}”`).join(" and ");
+  const only = ups.filter((x) => x.when).map((x) => ` If ${esc(x.decision)} doesn't pick ${esc(x.when_labels.join(" or "))}, this is cancelled for you.`).join("");
+  return `<div class="callout waiting">${icon("lock", 18)}
+    <div class="callout-main"><div><strong class="c-title">Don't worry about this yet</strong></div>
+      <div class="small">It depends on ${names}, which ${ups.length > 1 ? "are" : "is"} still open. Decide that first.${only} Until then it can't be decided and won't expire.</div></div>
+    <div class="callout-actions">
+      <a class="btn small primary" href="/d/${esc(ups[0].decision)}" data-nav>Go to ${esc(ups[0].decision)}${icon("arrow-right", 14)}</a>
+      <button class="btn small ghost" data-action="decide-anyway" title="Remove the dependency so you can decide this now">Decide anyway</button></div>
+  </div>`;
+}
+
+const depLink = (x) => `<a href="/d/${esc(x.decision)}" data-nav class="dep-title">${statusIcon(x)}<span class="dep-id">${esc(x.decision)}</span><span class="dep-name">${esc(x.title)}</span></a>`;
+
+// What happens to a decision that depends on this one, given what's selected (or was decided).
+function effectOf(d, x, picked) {
+  const others = (x.waiting_on || []).filter((id) => id !== d.id);
+  const applies = !x.when || x.when.some((w) => picked.includes(w));
+  if (x.status === "resolved") return d.status === "open" && picked.length ? ["warn", "Decided already: flagged for a second look"] : ["", "Decided"];
+  if (x.status !== "open") return ["", x.status[0].toUpperCase() + x.status.slice(1)];
+  if (d.status !== "open") return ["", "Open"];
+  if (!picked.length) return ["", "Waits for this"];
+  if (!applies) return ["bad", "Will be cancelled"];
+  return others.length ? ["", `Still waits on ${others.join(", ")}`] : ["ok", "Unlocks"];
+}
+
+// Dependencies both ways: what this waits on, and what deciding it does to others.
+function depsHtml(d) {
+  const ups = d.depends_on || [], downs = d.affects || [];
+  if (!ups.length && !downs.length) return "";
+  const open = d.status === "open";
+  const picked = open ? [...S.selection] : d.resolution?.selected || [];
+  const label = (id) => d.options.find((o) => o.id === id)?.label || id;
+  const upState = (x) => d.outdated_by?.includes(x.decision) ? ["warn", x.status === "open" ? "Reopened since" : "Changed since"]
+    : x.state === "waiting" ? ["warn", "Decide this first"] : x.state === "unmet" ? ["bad", "Didn't pick it: this doesn't apply"]
+    : ["ok", x.status === "resolved" ? "Decided" : `${x.status[0].toUpperCase() + x.status.slice(1)}, doesn't hold this up`];
+  const row = (x, [tone, text], cond, remove) => `<div class="dep">${depLink(x)}
+      ${cond ? `<span class="chip dep-cond">${cond}</span>` : ""}
+      <span class="dep-effect ${tone}">${esc(text)}</span>
+      ${remove ? `<button class="icon-btn" data-action="remove-dep" data-id="${esc(x.decision)}" title="Remove this dependency" aria-label="Remove the dependency on ${esc(x.decision)}">${icon("x", 14)}</button>` : ""}
+      ${x.note ? `<div class="dep-note">${esc(x.note)}</div>` : ""}</div>`;
+  return `<section class="block deps" aria-labelledby="deps-h"><div class="block-head"><h2 id="deps-h">Dependencies</h2></div>
+    ${ups.length ? `<h3 class="dep-head">Depends on</h3>${ups.map((x) => row(x, upState(x), x.when && `only if it picks ${esc(x.when_labels.join(" or "))}`, open)).join("")}` : ""}
+    ${downs.length ? `<h3 class="dep-head">Affects</h3>${downs.map((x) => row(x, effectOf(d, x, picked), x.when && `only if this picks ${esc(x.when.map(label).join(" or "))}`, false)).join("")}` : ""}
+  </section>`;
+}
+
+// One line under the decide button: what picking the current selection does to decisions that depend on this one.
+function effectsNote(d) {
+  if (!S.selection.size || !d.affects?.length) return "";
+  const picked = [...S.selection];
+  const by = (tone) => d.affects.filter((x) => effectOf(d, x, picked)[0] === tone).map((x) => esc(x.decision));
+  const parts = [[by("bad"), "cancels"], [by("ok"), "unlocks"], [by("warn"), "flags for a second look:"]]
+    .filter(([ids]) => ids.length).map(([ids, verb]) => `${verb} <strong>${ids.join(", ")}</strong>`);
+  return parts.length ? `<div class="bar-note info">${icon("link", 14)}<span>Deciding this ${parts.join(" · ")}</span></div>` : "";
+}
+
+// A decision whose upstream changed after it was made. It's left as decided, but you're asked to look again.
+function outdatedHtml(d) {
+  if (d.status !== "resolved" || !d.outdated_by?.length) return "";
+  const ups = d.depends_on.filter((x) => d.outdated_by.includes(x.decision));
+  const reopened = ups.filter((x) => x.status === "open");
+  const names = ups.map((x) => `<a href="/d/${esc(x.decision)}" data-nav>${esc(x.decision)}</a> “${esc(x.title)}”`).join(" and ");
+  return `<div class="callout warn">${icon("link", 18)}
+    <div class="callout-main"><div><strong class="c-title">Worth a second look</strong></div>
+      <div class="small">${names} changed after this was decided${reopened.length ? `, and ${reopened.length > 1 ? "they're" : "it's"} open again. Decide ${reopened.length > 1 ? "those" : "that"} first, then come back.` : ". If this still holds, confirm it. Otherwise reopen it."}</div></div>
+    <div class="callout-actions">${reopened.length
+      ? `<a class="btn small primary" href="/d/${esc(reopened[0].decision)}" data-nav>Go to ${esc(reopened[0].decision)}${icon("arrow-right", 14)}</a>`
+      : `<button class="btn small primary" data-action="still-holds" title="Confirm the same choice without notifying its listeners again">${icon("check", 14)}Still holds</button>`}</div>
   </div>`;
 }
 
@@ -1155,6 +1244,8 @@ function miniHtml(o, kind) {
 }
 
 function decideBarHtml(d, single, { visible }) {
+  if (isWaiting(d)) return `<div class="decide-bar locked" role="region" aria-label="Decide">
+    <div class="sel">${icon("lock", 15)}<span>Locked until ${d.waiting_on.map((id) => `<a href="/d/${esc(id)}" data-nav>${esc(id)}</a>`).join(" and ")} ${d.waiting_on.length > 1 ? "are" : "is"} decided</span></div></div>`;
   const n = S.selection.size;
   const min = d.min_select, max = d.max_select;
   const valid = n >= min && (max === null || n <= max);
@@ -1177,6 +1268,7 @@ function decideBarHtml(d, single, { visible }) {
     <div class="reason-field"><label for="note">Reason</label><input id="note" placeholder="Optional, shown to ${esc(d.source || "the requester")}" value="${esc(S.notes[d.id] ?? "")}" autocomplete="off"></div>
     <button class="btn ghost small add-reason-btn" data-action="show-reason">${icon("pencil", 14)}Reason</button>
     <button class="btn primary" data-action="resolve" ${valid && !S.resolving ? "" : "disabled"} title="${esc(why || "Decide (⌘↵)")}" aria-keyshortcuts="Meta+Enter Control+Enter">${S.resolving ? "Deciding…" : `${icon("check", 15)}Decide`}<span class="kbd" aria-hidden="true">⌘↵</span></button>
+    ${effectsNote(d)}
     ${S.resolveError?.id === d.id ? `<div class="bar-note bad" role="alert">${icon("ban", 15)}<span>Couldn't decide: ${esc(S.resolveError.message)}</span>
       <button class="btn small" data-action="resolve" ${valid ? "" : "disabled"}>Retry</button></div>` : ""}
   </div>
@@ -1239,6 +1331,7 @@ const EVENT_ICONS = {
   "decision.cancelled": "ban", "decision.expired": "clock", "decision.commented": "message", "options.added": "plus", "options.updated": "pencil",
   "option.removed": "minus", "options.excluded": "x", "options.included": "undo", "attributes.requested": "help",
   "attributes.request_cancelled": "ban", "webhook.acked": "check", "webhook.redelivered": "send",
+  "decision.unblocked": "unlock", "dependency.changed": "link",
 };
 const EVENT_TONE = { "decision.resolved": "resolved", "decision.expired": "bad", "resume.failed": "bad" };
 
@@ -1252,12 +1345,16 @@ function eventText(e) {
     case "decision.updated": {
       const due = x.changes.due_at?.[1];
       const rest = Object.keys(x.changes).filter((k) => k !== "due_at");
+      const deps = x.changes.depends_on && x.changes.depends_on[1].map((y) => y.decision);
       return [due ? `moved the deadline to <strong title="${esc(fullTime(due))}">${esc(whenTime(due))}</strong>` : "",
-              rest.length ? `edited the ${esc(rest.join(", "))}` : ""].filter(Boolean).join(" and ");
+              deps ? (deps.length ? `made it depend on <strong>${esc(deps.join(", "))}</strong>` : "removed its dependencies") : "",
+              rest.filter((k) => k !== "depends_on").length ? `edited the ${esc(rest.filter((k) => k !== "depends_on").join(", "))}` : ""].filter(Boolean).join(" and ");
     }
-    case "decision.resolved": return `${x.previous_status === "resolved" ? "changed the decision to" : "decided"} <strong>${esc(x.resolution.selected.map(label).join(", "))}</strong>${x.resolution.note ? quote(x.resolution.note) : ""}${x.resolution.filters ? `<div class="sub">Filters: ${esc(x.resolution.filters)}</div>` : ""}${x.silenced ? `<div class="sub">Didn't notify ${esc(x.silenced.join(", "))}</div>` : ""}`;
+    case "decision.resolved": return `${x.previous_status !== "resolved" ? "decided" : String(x.previous_resolution?.selected) === String(x.resolution.selected) ? "confirmed" : "changed the decision to"} <strong>${esc(x.resolution.selected.map(label).join(", "))}</strong>${x.resolution.note ? quote(x.resolution.note) : ""}${x.resolution.filters ? `<div class="sub">Filters: ${esc(x.resolution.filters)}</div>` : ""}${x.silenced ? `<div class="sub">Didn't notify ${esc(x.silenced.join(", "))}</div>` : ""}`;
     case "decision.reopened": return `reopened it${x.due_at ? ` with a new deadline, <span title="${esc(fullTime(x.due_at))}">${esc(whenTime(x.due_at))}</span>` : ""}${x.note ? quote(x.note) : ""}`;
     case "decision.expired": return `expired it: nobody decided before the deadline`;
+    case "decision.unblocked": return `unlocked it${x.after ? `: <strong>${esc(x.after)}</strong> is settled` : ""}${x.due_at ? `, so its deadline starts: <span title="${esc(fullTime(x.due_at))}">${esc(whenTime(x.due_at))}</span>` : ""}`;
+    case "dependency.changed": return `noted that <strong>${esc(x.decision)}</strong> ${x.status === "open" ? "was reopened" : x.status === "resolved" ? "was decided" : `was ${esc(x.status)}`}`;
     case "decision.cancelled": return `cancelled it${x.note ? quote(x.note) : ""}`;
     case "decision.commented": return `commented<div class="comment">${esc(x.text)}</div>`;
     case "options.added": return `added ${x.options.map((o) => `<strong>${esc(o.label)}</strong>`).join(", ")}`;
@@ -1572,6 +1669,18 @@ document.addEventListener("click", async (e) => {
       return;
     }
     case "mark-resumed": return markResumed();
+    case "add-dep": return addDependency();
+    case "remove-dep": return setDependencies(d.depends_on.filter((x) => x.decision !== id), "Dependency removed");
+    case "decide-anyway": {
+      const ok = await ask({ title: `Decide ${d.id} now?`, body: `<p>This removes its dependency on ${esc(d.waiting_on.join(" and "))}, so ${esc(d.source || "the requester")} can't count on that being settled first. Its deadline starts now.</p>`, ok: "Remove dependency" });
+      if (ok === null) return;
+      return setDependencies(d.depends_on.filter((x) => x.state !== "waiting"), "Unlocked");
+    }
+    case "still-holds": {
+      // Same choice and reason, confirmed against what changed. Nobody needs to act on it again.
+      const silence = [...(d.resume ? ["resumer"] : []), ...(S.listeners || []).filter((l) => l.scope !== "global").map((l) => l.id)];
+      return act(() => api("POST", `/api/decisions/${d.id}/resolve`, { selected: d.resolution.selected, note: d.resolution.note, silence }), "Confirmed");
+    }
     case "copy-ref": return copy(`[${d.id}: ${d.title}](${d.url})`, "link");
     case "copy-md": try { return copy(await api("GET", `/api/decisions/${d.id}/markdown`), "summary"); } catch (err) { return fail(err); }
     case "copy-provenance": {
@@ -1585,6 +1694,17 @@ document.addEventListener("click", async (e) => {
     case "delete-hook": if (await ask({ title: "Delete this webhook?", body: `<p>It stops receiving events and its pending retries are cancelled. Past deliveries stay on record.</p>`, ok: "Delete", danger: true }) !== null) { try { await api("DELETE", `/api/webhooks/${id}`); renderSettings(); } catch (err) { fail(err); } } return;
   }
 });
+
+const setDependencies = (deps, okMsg) =>
+  act(() => api("PATCH", `/api/decisions/${S.d.id}`, { depends_on: deps.map(({ decision, when, note }) => ({ decision, when, note })) }), okMsg);
+
+async function addDependency() {
+  const d = S.d;
+  const v = await ask({ title: `What does ${d.id} depend on?`, body: `<p>Until that decision is made, this one is locked and out of your way, and it won't expire. Its deadline starts once it unlocks.</p>`,
+    field: "Decision", placeholder: "D-12", ok: "Add dependency" });
+  if (!v) return;
+  return setDependencies([...d.depends_on, { decision: v }], "Dependency added");
+}
 
 function markResumed() {
   const d = S.d;
@@ -1689,6 +1809,7 @@ function palette() {
     ...Object.entries(STATUS_NAMES).map(([k, v]) => ({ kind: "cmd", icon: "filter", label: `Show ${v.toLowerCase()} decisions`, run: () => { S.status = k; storage("status", k); renderSidebar(); drawer(true); } })),
     { kind: "cmd", icon: "settings", label: "Settings", run: () => navigate("/settings") },
     ...(S.d ? [{ kind: "cmd", icon: "copy", label: `Copy link to ${S.d.id}`, run: () => copy(`[${S.d.id}: ${S.d.title}](${S.d.url})`, "link") }] : []),
+    ...(S.d?.status === "open" ? [{ kind: "cmd", icon: "link", label: `Make ${S.d.id} depend on another decision…`, run: addDependency }] : []),
   ];
   const decisions = [...S.list.filter((d) => d.status === "open").sort(byDeadline), ...S.list.filter((d) => d.status !== "open")]
     .map((d) => ({ kind: "decision", d, label: d.title, run: () => navigate(`/d/${d.id}`) }));
@@ -1703,7 +1824,7 @@ function palette() {
     dlg.querySelector(".pal-more").textContent = ds.length > 12 ? `Showing 12 of ${ds.length} decisions` : "";
     const group = (i) => i === 0 && ds.length ? `<li class="pal-group" role="presentation">Decisions</li>` : i === Math.min(ds.length, 12) && cs.length ? `<li class="pal-group" role="presentation">Commands</li>` : "";
     list.innerHTML = items.length ? items.map((x, i) => `${group(i)}<li role="option" id="pal-${i}" aria-selected="${i === at}" class="${i === at ? "on" : ""}" data-i="${i}">
-      ${x.kind === "decision" ? `${statusIcon(x.d)}<span class="pal-label">${esc(x.d.title)}</span><span class="pal-meta">${esc(x.d.id)}${x.d.status === "open" && x.d.due_at ? ` · ${until(x.d.due_at)}` : ` · ${esc(x.d.status)}`}</span>`
+      ${x.kind === "decision" ? `${statusIcon(x.d)}<span class="pal-label">${esc(x.d.title)}</span><span class="pal-meta">${esc(x.d.id)}${isWaiting(x.d) ? ` · after ${esc(x.d.waiting_on[0])}` : x.d.status === "open" && x.d.due_at ? ` · ${until(x.d.due_at)}` : ` · ${esc(x.d.status)}`}</span>`
                               : `${icon(x.icon, 15)}<span class="pal-label">${esc(x.label)}</span>`}</li>`).join("")
       : `<li class="pal-empty">No matches</li>`;
     input.setAttribute("aria-activedescendant", items.length ? `pal-${at}` : "");
