@@ -80,18 +80,27 @@ root:
                       component: ./components/external/core/group
                       props:
                         title: This machine vs. this checkout
-                        description: Amber means the running server started before the code last changed, the `decide` CLI install predates pyproject.toml (or is a differing copy), or an installed SKILL.md differs from decisions/skill/SKILL.md. Restart replaces whatever listens on :8787 with `decide serve` in Develop.
+                        description: Amber means the running server started before the code last changed, the database predates the schema in decisions/store.py (there are no migrations, so delete it), the `decide` CLI install predates pyproject.toml (or is a differing copy), or an installed SKILL.md differs from decisions/skill/SKILL.md. To replace an old database, Kill server, Delete old database (it asks first), then Restart server.
                       children:
                         axis: vertical
                         first:
                           axis: horizontal
                           first:
-                            node:
-                              id: server-freshness
-                              component: ./components/external/core/status
-                              props:
-                                label: Running server
-                                source: { shell: python3 .dash-bored/scripts/freshness.py server, every: 15000, timeoutMs: 8000 }
+                            axis: horizontal
+                            first:
+                              node:
+                                id: server-freshness
+                                component: ./components/external/core/status
+                                props:
+                                  label: Running server
+                                  source: { shell: python3 .dash-bored/scripts/freshness.py server, every: 15000, timeoutMs: 8000 }
+                            second:
+                              node:
+                                id: db-schema
+                                component: ./components/external/core/status
+                                props:
+                                  label: Database schema
+                                  source: { shell: python3 .dash-bored/scripts/db-schema.py status, every: 30000, timeoutMs: 8000 }
                           second:
                             axis: horizontal
                             first:
@@ -115,6 +124,7 @@ root:
                             props:
                               items:
                                 - { name: Kill server, action: "process:kill-server" }
+                                - { name: Delete old database, action: "process:delete-db" }
                                 - { name: Restart server, action: "process:serve" }
                                 - { name: Reinstall CLI, action: "process:reinstall-cli" }
                                 - { name: Install skill, action: "process:install-skill" }
@@ -330,12 +340,21 @@ root:
                                   label: Kill the server listening on :8787
                                   command: 'pids=$(lsof -nP -t -iTCP:8787 -sTCP:LISTEN); [ -n "$pids" ] || { echo "nothing listening on :8787"; exit 0; }; ps -o pid,lstart,command -p $pids; kill $pids && echo "sent SIGTERM to $pids"; [ -f ~/Library/LaunchAgents/com.decisions.server.plist ] && echo "note: the launchd service com.decisions.server may restart it; decide server uninstall stops it for good"; true'
                             second:
-                              node:
-                                id: serve
-                                component: ./components/external/core/command
-                                props:
-                                  label: Serve GUI + API on :8787 (replaces a running server)
-                                  command: 'pids=$(lsof -nP -t -iTCP:8787 -sTCP:LISTEN); if [ -n "$pids" ]; then echo "stopping $pids"; kill $pids; while lsof -nP -t -iTCP:8787 -sTCP:LISTEN >/dev/null; do sleep 0.2; done; fi; exec decide serve --port 8787'
+                              axis: vertical
+                              first:
+                                node:
+                                  id: delete-db
+                                  component: ./components/external/core/command
+                                  props:
+                                    label: Delete the local database (shows what's stale, asks first, refuses while the server has it open)
+                                    command: python3 .dash-bored/scripts/db-schema.py delete
+                              second:
+                                node:
+                                  id: serve
+                                  component: ./components/external/core/command
+                                  props:
+                                    label: Serve GUI + API on :8787 (replaces a running server)
+                                    command: 'pids=$(lsof -nP -t -iTCP:8787 -sTCP:LISTEN); if [ -n "$pids" ]; then echo "stopping $pids"; kill $pids; while lsof -nP -t -iTCP:8787 -sTCP:LISTEN >/dev/null; do sleep 0.2; done; fi; exec decide serve --port 8787'
                         second:
                           axis: vertical
                           first:
