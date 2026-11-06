@@ -218,42 +218,59 @@ root:
                 second:
                   axis: horizontal
                   first:
-                    node:
-                      id: recent-panel
-                      component: ./components/external/core/group
-                      props:
-                        title: Recently decided
-                        description: Last 20 resolved, cancelled or expired decisions with what was picked. A green check means the requesting agent session was resumed; a red cross means resuming failed.
-                      children:
-                        axis: vertical
-                        first:
-                          node:
-                            id: recent-decisions
-                            component: ./components/external/core/list
-                            props:
-                              sort: source-order
-                              source: { shell: python3 .dash-bored/scripts/decisions-api.py recent, every: 30000, timeoutMs: 10000 }
-                              itemActions:
-                                - name: Open in browser
-                                  action: { run: "component:open-recent:run", with: { url: "${item.url}" } }
-                                - name: Show summary
-                                  action: { run: "component:show-recent:run", with: { decision: "${item.decision}" } }
-                        second:
+                    axis: vertical
+                    first:
+                      node:
+                        id: recent-panel
+                        component: ./components/external/core/group
+                        props:
+                          title: Recently decided
+                          description: Last 20 resolved, cancelled or expired decisions with what was picked. A green check means the requesting agent session was resumed; a red cross means resuming failed.
+                        children:
                           axis: vertical
                           first:
                             node:
-                              id: open-recent
-                              component: ./components/external/core/command
+                              id: recent-decisions
+                              component: ./components/external/core/list
                               props:
-                                label: Open selected decision
-                                command: 'open "$DASH_ITEM_URL"'
+                                sort: source-order
+                                source: { shell: python3 .dash-bored/scripts/decisions-api.py recent, every: 30000, timeoutMs: 10000 }
+                                itemActions:
+                                  - name: Open in browser
+                                    action: { run: "component:open-recent:run", with: { url: "${item.url}" } }
+                                  - name: Show summary
+                                    action: { run: "component:show-recent:run", with: { decision: "${item.decision}" } }
                           second:
-                            node:
-                              id: show-recent
-                              component: ./components/external/core/command
-                              props:
-                                label: Selected decision summary
-                                command: 'decide get --markdown "$DASH_ITEM_DECISION"'
+                            axis: vertical
+                            first:
+                              node:
+                                id: open-recent
+                                component: ./components/external/core/command
+                                props:
+                                  label: Open selected decision
+                                  command: 'open "$DASH_ITEM_URL"'
+                            second:
+                              node:
+                                id: show-recent
+                                component: ./components/external/core/command
+                                props:
+                                  label: Selected decision summary
+                                  command: 'decide get --markdown "$DASH_ITEM_DECISION"'
+                    second:
+                      node:
+                        id: goals-panel
+                        component: ./components/external/core/group
+                        props:
+                          title: Goals
+                          description: Active goals with the decisions toward them, and abandoned goals with how many decisions went into them. The map in the GUI (/map) shows how they connect.
+                        children:
+                          node:
+                            id: goal-list
+                            component: ./components/external/core/list
+                            props:
+                              sort: source-order
+                              filterByTags: true
+                              source: { shell: python3 .dash-bored/scripts/decisions-api.py goals, every: 30000, timeoutMs: 10000 }
                   second:
                     node:
                       id: delivery-panel

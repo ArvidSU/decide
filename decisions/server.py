@@ -312,6 +312,40 @@ class Handler(BaseHTTPRequestHandler):
     def ack_decision(self, did):
         return self.store.ack_decision(did, self.actor, self.scope)
 
+    # ------------------------------------------------------------------ goals and the map
+
+    @route("GET", "/api/goals")
+    def list_goals(self):
+        g = lambda k, d=None: self.qs.get(k, [d])[0]
+        return {"goals": self.store.list_goals(status=g("status"), space=g("space"), scope=self.scope)}
+
+    @route("POST", "/api/goals")
+    def create_goal(self):
+        return 201, self.store.create_goal(self._body(), self.actor, self.scope)
+
+    @route("GET", "/api/goals/([^/]+)")
+    def get_goal(self, gid):
+        return self.store.get_goal(gid, self.scope)
+
+    @route("PATCH", "/api/goals/([^/]+)")
+    def update_goal(self, gid):
+        return self.store.update_goal(gid, self._body(), self.actor, self.scope)
+
+    @route("GET", "/api/goals/([^/]+)/events")
+    def goal_events(self, gid):
+        return {"events": self.store.events(int(self.qs.get("after", [0])[0]), goal_id=gid,
+                                            limit=int(self.qs.get("limit", [1000])[0]), scope=self.scope)}
+
+    @route("GET", "/api/graph")
+    def graph(self):
+        g = lambda k, d=None: self.qs.get(k, [d])[0]
+        return self.store.graph(self.scope, space=g("space"), focus=g("focus"),
+                                everything=g("all", "") in ("1", "true"))
+
+    @route("GET", "/api/insights")
+    def insights(self):
+        return self.store.insights(self.scope, space=self.qs.get("space", [None])[0])
+
     # ------------------------------------------------------------------ options
 
     @route("POST", "/api/decisions/([^/]+)/options")

@@ -96,12 +96,46 @@ CREATE TABLE IF NOT EXISTS dependencies (
 );
 CREATE INDEX IF NOT EXISTS dependencies_by_upstream ON dependencies(depends_on);
 
+-- Why decisions are made. A goal serves larger goals (goal_links), from a vision down to technical
+-- goals, and decisions are steps toward goals (decision_goals). Everything linked is in one space.
+CREATE TABLE IF NOT EXISTS goals (
+  id TEXT PRIMARY KEY,
+  num INTEGER NOT NULL UNIQUE,
+  space TEXT NOT NULL REFERENCES spaces(name),
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  status_note TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  closed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS goals_by_space ON goals(space, status);
+
+CREATE TABLE IF NOT EXISTS goal_links (
+  goal_id TEXT NOT NULL REFERENCES goals(id),
+  serves TEXT NOT NULL REFERENCES goals(id),
+  position INTEGER NOT NULL,
+  PRIMARY KEY (goal_id, serves)
+);
+CREATE INDEX IF NOT EXISTS goal_links_by_parent ON goal_links(serves);
+
+CREATE TABLE IF NOT EXISTS decision_goals (
+  decision_id TEXT NOT NULL REFERENCES decisions(id),
+  goal_id TEXT NOT NULL REFERENCES goals(id),
+  position INTEGER NOT NULL,
+  PRIMARY KEY (decision_id, goal_id)
+);
+CREATE INDEX IF NOT EXISTS decision_goals_by_goal ON decision_goals(goal_id);
+
 -- Each space has its own hash chain; space NULL is the server's own (webhooks across all spaces).
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   space TEXT,
   ts TEXT NOT NULL,
   decision_id TEXT,
+  goal_id TEXT,
   type TEXT NOT NULL,
   actor TEXT NOT NULL,
   data TEXT NOT NULL,
@@ -109,6 +143,7 @@ CREATE TABLE IF NOT EXISTS events (
   hash TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_by_decision ON events(decision_id, seq);
+CREATE INDEX IF NOT EXISTS events_by_goal ON events(goal_id, seq);
 CREATE INDEX IF NOT EXISTS events_by_space ON events(space, seq);
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
   BEGIN SELECT RAISE(ABORT, 'events are immutable'); END;
@@ -188,6 +223,9 @@ DEADLINE_ACTOR = "deadline"
 DEPENDENCY_ACTOR = "dependency"
 # Events after which a decision that depends on this one may need another look.
 SETTLING_EVENTS = ("decision.resolved", "decision.reopened", "decision.cancelled", "decision.expired")
+GOAL_STATUSES = ("active", "achieved", "abandoned")
+# The event a goal's status change is logged as.
+GOAL_EVENTS = {"active": "goal.reactivated", "achieved": "goal.achieved", "abandoned": "goal.abandoned"}
 GENESIS = "0" * 64
 DEFAULT_SPACE = "default"
 SPACE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
@@ -264,6 +302,26 @@ def norm_id(raw: str) -> str:
     if not m:
         raise ApiError(404, f"no decision {raw!r}")
     return f"D-{int(m.group(1))}"
+
+
+def norm_goal_id(raw: str) -> str:
+    m = re.fullmatch(r"(?i)\s*(?:g-?)?(\d+)\s*", str(raw))
+    if not m:
+        raise ApiError(404, f"no goal {raw!r}")
+    return f"G-{int(m.group(1))}"
+
+
+def _goal_ids(value, key: str) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ApiError(400, f"{key} must be a list of goal ids, e.g. [\"G-3\"]")
+    return list(dict.fromkeys(norm_goal_id(v) for v in value))
+
+
+def _label_key(label: str) -> str:
+    """Options from different decisions count as the same option when their labels match like this."""
+    return " ".join(label.lower().split())
 
 
 def event_matches(patterns: list[str], event_type: str) -> bool:
@@ -400,44 +458,49 @@ class Store:
         return space
 
     @staticmethod
-    def _record(space, ts, decision_id, etype, actor, data, prev_hash) -> str:
-        record = {"space": space, "ts": ts, "decision_id": decision_id, "type": etype, "actor": actor,
-                  "data": data, "prev_hash": prev_hash}
+    def _record(space, ts, decision_id, goal_id, etype, actor, data, prev_hash) -> str:
+        record = {"space": space, "ts": ts, "decision_id": decision_id, "goal_id": goal_id, "type": etype,
+                  "actor": actor, "data": data, "prev_hash": prev_hash}
         return hashlib.sha256(canonical(record).encode()).hexdigest()
 
-    def _event(self, decision_id, etype, actor, data, space=None) -> int:
+    def _event(self, decision_id, etype, actor, data, space=None, goal_id=None) -> int:
         """Append to the space's hash chain and fan out webhook deliveries. Call inside tx().
-        An event about a decision goes to the decision's space; others to `space`."""
+        An event about a decision or a goal goes to its space; others to `space`."""
         if decision_id:
             space = self._decision_row(decision_id)["space"]
+        elif goal_id:
+            space = self._goal_row(goal_id)["space"]
         last = self.conn.execute("SELECT hash FROM events WHERE space IS ? ORDER BY seq DESC LIMIT 1",
                                  (space,)).fetchone()
         prev_hash = last["hash"] if last else GENESIS
         ts = now_iso()
-        digest = self._record(space, ts, decision_id, etype, actor, data, prev_hash)
+        digest = self._record(space, ts, decision_id, goal_id, etype, actor, data, prev_hash)
         seq = self.conn.execute(
-            "INSERT INTO events (space, ts, decision_id, type, actor, data, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?)",
-            (space, ts, decision_id, etype, actor, canonical(data), prev_hash, digest),
+            "INSERT INTO events (space, ts, decision_id, goal_id, type, actor, data, prev_hash, hash) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (space, ts, decision_id, goal_id, etype, actor, canonical(data), prev_hash, digest),
         ).lastrowid
         if not etype.startswith("webhook."):
-            self._fanout(seq, ts, decision_id, space, etype, actor, data.get("silenced", ()))
+            self._fanout(seq, ts, decision_id, space, etype, actor, data.get("silenced", ()), goal_id)
         return seq
 
-    def _fanout(self, seq, ts, decision_id, space, etype, actor, silenced=()):
+    def _fanout(self, seq, ts, decision_id, space, etype, actor, silenced=(), goal_id=None):
         subs = self.conn.execute(
             "SELECT * FROM subscriptions WHERE active=1 AND (decision_id=? OR "
             "(decision_id IS NULL AND (space IS NULL OR space=?)))",
             (decision_id, space),
         ).fetchall()
-        snapshot = None
+        snapshot = goal = None
         for sub in subs:
             if sub["id"] in silenced or not event_matches(json.loads(sub["events"]), etype):
                 continue
             if snapshot is None and decision_id:
                 snapshot = self._decision_dict(decision_id)
-            self._enqueue(sub, seq, ts, decision_id, etype, actor, snapshot)
+            if goal is None and goal_id:
+                goal = self._goal_dict(goal_id)
+            self._enqueue(sub, seq, ts, decision_id, etype, actor, snapshot, goal=goal)
 
-    def _enqueue(self, sub, seq, ts, decision_id, etype, actor, snapshot, replayed=False):
+    def _enqueue(self, sub, seq, ts, decision_id, etype, actor, snapshot, replayed=False, goal=None):
         require_ack = self.cfg.webhook_require_ack if sub["require_ack"] is None else bool(sub["require_ack"])
         delivery_id = "dlv_" + secrets.token_hex(8)
         payload = {
@@ -451,6 +514,8 @@ class Store:
             },
             "decision": snapshot,
         }
+        if goal:
+            payload["goal"] = goal
         self.conn.execute(
             """INSERT INTO deliveries (id, subscription_id, space, event_seq, decision_id, event_type, payload,
                status, require_ack, next_attempt_at, created_at) VALUES (?,?,?,?,?,?,?,'pending',?,?,?)""",
@@ -536,6 +601,7 @@ class Store:
             "pending_attribute_requests": pending,
             "options": options,
             "webhooks": [self._sub_dict(s) for s in subs],
+            "goals": [self._goal_ref(g) for g in self._decision_goal_ids(did)],
         }
         return out | self._dependency_view(did, row)
 
@@ -730,6 +796,7 @@ class Store:
             self._check_select_bounds(min_select, max_select)
             defs = self._clean_defs(_opt_type(body, "attributes", dict, {}))
             deps = self._check_dependencies(did, space, _dependencies(body.get("depends_on", [])), applies=True)
+            goals = self._check_goals(_goal_ids(body.get("goals", []), "goals"), space)
             if body.get("due_at") is not None:
                 due_at = _due_at(body["due_at"])
             else:
@@ -748,6 +815,7 @@ class Store:
                  key, ts, ts, canonical(r) if (r := _resume(body.get("resume"))) else None),
             )
             self._write_dependencies(did, deps)
+            self._write_decision_goals(did, goals)
             self._insert_options(did, _opt_type(body, "options", list, []))
             hooks = body.get("webhooks") or ([body["webhook"]] if body.get("webhook") else [])
             created_subs = [self._create_sub(h, did, space) for h in hooks]
@@ -812,7 +880,8 @@ class Store:
                                       "updated_at", "resolved_at", "due_at", "resolution",
                                       "pending_attribute_requests", "min_select", "max_select", "resume_state",
                                       "waiting_on", "outdated_by")
-                } | {"option_count": counts[0], "excluded_count": counts[1] or 0})
+                } | {"option_count": counts[0], "excluded_count": counts[1] or 0,
+                     "goals": [g["goal"] for g in d["goals"]]})
         return out
 
     def update_decision(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
@@ -856,6 +925,12 @@ class Store:
                     changes["depends_on"] = [old, val]
                     was_waiting = bool(self._open_upstreams(did))
                     self._write_dependencies(did, val)
+            if "goals" in body:
+                old = self._decision_goal_ids(did)
+                val = self._check_goals(_goal_ids(body["goals"], "goals"), row["space"])
+                if val != old:
+                    changes["goals"] = [old, val]
+                    self._write_decision_goals(did, val)
             if "links" in body:
                 val, old = _links(body["links"]), json.loads(row["links"])
                 if val != old:
@@ -1004,6 +1079,364 @@ class Store:
             self._touch(did)
             seq = self._event(did, "decision.commented", actor, {"text": text})
         return {"seq": seq, "text": text, "actor": actor}
+
+    # ------------------------------------------------------------------ goals
+
+    def _goal_row(self, gid: str, scope: Scope = ALL):
+        row = self.conn.execute("SELECT * FROM goals WHERE id=?", (gid,)).fetchone()
+        if not row or not scope.allows(row["space"]):
+            raise ApiError(404, f"no goal {gid}")
+        return row
+
+    def _goal_ref(self, gid: str) -> dict:
+        row = self.conn.execute("SELECT title, status FROM goals WHERE id=?", (gid,)).fetchone()
+        return {"goal": gid, "title": row["title"], "status": row["status"]}
+
+    def _decision_goal_ids(self, did: str) -> list[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT goal_id FROM decision_goals WHERE decision_id=? ORDER BY position", (did,))]
+
+    def _serves_ids(self, gid: str) -> list[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT serves FROM goal_links WHERE goal_id=? ORDER BY position", (gid,))]
+
+    def _check_goals(self, ids: list[str], space: str) -> list[str]:
+        """Goals a decision works toward, or a goal serves: they exist, in the same space."""
+        for gid in ids:
+            row = self.conn.execute("SELECT space FROM goals WHERE id=?", (gid,)).fetchone()
+            if not row or row["space"] != space:
+                raise ApiError(404, f"no goal {gid}")
+        return ids
+
+    def _check_serves(self, gid: str, space: str, ids: list[str]) -> list[str]:
+        self._check_goals(ids, space)
+        for up in ids:
+            if up == gid:
+                raise ApiError(400, "a goal can't serve itself")
+            # Following what it serves upward must never lead back here.
+            seen, todo = set(), [up]
+            while todo:
+                cur = todo.pop()
+                if cur == gid:
+                    raise ApiError(400, f"serving {up} would make a cycle: {up} already serves {gid}")
+                if cur not in seen:
+                    seen.add(cur)
+                    todo += self._serves_ids(cur)
+        return ids
+
+    def _write_decision_goals(self, did: str, ids: list[str]):
+        self.conn.execute("DELETE FROM decision_goals WHERE decision_id=?", (did,))
+        self.conn.executemany("INSERT INTO decision_goals (decision_id, goal_id, position) VALUES (?,?,?)",
+                              [(did, gid, i) for i, gid in enumerate(ids)])
+
+    def _write_serves(self, gid: str, ids: list[str]):
+        self.conn.execute("DELETE FROM goal_links WHERE goal_id=?", (gid,))
+        self.conn.executemany("INSERT INTO goal_links (goal_id, serves, position) VALUES (?,?,?)",
+                              [(gid, up, i) for i, up in enumerate(ids)])
+
+    def _outcome(self, row) -> list[str]:
+        """Labels of what a decision picked, if it's resolved."""
+        if row["status"] != "resolved" or not row["resolution"]:
+            return []
+        labels = dict(self.conn.execute("SELECT id, label FROM options WHERE decision_id=?", (row["id"],)).fetchall())
+        return [labels.get(s, s) for s in json.loads(row["resolution"])["selected"]]
+
+    def _goal_dict(self, gid: str, row=None) -> dict:
+        row = row or self._goal_row(gid)
+        subgoals = [{"goal": r["id"], "title": r["title"], "status": r["status"]} for r in self.conn.execute(
+            "SELECT g.* FROM goal_links l JOIN goals g ON g.id = l.goal_id WHERE l.serves=? ORDER BY g.num", (gid,))]
+        decisions = [{"decision": r["id"], "title": r["title"], "status": r["status"], "outcome": self._outcome(r),
+                      "waiting_on": self._open_upstreams(r["id"]) if r["status"] == "open" else []}
+                     for r in self.conn.execute(
+                         "SELECT d.* FROM decision_goals x JOIN decisions d ON d.id = x.decision_id "
+                         "WHERE x.goal_id=? ORDER BY d.num", (gid,))]
+        return {
+            "id": row["id"],
+            "space": row["space"],
+            "url": f"{self.cfg.public_url}/g/{row['id']}",
+            "title": row["title"],
+            "description": row["description"],
+            "status": row["status"],
+            "status_note": row["status_note"],
+            "tags": json.loads(row["tags"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "closed_at": row["closed_at"],
+            "serves": [self._goal_ref(up) for up in self._serves_ids(gid)],
+            "subgoals": subgoals,
+            "decisions": decisions,
+        }
+
+    def create_goal(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        title = _req_str(body, "title")
+        space = self._space_for(scope, body.get("space"))
+        status = _opt_type(body, "status", str, "active")
+        if status not in GOAL_STATUSES:
+            raise ApiError(400, f"status must be one of {', '.join(GOAL_STATUSES)}")
+        with self.tx():
+            num = self.conn.execute("SELECT COALESCE(MAX(num), 0) + 1 FROM goals").fetchone()[0]
+            gid, ts = f"G-{num}", now_iso()
+            serves = self._check_serves(gid, space, _goal_ids(body.get("serves", []), "serves"))
+            self.conn.execute(
+                """INSERT INTO goals (id, num, space, title, description, status, status_note, tags, created_at,
+                   updated_at, closed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (gid, num, space, title, _opt_type(body, "description", str, ""), status,
+                 _opt_type(body, "note", str, ""), canonical(_opt_type(body, "tags", list, [])), ts, ts,
+                 None if status == "active" else ts))
+            self._write_serves(gid, serves)
+            out = self._goal_dict(gid)
+            self._event(None, "goal.created", actor, {"goal": out}, goal_id=gid)
+            return out
+
+    def get_goal(self, raw_id: str, scope: Scope = ALL) -> dict:
+        gid = norm_goal_id(raw_id)
+        with self.lock:
+            return self._goal_dict(gid, self._goal_row(gid, scope))
+
+    def list_goals(self, status=None, space=None, scope: Scope = ALL) -> list[dict]:
+        cond, args = scope.where("space")
+        sql = "SELECT * FROM goals WHERE 1=1" + cond
+        if space:
+            sql += " AND space=?"
+            args.append(space)
+        if status and status != "all":
+            sql += " AND status=?"
+            args.append(status)
+        out = []
+        with self.lock:
+            for row in self.conn.execute(sql + " ORDER BY num", args).fetchall():
+                n = self.conn.execute(
+                    "SELECT COUNT(*) AS total, COALESCE(SUM(d.status='open'), 0) AS open, "
+                    "COALESCE(SUM(d.status='resolved'), 0) AS resolved "
+                    "FROM decision_goals x JOIN decisions d ON d.id = x.decision_id WHERE x.goal_id=?",
+                    (row["id"],)).fetchone()
+                out.append({k: row[k] for k in ("id", "space", "title", "status", "status_note", "created_at",
+                                                "updated_at", "closed_at")} | {
+                    "url": f"{self.cfg.public_url}/g/{row['id']}", "tags": json.loads(row["tags"]),
+                    "serves": self._serves_ids(row["id"]),
+                    "decisions": {"total": n["total"], "open": n["open"], "resolved": n["resolved"]}})
+        return out
+
+    def update_goal(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """Edit fields (one `goal.updated`) and/or change `status` with an optional `note` (`goal.achieved`,
+        `goal.abandoned`, `goal.reactivated`)."""
+        gid = norm_goal_id(raw_id)
+        with self.tx():
+            row = self._goal_row(gid, scope)
+            changes, sets = {}, {}
+            for field in ("title", "description"):
+                if field in body:
+                    val = _opt_type(body, field, str) or ""
+                    if field == "title" and not val.strip():
+                        raise ApiError(400, "title cannot be empty")
+                    if val != row[field]:
+                        changes[field], sets[field] = [row[field], val], val
+            if "tags" in body:
+                val, old = _opt_type(body, "tags", list, []), json.loads(row["tags"])
+                if val != old:
+                    changes["tags"], sets["tags"] = [old, val], canonical(val)
+            if "serves" in body:
+                old = self._serves_ids(gid)
+                val = self._check_serves(gid, row["space"], _goal_ids(body["serves"], "serves"))
+                if val != old:
+                    changes["serves"] = [old, val]
+                    self._write_serves(gid, val)
+            status = _opt_type(body, "status", str, row["status"])
+            if status not in GOAL_STATUSES:
+                raise ApiError(400, f"status must be one of {', '.join(GOAL_STATUSES)}")
+            note = _opt_type(body, "note", str, "")
+            ts = now_iso()
+            if status != row["status"]:
+                sets |= {"status": status, "status_note": note, "closed_at": None if status == "active" else ts}
+            if sets or changes:
+                sets["updated_at"] = ts
+                self.conn.execute(f"UPDATE goals SET {', '.join(f'{k}=?' for k in sets)} WHERE id=?",
+                                  (*sets.values(), gid))
+            if changes:
+                self._event(None, "goal.updated", actor, {"changes": changes}, goal_id=gid)
+            if status != row["status"]:
+                self._event(None, GOAL_EVENTS[status], actor, {"note": note, "previous_status": row["status"]},
+                            goal_id=gid)
+            return self._goal_dict(gid)
+
+    # ------------------------------------------------------------------ the map: goals and decisions as a graph
+
+    def _history(self, dids: set[str]) -> dict[str, dict]:
+        """Per decision: every pick it has made (`picks`, oldest first) and every `turn`: a pick it later dropped,
+        by changing to something else or by being withdrawn (cancelled or expired after a reopen)."""
+        out = {did: {"picks": [], "turns": []} for did in dids}
+        for ev in self.conn.execute(
+                "SELECT * FROM events WHERE type IN ('decision.resolved', 'decision.cancelled', 'decision.expired') "
+                "AND decision_id IS NOT NULL ORDER BY seq"):
+            h = out.get(ev["decision_id"])
+            if h is None:
+                continue
+            data = json.loads(ev["data"])
+            last = h["picks"][-1] if h["picks"] and not h.get("withdrawn") else None
+            if ev["type"] == "decision.resolved":
+                pick = {"selected": data["resolution"]["selected"], "seq": ev["seq"], "at": ev["ts"], "by": ev["actor"],
+                        "note": data["resolution"].get("note", "")}
+                if last and set(last["selected"]) != set(pick["selected"]):
+                    h["turns"].append({"from": last["selected"], "to": pick["selected"], "seq": ev["seq"],
+                                       "at": ev["ts"], "by": ev["actor"], "note": pick["note"], "withdrawn": False})
+                h["picks"].append(pick)
+                h["withdrawn"] = False
+            elif last:
+                h["turns"].append({"from": last["selected"], "to": [], "seq": ev["seq"], "at": ev["ts"],
+                                   "by": ev["actor"], "note": data.get("note", ""), "withdrawn": True})
+                h["withdrawn"] = True
+        return out
+
+    def _map_rows(self, scope: Scope, space: str | None):
+        cond, args = scope.where("space")
+        if space:
+            cond += " AND space=?"
+            args.append(space)
+        goals = {r["id"]: r for r in self.conn.execute("SELECT * FROM goals WHERE 1=1" + cond + " ORDER BY num", args)}
+        decisions = {r["id"]: r for r in
+                     self.conn.execute("SELECT * FROM decisions WHERE 1=1" + cond + " ORDER BY num", args)}
+        # Links never cross spaces, so the step's side decides whether a link is in view.
+        serves = [(r[0], r[1]) for r in self.conn.execute("SELECT goal_id, serves FROM goal_links ORDER BY goal_id, position")
+                  if r[0] in goals]
+        toward = [(r[0], r[1]) for r in self.conn.execute(
+            "SELECT decision_id, goal_id FROM decision_goals ORDER BY decision_id, position") if r[0] in decisions]
+        deps = [r for r in self.conn.execute("SELECT * FROM dependencies ORDER BY decision_id, position")
+                if r["decision_id"] in decisions]
+        return goals, decisions, serves, toward, deps
+
+    @staticmethod
+    def _reach(start: str, adjacent: dict[str, list[str]]) -> set[str]:
+        seen, todo = set(), list(adjacent.get(start, []))
+        while todo:
+            cur = todo.pop()
+            if cur not in seen:
+                seen.add(cur)
+                todo += adjacent.get(cur, [])
+        return seen
+
+    def graph(self, scope: Scope = ALL, space=None, focus=None, everything=False) -> dict:
+        """Goals and decisions as one graph. Each edge goes from a step to what it's for: a goal to the goals it
+        `serves`, a decision `toward` its goals, and a decision to the ones it `depends_on`. Decisions show up when
+        they're linked to a goal, directly or through dependencies (`everything`: all of them). With `focus`
+        (G-n or D-n), only what leads to it and what it leads to."""
+        with self.lock:
+            goals, decisions, serves, toward, deps = self._map_rows(scope, space)
+            edges = ([{"from": a, "to": b, "kind": "serves"} for a, b in serves] +
+                     [{"from": a, "to": b, "kind": "toward"} for a, b in toward] +
+                     [{"from": r["decision_id"], "to": r["depends_on"], "kind": "depends_on",
+                       "when": json.loads(r["when_selected"]) if r["when_selected"] else None} for r in deps])
+            up, down = {}, {}
+            for e in edges:
+                up.setdefault(e["from"], []).append(e["to"])
+                down.setdefault(e["to"], []).append(e["from"])
+            if focus:
+                fid = norm_goal_id(focus) if str(focus).strip().upper().startswith("G") else norm_id(focus)
+                if fid not in goals and fid not in decisions:
+                    raise ApiError(404, f"no {'goal' if fid.startswith('G') else 'decision'} {fid}")
+                keep = {fid} | self._reach(fid, up) | self._reach(fid, down)
+            elif everything:
+                keep = set(goals) | set(decisions)
+            else:
+                linked = {a for a, _ in toward}
+                related = {}
+                for r in deps:
+                    related.setdefault(r["decision_id"], []).append(r["depends_on"])
+                    related.setdefault(r["depends_on"], []).append(r["decision_id"])
+                for did in list(linked):
+                    linked |= self._reach(did, related)
+                keep = set(goals) | linked
+            history = self._history({d for d in decisions if d in keep})
+            nodes = [{"id": g, "kind": "goal", "space": r["space"], "title": r["title"], "status": r["status"]}
+                     for g, r in goals.items() if g in keep]
+            nodes += [{"id": d, "kind": "decision", "space": r["space"], "title": r["title"], "status": r["status"],
+                       "outcome": self._outcome(r), "changed": len(history[d]["turns"]),
+                       "waiting_on": self._open_upstreams(d) if r["status"] == "open" else []}
+                      for d, r in decisions.items() if d in keep]
+            return {"nodes": nodes, "edges": [e for e in edges if e["from"] in keep and e["to"] in keep],
+                    "focus": fid if focus else None}
+
+    def insights(self, scope: Scope = ALL, space=None) -> dict:
+        """What the history says. `dead_ends`: options, matched by label across decisions, that were picked and
+        later dropped, or picked for a goal that was abandoned, or keep being ruled out. `reversals`: each time a
+        decision changed its mind, with what led to it and the decided ones it pulled the rug from.
+        `abandoned_goals`: with how many decisions went into them."""
+        with self.lock:
+            goals, decisions, serves, toward, deps = self._map_rows(scope, space)
+            history = self._history(set(decisions))
+            goals_of, decisions_of = {}, {}
+            for did, gid in toward:
+                goals_of.setdefault(did, []).append(gid)
+                decisions_of.setdefault(gid, []).append(did)
+            upstream, downstream, subgoals = {}, {}, {}
+            for r in deps:
+                upstream.setdefault(r["decision_id"], []).append(r["depends_on"])
+                downstream.setdefault(r["depends_on"], []).append(r["decision_id"])
+            for gid, parent in serves:
+                subgoals.setdefault(parent, []).append(gid)
+            options = {}
+            for r in self.conn.execute("SELECT * FROM options ORDER BY decision_id, position"):
+                if r["decision_id"] in decisions:
+                    options.setdefault(r["decision_id"], []).append(r)
+            label = lambda did, oid: next((o["label"] for o in options.get(did, []) if o["id"] == oid), oid)
+
+            stats = {}
+            for did, row in decisions.items():
+                picked = {s for p in history[did]["picks"] for s in p["selected"]}
+                current = set(json.loads(row["resolution"])["selected"]) if row["status"] == "resolved" else set()
+                goal_status = {goals[g]["status"] for g in goals_of.get(did, []) if g in goals}
+                for o in options.get(did, []):
+                    s = stats.setdefault(_label_key(o["label"]), {
+                        "label": o["label"], "offered": 0, "ruled_out": 0, "picked": 0, "reversed": 0,
+                        "abandoned": 0, "achieved": 0, "decisions": []})
+                    s["offered"] += 1
+                    outcome = None
+                    if o["id"] in picked:
+                        s["picked"] += 1
+                        outcome = ("reopened" if row["status"] == "open" else "reversed" if o["id"] not in current
+                                   else "abandoned" if "abandoned" in goal_status
+                                   else "achieved" if "achieved" in goal_status else "held")
+                        if outcome in s:
+                            s[outcome] += 1
+                    elif o["excluded"]:
+                        s["ruled_out"] += 1
+                        outcome = "ruled_out"
+                    if outcome:
+                        s["decisions"].append({"decision": did, "title": row["title"], "outcome": outcome,
+                                               "reason": o["exclude_reason"] if outcome == "ruled_out" else None})
+            dead_ends = []
+            for s in stats.values():
+                s["dead_ends"] = s["reversed"] + s["abandoned"]
+                if s["dead_ends"] or s["ruled_out"] > 1:
+                    dead_ends.append(s | {"dead_end_rate": round(s["dead_ends"] / s["picked"], 2) if s["picked"] else None})
+            dead_ends.sort(key=lambda s: (-s["dead_ends"], -(s["dead_end_rate"] or 0), -s["ruled_out"], s["label"]))
+
+            reversals = []
+            for did, h in history.items():
+                ancestors = self._reach(did, upstream)
+                for t in h["turns"]:
+                    # Decisions that depended on this one and were already decided: the turn pulled the rug out.
+                    hit = sorted((d for d in self._reach(did, downstream)
+                                  if any(p["seq"] < t["seq"] for p in history[d]["picks"])),
+                                 key=lambda d: decisions[d]["num"])
+                    reversals.append({
+                        "decision": did, "title": decisions[did]["title"], "status": decisions[did]["status"],
+                        "from": [label(did, s) for s in t["from"]], "to": [label(did, s) for s in t["to"]],
+                        "withdrawn": t["withdrawn"], "at": t["at"], "by": t["by"], "note": t["note"],
+                        "upstream": sorted(ancestors, key=lambda d: decisions[d]["num"]),
+                        "goals": goals_of.get(did, []), "invalidated": hit})
+            reversals.sort(key=lambda x: x["at"], reverse=True)
+
+            abandoned = []
+            for gid, g in goals.items():
+                if g["status"] != "abandoned":
+                    continue
+                under = {gid} | self._reach(gid, subgoals)
+                spent = {d for u in under for d in decisions_of.get(u, [])}
+                abandoned.append({"goal": gid, "title": g["title"], "note": g["status_note"], "closed_at": g["closed_at"],
+                                  "decisions": len(spent),
+                                  "resolved": sum(1 for d in spent if decisions[d]["status"] == "resolved")})
+            abandoned.sort(key=lambda x: x["closed_at"] or "", reverse=True)
+            return {"dead_ends": dead_ends[:50], "reversals": reversals, "abandoned_goals": abandoned}
 
     # ------------------------------------------------------------------ resumption
 
@@ -1398,9 +1831,10 @@ class Store:
     @staticmethod
     def _event_dict(row) -> dict:
         return {"seq": row["seq"], "space": row["space"], "ts": row["ts"], "decision_id": row["decision_id"],
-                "type": row["type"], "actor": row["actor"], "data": json.loads(row["data"]), "hash": row["hash"]}
+                "goal_id": row["goal_id"], "type": row["type"], "actor": row["actor"], "data": json.loads(row["data"]),
+                "hash": row["hash"]}
 
-    def events(self, after=0, decision_id=None, types=None, limit=200, scope: Scope = ALL) -> list[dict]:
+    def events(self, after=0, decision_id=None, types=None, limit=200, scope: Scope = ALL, goal_id=None) -> list[dict]:
         cond, args = scope.where("space")
         sql, args = "SELECT * FROM events WHERE seq > ?" + cond, [after, *args]
         if decision_id:
@@ -1409,6 +1843,12 @@ class Store:
                 self._decision_row(did, scope)
             sql += " AND decision_id=?"
             args.append(did)
+        if goal_id:
+            gid = norm_goal_id(goal_id)
+            with self.lock:
+                self._goal_row(gid, scope)
+            sql += " AND goal_id=?"
+            args.append(gid)
         sql += " ORDER BY seq LIMIT ?"
         # Type filtering is done in Python so wildcard patterns work.
         args.append(limit if not types else 100000)
@@ -1507,8 +1947,8 @@ class Store:
                 c = chains.setdefault(row["space"], {"ok": True, "events": 0, "head": GENESIS})
                 if not c["ok"]:
                     continue
-                digest = self._record(row["space"], row["ts"], row["decision_id"], row["type"], row["actor"],
-                                      json.loads(row["data"]), row["prev_hash"])
+                digest = self._record(row["space"], row["ts"], row["decision_id"], row["goal_id"], row["type"],
+                                      row["actor"], json.loads(row["data"]), row["prev_hash"])
                 if row["prev_hash"] != c["head"] or digest != row["hash"]:
                     c |= {"ok": False, "broken_at": row["seq"]}
                     continue

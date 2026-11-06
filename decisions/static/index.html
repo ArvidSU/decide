@@ -12,12 +12,16 @@
     <header class="mobile-bar">
       <button class="icon-btn" data-action="drawer" aria-label="Show decisions" aria-controls="sidebar" aria-expanded="false" id="drawer-btn"></button>
       <div class="mb-title" id="mb-title">Decisions</div>
+      <a href="/map" data-nav class="icon-btn" aria-label="Map of goals and decisions" id="mb-map"></a>
       <a href="/settings" data-nav class="icon-btn" aria-label="Settings" id="mb-settings"></a>
     </header>
     <aside class="sidebar" id="sidebar" aria-label="Decisions">
       <header class="brand">
         <a href="/" data-nav class="logo"><span class="logo-mark" id="logo-mark"></span>Decisions</a>
-        <a href="/settings" data-nav class="icon-btn" id="settings-btn" title="Settings &amp; webhooks" aria-label="Settings"></a>
+        <span class="brand-actions">
+          <a href="/map" data-nav class="icon-btn" id="map-btn" title="Map: goals and the decisions toward them" aria-label="Map of goals and decisions"></a>
+          <a href="/settings" data-nav class="icon-btn" id="settings-btn" title="Settings &amp; webhooks" aria-label="Settings"></a>
+        </span>
       </header>
       <div class="tabs spaces" id="space-tabs" role="group" aria-label="Space" hidden></div>
       <div id="attention"></div>

@@ -103,6 +103,8 @@ def _until(iso: str) -> str:
 def _summary(d: dict) -> str:
     by_id = {o["id"]: o for o in d["options"]}
     lines = [f"{d['id']}  [{d['status']}]  {d['title']}", f"  {d['url']}"]
+    for g in d.get("goals", []):
+        lines.append(f"  toward {g['goal']} [{g['status']}] {g['title']}")
     for x in d.get("depends_on", []):
         cond = f", only applies if it picks {' or '.join(x['when'])}" if x["when"] else ""
         state = {"waiting": "locked until it's decided", "met": "settled", "unmet": "doesn't apply"}[x["state"]]
@@ -221,6 +223,8 @@ def cmd_create(args):
         body.setdefault("metadata", {}).update(dict(m.split("=", 1) for m in args.meta))
     if args.due:
         body["due_at"] = _parse_due(args.due)
+    if args.goal:
+        body["goals"] = [*body.get("goals", []), *args.goal]
     for dep in args.depends_on or []:
         up, _, when = dep.partition("=")
         body.setdefault("depends_on", []).append({"decision": up, **({"when": when.split(",")} if when else {})})
@@ -270,6 +274,110 @@ def cmd_list(args):
             due += f"  [outdated by {', '.join(d['outdated_by'])}]"
         space = f"{d['space']:<10} " if show_space else ""
         print(f"{d['id']:>7}  {space}{d['status']:<9} {d['title']}{pending}{due}")
+
+
+def _goal_line(g: dict) -> str:
+    n = g["decisions"]
+    counts = f"{n['total']} decision{'' if n['total'] == 1 else 's'}" + (f", {n['open']} open" if n["open"] else "")
+    return f"{g['id']:>6}  {g['status']:<9} {g['title']}  ({counts})"
+
+
+def cmd_goal_list(args):
+    q = f"status={args.status}" + (f"&space={args.space}" if args.space else "")
+    goals = Client().call("GET", f"/api/goals?{q}")["goals"]
+    # Indented under the goals they serve; a goal serving several shows under each.
+    ids = {g["id"] for g in goals}
+    children = {}
+    for g in goals:
+        for up in g["serves"] or [None]:
+            children.setdefault(up if up in ids else None, []).append(g)
+
+    def show(parent, depth):
+        for g in children.get(parent, []):
+            print("  " * depth + _goal_line(g))
+            show(g["id"], depth + 1)
+    show(None, 0)
+
+
+def cmd_goal_create(args):
+    body = {"title": args.title, "serves": args.serves or []}
+    if args.description:
+        body["description"] = args.description
+    if args.space or os.environ.get("DECISIONS_SPACE"):
+        body["space"] = args.space or os.environ["DECISIONS_SPACE"]
+    g = Client().call("POST", "/api/goals", body)
+    if args.quiet:
+        print(g["id"])
+    else:
+        _print(g)
+
+
+def cmd_goal_get(args):
+    g = Client().call("GET", f"/api/goals/{args.id}")
+    if args.json:
+        return _print(g)
+    print(f"{g['id']}  [{g['status']}]  {g['title']}\n  {g['url']}")
+    if g["status_note"]:
+        print(f"  {g['status']}: {g['status_note']}")
+    for x in g["serves"]:
+        print(f"  serves {x['goal']} [{x['status']}] {x['title']}")
+    for x in g["subgoals"]:
+        print(f"  subgoal {x['goal']} [{x['status']}] {x['title']}")
+    for x in g["decisions"]:
+        picked = f": {', '.join(x['outcome'])}" if x["outcome"] else ""
+        print(f"  decision {x['decision']} [{x['status']}] {x['title']}{picked}")
+    if g["description"]:
+        print("\n" + g["description"])
+
+
+def cmd_goal_set(args):
+    body = {k: v for k, v in (("title", args.title), ("description", args.description), ("status", args.status),
+                              ("note", args.note)) if v is not None}
+    if args.serves is not None:
+        body["serves"] = [x for x in args.serves if x]
+    _print(Client().call("PATCH", f"/api/goals/{args.id}", body))
+
+
+def cmd_map(args):
+    q = "&".join(x for x in (f"focus={args.focus}" if args.focus else "", f"space={args.space}" if args.space else "",
+                             "all=1" if args.all else "") if x)
+    g = Client().call("GET", f"/api/graph?{q}")
+    if args.json:
+        return _print(g)
+    verbs = {"serves": "serves", "toward": "toward", "depends_on": "depends on"}
+    out = {}
+    for e in g["edges"]:
+        out.setdefault(e["from"], []).append(f"{verbs[e['kind']]} {e['to']}")
+    for n in g["nodes"]:
+        picked = f" -> {', '.join(n['outcome'])}" if n.get("outcome") else ""
+        changed = f"  (changed {n['changed']}x)" if n.get("changed") else ""
+        print(f"{n['id']:>6}  {n['status']:<9} {n['title']}{picked}{changed}")
+        for e in out.get(n["id"], []):
+            print(f"{'':>8}{e}")
+
+
+def cmd_insights(args):
+    i = Client().call("GET", "/api/insights" + (f"?space={args.space}" if args.space else ""))
+    if args.json:
+        return _print(i)
+    print("Dead ends: options picked and later dropped, or picked for a goal that was abandoned")
+    for x in i["dead_ends"]:
+        print(f"  {x['label']}: {x['dead_ends']} of {x['picked']} picks were dead ends "
+              f"({x['reversed']} reversed, {x['abandoned']} for an abandoned goal), ruled out {x['ruled_out']} "
+              f"of {x['offered']} times offered  [{', '.join(d['decision'] for d in x['decisions'])}]")
+    print("\nReversals: decisions that changed their mind")
+    for x in i["reversals"]:
+        to = "withdrawn" if x["withdrawn"] else ", ".join(x["to"])
+        print(f"  {x['decision']} {x['title']}: {', '.join(x['from'])} -> {to}  ({x['at'][:10]}, {x['by']})"
+              + (f"  — {x['note']}" if x["note"] else ""))
+        if x["upstream"]:
+            print(f"      led there by: {', '.join(x['upstream'])}")
+        if x["invalidated"]:
+            print(f"      already decided on top of it: {', '.join(x['invalidated'])}")
+    print("\nAbandoned goals")
+    for x in i["abandoned_goals"]:
+        print(f"  {x['goal']} {x['title']}: {x['decisions']} decisions went into it"
+              + (f"  — {x['note']}" if x["note"] else ""))
 
 
 def cmd_wait(args):
@@ -889,6 +997,7 @@ def main(argv=None):
     s.add_argument("--meta", action="append", help="metadata key=value (repeatable)")
     s.add_argument("--due", help="deadline, after which the undecided decision expires: 36h, 2d, 1w, or an ISO "
                                  "timestamp (default: the server's deadline_days, normally 4 days)")
+    s.add_argument("--goal", action="append", metavar="G-N", help="a goal this decision is a step toward (repeatable)")
     s.add_argument("--depends-on", action="append", metavar="D-N[=OPT,...]",
                    help="locked until decision D-N is decided; with =OPT,... it only applies if D-N picks one "
                         "of those options, and is cancelled otherwise (repeatable)")
@@ -912,6 +1021,44 @@ def main(argv=None):
     s.add_argument("--limit", type=int, default=50)
     s.add_argument("--space", help="only this space")
     s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("goal", help="goals: why decisions are made, and the larger goals each one serves")
+    gsub = s.add_subparsers(dest="goal_cmd", required=True)
+    r = gsub.add_parser("list", help="goals as a tree, under the goals they serve")
+    r.add_argument("--status", default="active", help="active, achieved, abandoned or all")
+    r.add_argument("--space", help="only this space")
+    r.set_defaults(fn=cmd_goal_list)
+    r = gsub.add_parser("create", help="create a goal")
+    r.add_argument("title")
+    r.add_argument("--serves", action="append", metavar="G-N", help="a larger goal this one is a step toward (repeatable)")
+    r.add_argument("--description")
+    r.add_argument("--space", help="space to create it in (default: the token's space, or DECISIONS_SPACE)")
+    r.add_argument("--quiet", "-q", action="store_true", help="print only the goal id")
+    r.set_defaults(fn=cmd_goal_create)
+    r = gsub.add_parser("get", help="show a goal with what it serves, its subgoals and decisions")
+    r.add_argument("id")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(fn=cmd_goal_get)
+    r = gsub.add_parser("set", help="edit a goal, or mark it achieved / abandoned / active")
+    r.add_argument("id")
+    r.add_argument("--title")
+    r.add_argument("--description")
+    r.add_argument("--status", choices=["active", "achieved", "abandoned"])
+    r.add_argument("--note", help="why its status changed")
+    r.add_argument("--serves", nargs="*", metavar="G-N", help="replace the goals it serves (none: a top-level goal)")
+    r.set_defaults(fn=cmd_goal_set)
+
+    s = sub.add_parser("map", help="goals and decisions as a graph: what serves what")
+    s.add_argument("--focus", metavar="G-N|D-N", help="only what leads to it and what it leads to")
+    s.add_argument("--all", action="store_true", help="include decisions that aren't linked to a goal")
+    s.add_argument("--space", help="only this space")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_map)
+
+    s = sub.add_parser("insights", help="dead-end options, reversed decisions and abandoned goals")
+    s.add_argument("--space", help="only this space")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_insights)
 
     s = sub.add_parser("wait", help="block until a decision is resolved (long-poll; no inbound port needed)")
     s.add_argument("id")

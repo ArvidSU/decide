@@ -50,6 +50,16 @@ Make it easy to decide:
 
 Then tell the user the ID and link in one line, and don't also ask the question in chat.
 
+### Goals: why you're asking
+
+Every decision is a step toward a goal, and goals serve larger goals, from the business vision down to technical goals. Linking them builds a map the user analyzes later: which options tend to be dead ends, and which decisions led to a pivot. So before creating a decision:
+
+1. **Link it to its goal.** Run `decide goal list` (a tree of the active goals, `G-<n>`) and pass the goal the decision serves: `"goals": ["G-7"]` in the body, or `decide create … --goal G-7`. Pick the most specific goal that fits. A decision may serve more than one.
+2. **Create a goal only when none fits** and the goal is clear from the task: `decide goal create "Self-serve data import" --serves G-2 -q`. Always say which larger goal it `--serves`. Don't invent visions or strategy; if you don't know why the work matters, leave the decision unlinked and say so in `context`.
+3. **Learn from the history.** Run `decide insights` and check whether any option you're about to propose was a dead end before (picked and later reversed, picked for a goal that was then abandoned, or ruled out repeatedly). Still include it if it's genuinely right this time, but say in `context` what happened last time and why this time is different. `decide map --focus D-12` shows what led to a decision and what it led to.
+
+To revisit an earlier decision, **reopen and re-decide it** rather than creating a new one, so the change of mind is recorded where the analysis can see it. When you finish the work a goal describes, don't mark it achieved yourself; tell the user it may be done.
+
 ### Decisions that depend on each other
 
 The user's attention is the scarce resource. Never make them decide something that another open decision could make moot or change. Before creating a decision, run `decide list` and check whether it hangs on one that's still open (yours or another agent's). If it does, in order of preference:
@@ -102,6 +112,6 @@ Then run the `to keep waiting: …` command from the previous `decide wait` outp
 
 ## 4. Act on the decision
 
-`decide get D-12 --json` returns `resolution.selected` (option IDs), `selected_options`, and `resolution.note`. The note is the user's rationale or extra instructions; follow it. Where you act on the decision (commit, PR, Linear comment, a written summary), reference it as `[D-12: title](url)`.
+`decide get D-12 --json` returns `resolution.selected` (option IDs), `selected_options`, `resolution.note`, and the `goals` it serves. The note is the user's rationale or extra instructions; follow it. Where you act on the decision (commit, PR, Linear comment, a written summary), reference it as `[D-12: title](url)`.
 
 The user may revise a decision later (another `decision.resolved`, or `decision.reopened`). The latest resolution is authoritative. If `outdated_by` is non-empty, a decision this one depends on changed after it was made. Check with the user before acting on it. A revision may skip notifying you (e.g. a typo fix), so check `decide get` before acting on an older one.

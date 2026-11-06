@@ -34,6 +34,9 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 | **Machine token** | `dk_…`, for one machine in one space. Only its hash is stored, so it's shown once, when it's created or rolled. Rolling gives it a new secret and the old one stops working at once. Revoking deletes it. Settings → Machines shows when each was last used and whether that machine's resumer is online. Creating, rolling and revoking are logged in the space's chain, without the secret. |
 | **Decision** | `D-12`: title, context (markdown), source, options, `min_select`/`max_select` (default: pick exactly one; `"max_select": null` = any number), links, tags, metadata, `due_at`. Status `open` → `resolved` / `cancelled` / `expired`. Nothing is locked: you can edit, re-resolve or reopen at any time; every change is logged. |
 | **Deadline** | Every open decision has a `due_at`, by default 4 days after it's created (`deadline_days`). If nobody decides by then, it **expires**: status `expired`, event `decision.expired` (actor `deadline`). That's distinct from `cancelled`, which someone does on purpose. If nobody took action, it wasn't very important. Its waiters, webhooks and resumer are notified, the same as for a resolution. Extend it with `PATCH {"due_at": …}` or the GUI's +1 day / +4 days. Reopening an expired decision starts a new deadline. |
+| **Goal** | `G-3`: why decisions are made. Title, description (markdown), status `active` / `achieved` / `abandoned` (with a note on why), tags. A goal `serves` larger goals, so goals form a map from the business vision through strategic and product goals down to technical ones. A decision is a step `toward` one or more goals (`goals: ["G-3"]`). Links stay within a space, and cycles are refused. An open decision whose every goal was abandoned is flagged. |
+| **Map** | Goals and decisions as one graph: goal → the goals it serves, decision → its goals, decision → the decisions it depends on. Focus on any goal or decision to see everything that led to it and everything it led to. |
+| **Insights** | What the history says. **Dead ends**: options, matched by label across decisions, that were picked and later reversed or withdrawn, picked for a goal that was then abandoned, or keep being ruled out. **Changes of mind**: every time a decision was changed or withdrawn after it was made, with the decisions upstream of it (what led there) and the decided ones downstream (what it pulled the rug from). **Abandoned goals**: with how many decisions went into them. To keep this honest, revisit a decision by reopening it, not by creating a new one. |
 | **Option** | `label`, `description`, `url`, `image`, `attributes` (any JSON). The ID is yours (e.g. a SKU) or auto-assigned (`1`, `2`, …). |
 | **Attribute defs** | Optional hints per attribute key: `label`, `type` (`number`/`boolean`/`enum`/`tags`/`text`/`url`), `unit`, `better` (`lower`/`higher`), `description`. Without them the GUI infers types from the values. |
 | **Attribute request** | You ask for a new attribute in the GUI. The decision's `pending_attribute_requests` lists which options are missing it, and an `attributes.requested` webhook fires. The requester PATCHes the values in. |
@@ -53,6 +56,7 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 * Keyboard: `j`/`k` move, `space` select, `x` rule out, `/` search, `⌘/Ctrl+Enter` decide (listed under the options). Every rule-out offers Undo and Add reason; Alt-click Rule out to give the reason up front.
 * Resolved, expired and cancelled decisions open as a read-only record: the outcome and its reason, every option considered and the log. Reopen to change one. "Next open" jumps to the most urgent open decision.
 * Dependencies: a decision waiting on another says "Don't worry about this yet", links to the one to decide first, and can't be decided until then ("Decide anyway" removes the dependency). Its upstream lists what it affects, and as you select options the decide bar says what deciding would do: cancel, unlock, or flag a decided one for a second look. A decided decision whose upstream changed shows "Worth a second look", with "Still holds" to confirm it without waking its listeners. "Depends on…" (or ⌘K) adds one.
+* Map (the map icon, or ⌘K): the goal graph, laid out with what something is for above it. Hover or focus any node to light up what led to it and what it led to. Below it, the goals as an outline and the insights. A goal's page lists what it serves, its subgoals and the decisions toward it, with its own part of the map. A decision shows the goals it's toward under its title ("Goal…" links one, including after it's decided), and "Trace on the map".
 * Live: new options and attribute values appear as the agent adds them.
 * Settings: connect a machine, global webhooks (pick the events), delivery policy, log integrity.
 
@@ -67,11 +71,16 @@ so its origin is recognized. Cross-origin browser integrations are not supported
 
 | Method & path | |
 |---|---|
-| `POST /decisions` | Create. Body: `title`, `context`, `source`, `options[]`, `attributes{}`, `min_select`, `max_select`, `links[]`, `tags[]`, `metadata{}`, `due_at` (ISO 8601; default now + the space's `deadline_days`, counted from when it unlocks if it waits on another decision), `depends_on[]` (`"D-12"` or `{decision, when?: [option ids], note?}`; 409 if `when` can no longer be met), `idempotency_key` (per space), `webhooks[]`, `space` (default: the token's space, or `default` for the admin token). Returns 201, or 200 with the existing decision if `idempotency_key` matches. |
+| `POST /decisions` | Create. Body: `title`, `context`, `source`, `options[]`, `attributes{}`, `goals[]` (goal ids it's a step toward), `min_select`, `max_select`, `links[]`, `tags[]`, `metadata{}`, `due_at` (ISO 8601; default now + the space's `deadline_days`, counted from when it unlocks if it waits on another decision), `depends_on[]` (`"D-12"` or `{decision, when?: [option ids], note?}`; 409 if `when` can no longer be met), `idempotency_key` (per space), `webhooks[]`, `space` (default: the token's space, or `default` for the admin token). Returns 201, or 200 with the existing decision if `idempotency_key` matches. |
 | `GET /decisions?status=open&q=&tag=&source=&space=` | List (`status`: `open`, `resolved`, `cancelled`, `expired`, `all`), limited to the token's spaces |
 | `GET /decisions/{id}` | Full decision incl. options, resolution, `selected_options`, `pending_attribute_requests`, and dependencies: `depends_on` (each with the upstream's `status` and `state`: `waiting` / `met` / `unmet`), `waiting_on` (what locks it), `affects` (decisions depending on this one) and `outdated_by` (upstreams that changed after this was decided) |
 | `PATCH /decisions/{id}` | Edit any field (`metadata` merges; `null` removes a key; `depends_on` replaces the list, and dropping the last one it waits on unlocks it) |
 | `GET /decisions/{id}/markdown` | Markdown summary |
+| `GET /goals?status=&space=` · `POST /goals` | Goals with what each `serves` and its decision counts (`status`: `active`, `achieved`, `abandoned`, `all`). Create: `title`, `description`, `serves[]`, `tags[]`, `space`. |
+| `GET /goals/{id}` · `PATCH /goals/{id}` | Full goal with `serves`, `subgoals` and `decisions` (with their outcome). PATCH: `title`, `description`, `tags`, `serves` (replaces the list), `status` with an optional `note`. |
+| `GET /goals/{id}/events` | The goal's log: `goal.created`, `goal.updated`, `goal.achieved`, `goal.abandoned`, `goal.reactivated` |
+| `GET /graph?space=&focus=&all=1` | `{nodes, edges}`: goals and the decisions linked to them (directly or through dependencies; `all=1` adds the rest). Edges `serves`, `toward`, `depends_on` point from the step to what it's for. `focus=G-3` or `D-12`: only what leads to it and what it leads to. Decision nodes carry their `outcome` and how often they `changed` their mind. |
+| `GET /insights?space=` | `{dead_ends, reversals, abandoned_goals}` (see Insights above) |
 | `POST /decisions/{id}/options` | Add one, a list, or `{options: [...]}` |
 | `PATCH /decisions/{id}/options` | Bulk patch `[{id, attributes: {...}}]`; attributes merge, `null` deletes |
 | `PATCH` / `DELETE /decisions/{id}/options/{oid}` | Edit / remove one option |
@@ -90,7 +99,7 @@ so its origin is recognized. Cross-origin browser integrations are not supported
 
 ### Webhooks
 
-Subscription: `{url, secret?, events?, require_ack?, max_attempts?, refire_interval?}`. Default events: `decision.resolved`, `decision.reopened`, `decision.cancelled`, `decision.expired`, `attributes.requested`. Use `["*"]` or `["decision.*"]` for more, e.g. `decision.unblocked` (what it waited on is settled) and `dependency.changed` (something it depends on was reopened or decided again). If you omit `secret`, one is generated; it is returned only in the creating response.
+Subscription: `{url, secret?, events?, require_ack?, max_attempts?, refire_interval?}`. Default events: `decision.resolved`, `decision.reopened`, `decision.cancelled`, `decision.expired`, `attributes.requested`. Use `["*"]` or `["decision.*"]` for more, e.g. `decision.unblocked` (what it waited on is settled) and `dependency.changed` (something it depends on was reopened or decided again). Global webhooks can also hear `goal.*`; those payloads carry the goal as `goal` and `decision: null`. If you omit `secret`, one is generated; it is returned only in the creating response.
 
 ```http
 POST <your url>
@@ -213,7 +222,9 @@ Spaces and machine tokens live in the database, not here: manage them in Setting
 
 Answer attribute requests from the CLI with `decide fill D-12 < patches.json` (`[{"id", "attributes"}]`).
 
-Client commands (`decide create/get/list/wait/watch/fill/ack/verify/resumer/space/token`) find the server from `DECISIONS_URL` / `DECISIONS_TOKEN`, then `~/.config/decisions/client.toml` (written by `decide connect`), then `http://127.0.0.1:8787`. `DECISIONS_ACTOR` names who is acting; `DECISIONS_MACHINE` overrides the machine name.
+Goals from the CLI: `decide goal list` (a tree), `decide goal create TITLE --serves G-1`, `decide goal get G-3`, `decide goal set G-3 --status abandoned --note …`, `decide create … --goal G-3`, `decide map --focus D-12` and `decide insights`.
+
+Client commands (`decide create/get/list/wait/watch/fill/ack/verify/resumer/space/token/goal/map/insights`) find the server from `DECISIONS_URL` / `DECISIONS_TOKEN`, then `~/.config/decisions/client.toml` (written by `decide connect`), then `http://127.0.0.1:8787`. `DECISIONS_ACTOR` names who is acting; `DECISIONS_MACHINE` overrides the machine name.
 
 ## License
 

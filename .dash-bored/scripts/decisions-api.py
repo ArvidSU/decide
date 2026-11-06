@@ -3,7 +3,7 @@
 Usage: python3 .dash-bored/scripts/decisions-api.py <view>
 
 Views: server, resumer, chain, deliveries (status JSON); open, recent,
-delivery-list (list JSON); activity (chart JSON).
+delivery-list, goals (list JSON); activity (chart JSON).
 
 Reads the server from DECISIONS_URL (default http://127.0.0.1:8787) and sends
 DECISIONS_TOKEN as a bearer token when set. Read-only; stdlib only and
@@ -127,6 +127,8 @@ def open_list():
             bits.append("waiting on requester for: " + ", ".join(sorted(pending)))
         if d.get("waiting_on"):
             bits.append("locked until %s is decided" % ", ".join(d["waiting_on"]))
+        if d.get("goals"):
+            bits.append("toward " + ", ".join(d["goals"]))
         bits += ["from " + (d.get("source") or "unknown"), "opened " + ago(d.get("created_at"))]
         if d.get("due_at") and not d.get("waiting_on"):
             bits.append("expires " + d["due_at"][:16].replace("T", " ") + " UTC")
@@ -191,6 +193,28 @@ def delivery_list():
     out(items)
 
 
+def goals_list():
+    items = []
+    for g in get("/goals?status=all")["goals"]:
+        n = g["decisions"]
+        bits = ["%d decision%s" % (n["total"], "" if n["total"] == 1 else "s")]
+        if n["open"]:
+            bits.append("%d open" % n["open"])
+        if g["serves"]:
+            bits.append("serves " + ", ".join(g["serves"]))
+        if g["status"] != "active":
+            bits.append("%s %s" % (g["status"], ago(g.get("closed_at"))))
+        if g.get("status_note"):
+            bits.append("“%s”" % g["status_note"][:80])
+        items.append({"id": g["id"], "title": "%s · %s" % (g["id"], g["title"]), "detail": " · ".join(bits),
+                      "state": {"active": "pending" if n["open"] else "unknown", "achieved": "success",
+                                "abandoned": "closed"}[g["status"]],
+                      "tags": [g["status"]] + (g.get("tags") or []), "url": g["url"]})
+    # Active first, so what's being worked toward leads.
+    items.sort(key=lambda x: x["tags"][0] != "active")
+    out(items)
+
+
 def activity():
     days = 14
     today = datetime.now(timezone.utc).date()
@@ -220,7 +244,8 @@ def reason(exc):
 
 
 VIEWS = {"server": server, "resumer": resumer, "chain": chain, "deliveries": deliveries,
-         "open": open_list, "recent": recent_list, "delivery-list": delivery_list, "activity": activity}
+         "open": open_list, "recent": recent_list, "delivery-list": delivery_list, "goals": goals_list,
+         "activity": activity}
 
 if __name__ == "__main__":
     view = sys.argv[1] if len(sys.argv) > 1 else ""

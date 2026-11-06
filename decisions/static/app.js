@@ -27,6 +27,11 @@ const S = {
   notes: {},          // unsent reason per decision id
   stale: false,       // a live update arrived while you were typing; applied when you leave the field
   ui: {},             // per-decision UI state: filters, view, sort, keepUnknown, text
+  goals: [],          // every goal this token sees, with what each serves
+  goal: null,         // current goal page, with its events and its part of the map
+  goalEvents: [],
+  goalGraph: null,
+  editingGoal: false,
 };
 
 function storage(key, value) {
@@ -93,6 +98,8 @@ const ICONS = {
   play: '<path d="m6 3 14 9-14 9z"/>',
   lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
   unlock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.8-1.3"/>',
+  target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+  map: '<rect x="9" y="2" width="6" height="5" rx="1"/><rect x="2" y="17" width="6" height="5" rx="1"/><rect x="16" y="17" width="6" height="5" rx="1"/><path d="M12 7v5M5 17v-2.5A2.5 2.5 0 0 1 7.5 12h9a2.5 2.5 0 0 1 2.5 2.5V17"/>',
 };
 const icon = (name, size = 16) =>
   `<svg class="i" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ""}</svg>`;
@@ -188,8 +195,8 @@ function toast(msg, { undo, undoLabel, actions = [], error, info } = {}) {
 const fail = (e) => toast(e.message || String(e), { error: true });
 
 // In-page replacement for prompt()/confirm(). Resolves to the field's text ("" without a field),
-// or null when dismissed. `body` is HTML.
-function ask({ title, body = "", field, value = "", placeholder = "", type = "text", ok = "OK", cancel = "Cancel", danger = false }) {
+// or null when dismissed. `body` is HTML. With `choices` ([{value, label}]) the field is a select.
+function ask({ title, body = "", field, value = "", placeholder = "", type = "text", ok = "OK", cancel = "Cancel", danger = false, choices }) {
   return new Promise((done) => {
     const dlg = document.createElement("dialog");
     dlg.className = "dialog";
@@ -198,17 +205,18 @@ function ask({ title, body = "", field, value = "", placeholder = "", type = "te
       <h3 id="dlg-title">${esc(title)}</h3>
       ${body ? `<div class="dialog-body">${body}</div>` : ""}
       ${field !== undefined ? `<label class="dialog-field">${esc(field)}
-        <input class="input" name="v" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off"></label>` : ""}
+        ${choices ? `<select class="input" name="v">${choices.map((c) => `<option value="${esc(c.value)}" ${c.value === value ? "selected" : ""}>${esc(c.label)}</option>`).join("")}</select>`
+          : `<input class="input" name="v" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off">`}</label>` : ""}
       <div class="dialog-actions">
         ${cancel ? `<button type="button" class="btn" data-close>${esc(cancel)}</button>` : ""}
         <button class="btn ${danger ? "danger-fill" : "primary"}" value="ok">${esc(ok)}</button></div>
     </form>`;
     document.body.append(dlg);
-    const input = dlg.querySelector("input");
+    const input = dlg.querySelector("input, select");
     dlg.querySelector("[data-close]")?.addEventListener("click", () => dlg.close());
     dlg.addEventListener("close", () => { done(dlg.returnValue === "ok" ? (input?.value.trim() ?? "") : null); dlg.remove(); });
     dlg.showModal();
-    if (input) { input.focus(); input.select(); }
+    if (input) { input.focus(); input.select?.(); }
   });
 }
 const dialogOpen = () => !!document.querySelector("dialog[open]");
@@ -378,7 +386,9 @@ function valueHtml(v, m) {
 // ------------------------------------------------------------------ data loading
 
 async function loadList() {
-  S.list = (await api("GET", "/api/decisions?status=all&limit=500")).decisions;
+  const [list, goals] = await Promise.all([api("GET", "/api/decisions?status=all&limit=500"), api("GET", "/api/goals?status=all")]);
+  S.list = list.decisions;
+  S.goals = goals.goals;
   renderSidebar();
 }
 
@@ -432,6 +442,9 @@ async function poll() {
         if (S.d && r.events.some((e) => e.decision_id === S.d.id)) {
           if (!isTyping()) await loadDecision(S.d.id, { keepSelection: true });
           else S.stale = true;
+        } else if ((S.goal || location.pathname === "/map") && !isTyping() && !dialogOpen()) {
+          // The goal page and the map show decisions too, so any change can matter there.
+          await (S.goal ? loadGoal(S.goal.id) : renderMap());
         }
       }
       if (S.offline) { S.offline = false; $("#conn").hidden = true; await loadList(); if (S.d && !isTyping()) await loadDecision(S.d.id, { keepSelection: true }); }
@@ -465,13 +478,16 @@ function renderError(e, retry = "retry") {
 async function route() {
   const path = location.pathname;
   drawer(false);
-  const want = path.match(/^\/d\/([^/]+)/);
-  if (want && S.d?.id !== decodeURIComponent(want[1])) renderSkeleton();
   const m = path.match(/^\/d\/([^/]+)/);
+  const gm = path.match(/^\/g\/([^/]+)/);
+  if ((m && S.d?.id !== decodeURIComponent(m[1])) || (gm && S.goal?.id !== decodeURIComponent(gm[1]))) renderSkeleton();
   try {
-    if (m) return await loadDecision(decodeURIComponent(m[1]));
+    if (m) { S.goal = null; return await loadDecision(decodeURIComponent(m[1])); }
     S.d = null;
+    if (gm) return await loadGoal(decodeURIComponent(gm[1]));
+    S.goal = null;
     renderSidebar();
+    if (path === "/map") return await renderMap();
     if (path === "/settings") return await renderSettings();
     const first = S.list.filter((d) => actionable(d) && inSpace(d)).sort(byDeadline)[0];
     if (first) return navigate(`/d/${first.id}`, true);
@@ -510,7 +526,9 @@ function renderSidebar() {
   setHtml($("#status-tabs"), Object.keys(STATUS_NAMES).map((t) =>
     `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && open.length ? "has-open" : ""}" data-status="${t}" aria-pressed="${S.status === t}" title="${S.counts[t]} ${STATUS_NAMES[t].toLowerCase()}${t === "open" && later ? `, ${later} waiting on another decision` : ""}">${STATUS_NAMES[t]}${t === "open" && open.length ? `<span class="n">${open.length}</span>` : ""}</button>`).join(""));
   $("#settings-btn").classList.toggle("active", location.pathname === "/settings");
-  document.title = (open.length ? `(${open.length}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : "Decisions");
+  $("#map-btn").classList.toggle("active", location.pathname === "/map" || !!S.goal);
+  document.title = (open.length ? `(${open.length}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : S.goal ? `${S.goal.id} · ${S.goal.title}`
+    : location.pathname === "/map" ? "Map" : "Decisions");
   setHtml($("#mb-title"), `Decisions${open.length ? `<span class="n" aria-label="${open.length} open">${open.length}</span>` : ""}`);
   setHtml($("#attention"), open.length
     ? `<a href="/d/${open[0].id}" data-nav class="attention ${urgency(open[0])}" title="Undecided decisions expire at their deadline">
@@ -592,6 +610,7 @@ const HOOK_EVENTS = {
   "Activity": { "decision.created": "Created", "decision.updated": "Edited or deadline moved", "decision.commented": "Commented", "attributes.requested": "Attributes requested" },
   "Options": { "options.added": "Options added", "options.updated": "Options updated", "options.excluded": "Options ruled out" },
   "Dependencies": { "decision.unblocked": "Unlocked: what it waited on is settled", "dependency.changed": "Something it depends on changed" },
+  "Goals": { "goal.created": "Goal created", "goal.updated": "Goal edited", "goal.achieved": "Goal achieved", "goal.abandoned": "Goal abandoned", "goal.reactivated": "Goal active again" },
 };
 
 async function renderSettings() {
@@ -805,6 +824,7 @@ function renderDecision() {
     ${headerHtml(d)}
     <div id="deadline-card">${deadlineHtml(d)}</div>
     <div id="resume-card">${resumeHtml(d)}</div>
+    ${goalGoneHtml(d)}
     <div id="deps-panel">${depsHtml(d)}</div>
     <section class="block" aria-labelledby="opts-h">
       <div class="block-head">
@@ -849,6 +869,7 @@ function renderClosed(d) {
     ${crumbsHtml(d)}
     <h1 class="d-title">${esc(d.title)}</h1>
     <div class="d-sub">${subHtml(d)}</div>
+    ${towardHtml(d)}
     ${outcomeHtml(d)}
     ${outdatedHtml(d)}
     <div id="resume-card">${resumeHtml(d)}</div>
@@ -856,6 +877,7 @@ function renderClosed(d) {
       ${r ? `<button class="btn primary" data-action="copy-provenance" title="Copy the choice, reason and link, e.g. for a commit message or PR">${icon("copy", 15)}Copy decision record</button>` : ""}
       <button class="btn" data-action="copy-md" title="Copy a markdown summary with the options table">Copy summary</button>
       <button class="btn ${r ? "ghost" : "primary"}" data-action="reopen">${icon("rotate", 15)}Reopen</button>
+      ${d.goals.length ? "" : `<button class="btn ghost" data-action="add-goal" title="Link it to the goal it was a step toward">${icon("target", 15)}Goal…</button>`}
       <span class="spacer"></span>
       ${others.length ? `<a class="btn ghost" href="/d/${esc(others[0].id)}" data-nav title="${esc(others[0].title)}">Next open: ${esc(others[0].id)}${icon("arrow-right", 15)}</a>` : ""}
     </div>
@@ -958,10 +980,12 @@ function headerHtml(d) {
       <div style="min-width:0">
         <h1 class="d-title">${esc(d.title)}</h1>
         <div class="d-sub">${subHtml(d)}</div>
+        ${towardHtml(d)}
       </div>
       <div class="d-actions">
         <button class="btn small" data-action="copy-md" title="Copy a markdown summary with the options table">${icon("copy", 14)}Copy summary</button>
         <button class="btn small ghost" data-action="edit">${icon("pencil", 14)}Edit</button>
+        ${d.goals.length ? "" : `<button class="btn small ghost" data-action="add-goal" title="Link it to the goal it's a step toward">${icon("target", 14)}Goal…</button>`}
         <button class="btn small ghost" data-action="add-dep" title="Lock this until another decision is made">${icon("link", 14)}Depends on…</button>
         <button class="btn small ghost danger" data-action="cancel-decision" title="Withdraw it without picking anything">${icon("ban", 14)}Cancel</button>
       </div>
@@ -1346,9 +1370,14 @@ function eventText(e) {
       const due = x.changes.due_at?.[1];
       const rest = Object.keys(x.changes).filter((k) => k !== "due_at");
       const deps = x.changes.depends_on && x.changes.depends_on[1].map((y) => y.decision);
+      const [was, now] = x.changes.goals || [[], []];
+      const linked = now.filter((g) => !was.includes(g)), unlinked = was.filter((g) => !now.includes(g));
+      const other = rest.filter((k) => k !== "depends_on" && k !== "goals");
       return [due ? `moved the deadline to <strong title="${esc(fullTime(due))}">${esc(whenTime(due))}</strong>` : "",
               deps ? (deps.length ? `made it depend on <strong>${esc(deps.join(", "))}</strong>` : "removed its dependencies") : "",
-              rest.filter((k) => k !== "depends_on").length ? `edited the ${esc(rest.filter((k) => k !== "depends_on").join(", "))}` : ""].filter(Boolean).join(" and ");
+              linked.length ? `linked it to <strong>${esc(linked.map(goalLabel).join(", "))}</strong>` : "",
+              unlinked.length ? `unlinked it from <strong>${esc(unlinked.join(", "))}</strong>` : "",
+              other.length ? `edited the ${esc(other.join(", "))}` : ""].filter(Boolean).join(" and ");
     }
     case "decision.resolved": return `${x.previous_status !== "resolved" ? "decided" : String(x.previous_resolution?.selected) === String(x.resolution.selected) ? "confirmed" : "changed the decision to"} <strong>${esc(x.resolution.selected.map(label).join(", "))}</strong>${x.resolution.note ? quote(x.resolution.note) : ""}${x.resolution.filters ? `<div class="sub">Filters: ${esc(x.resolution.filters)}</div>` : ""}${x.silenced ? `<div class="sub">Didn't notify ${esc(x.silenced.join(", "))}</div>` : ""}`;
     case "decision.reopened": return `reopened it${x.due_at ? ` with a new deadline, <span title="${esc(fullTime(x.due_at))}">${esc(whenTime(x.due_at))}</span>` : ""}${x.note ? quote(x.note) : ""}`;
@@ -1384,6 +1413,393 @@ function activityHtml(d) {
         <details><summary>Technical details</summary><div class="tech">#${e.seq} · ${esc(e.type)} · hash ${esc(e.hash.slice(0, 16))}…</div><pre>${esc(JSON.stringify(e.data, null, 2))}</pre></details></div>
     </li>`).join("")}</ul>`;
 }
+
+// ------------------------------------------------------------------ goals and the map
+
+const GOAL_STATUS = { active: "Active", achieved: "Achieved", abandoned: "Abandoned" };
+const goalIcon = (g, size = 14) => `<span class="gi ${esc(g.status)}" aria-label="${esc(GOAL_STATUS[g.status] || g.status)} goal">${icon("target", size)}</span>`;
+const goalsIn = (space) => S.goals.filter((g) => g.space === space);
+const goalLabel = (id) => { const g = S.goals.find((x) => x.id === id); return g ? `${g.id} · ${g.title}` : id; };
+
+// Goals a goal leads up to through what it serves, so nothing can be made to serve its own subgoal.
+function goalAncestors(id, seen = new Set()) {
+  for (const up of S.goals.find((g) => g.id === id)?.serves || []) if (!seen.has(up)) { seen.add(up); goalAncestors(up, seen); }
+  return seen;
+}
+function goalDescendants(id) {
+  const out = new Set();
+  const walk = (x) => S.goals.filter((g) => g.serves.includes(x)).forEach((g) => { if (!out.has(g.id)) { out.add(g.id); walk(g.id); } });
+  walk(id);
+  return out;
+}
+
+// What a goal-picking dialog offers: active goals in the space, minus those that would make no sense.
+async function pickGoal({ title, body, space, exclude = new Set(), ok }) {
+  const choices = goalsIn(space).filter((g) => g.status === "active" && !exclude.has(g.id))
+    .map((g) => ({ value: g.id, label: `${g.id} · ${g.title}` }));
+  if (!choices.length) { toast("No goal to pick: create one on the Map first", { info: true }); return null; }
+  return ask({ title, body, field: "Goal", choices, ok });
+}
+
+// Layered layout: what something is for sits above it. A goal sits below the goals it serves; a decision
+// below its goals and the decisions it depends on. Decisions without either start below every goal.
+const MAP = { w: 200, h: 84, gx: 20, gy: 56, pad: 20 };
+
+function layoutMap(g) {
+  const nodes = new Map(g.nodes.map((n) => [n.id, { ...n, ups: [], downs: [] }]));
+  const edges = g.edges.filter((e) => nodes.has(e.from) && nodes.has(e.to));
+  for (const e of edges) { nodes.get(e.from).ups.push(e.to); nodes.get(e.to).downs.push(e.from); }
+  const rank = new Map();
+  let floor = 0;
+  const rankOf = (id) => {
+    if (!rank.has(id)) {
+      const n = nodes.get(id);
+      rank.set(id, 0);  // guards against a cycle, which the server refuses anyway
+      rank.set(id, n.ups.length ? 1 + Math.max(...n.ups.map(rankOf)) : n.kind === "goal" ? 0 : floor);
+    }
+    return rank.get(id);
+  };
+  const all = [...nodes.values()].sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "goal" ? -1 : 1) || num(a.id) - num(b.id));
+  all.filter((n) => n.kind === "goal").forEach((n) => rankOf(n.id));
+  floor = Math.max(-1, ...all.filter((n) => n.kind === "goal").map((n) => rank.get(n.id))) + 1;
+  all.forEach((n) => rankOf(n.id));
+  const layers = [];
+  for (const n of all) (layers[rank.get(n.id)] ||= []).push(n);
+  const step = MAP.w + MAP.gx;
+  const x = new Map();
+  layers.forEach((l) => l?.forEach((n, i) => x.set(n.id, i * step)));
+  const mean = (ids) => ids.reduce((s, id) => s + x.get(id), 0) / ids.length;
+  // Order each layer by where its neighbours are (fewer crossings), then pull nodes toward them without overlapping.
+  for (let pass = 0; pass < 6; pass++) {
+    const down = pass % 2 === 0;
+    for (const layer of down ? layers : [...layers].reverse()) {
+      if (!layer) continue;
+      const want = new Map(layer.map((n) => { const near = down ? n.ups : n.downs; return [n.id, near.length ? mean(near) : x.get(n.id)]; }));
+      layer.sort((a, b) => want.get(a.id) - want.get(b.id));
+      let at = -Infinity;
+      for (const n of layer) { at = Math.max(want.get(n.id), at + step); x.set(n.id, at); }
+      for (let i = layer.length - 2; i >= 0; i--) x.set(layer[i].id, Math.min(x.get(layer[i].id), x.get(layer[i + 1].id) - step));
+    }
+  }
+  const minX = Math.min(...x.values());
+  const at = new Map(all.map((n) => [n.id, { x: x.get(n.id) - minX + MAP.pad, y: MAP.pad + rank.get(n.id) * (MAP.h + MAP.gy) }]));
+  return {
+    nodes: all, edges, at,
+    width: Math.max(...[...at.values()].map((p) => p.x)) + MAP.w + MAP.pad,
+    height: (layers.length - 1) * (MAP.h + MAP.gy) + MAP.h + 2 * MAP.pad,
+  };
+}
+const num = (id) => Number(String(id).replace(/\D/g, ""));
+
+function mapNodeHtml(n, p, focus) {
+  const goal = n.kind === "goal";
+  const sub = goal ? (n.status === "active" ? "" : GOAL_STATUS[n.status])
+    : n.status === "resolved" ? `→ ${n.outcome.join(", ")}`
+    : isWaiting(n) ? `after ${n.waiting_on.join(", ")}` : n.status === "open" ? "Undecided" : n.status[0].toUpperCase() + n.status.slice(1);
+  return `<a href="/${goal ? "g" : "d"}/${esc(n.id)}" data-nav class="mnode ${n.kind} ${esc(n.status)} ${n.id === focus ? "focus" : ""}" data-node="${esc(n.id)}"
+      style="left:${p.x}px;top:${p.y}px" title="${esc(`${n.id}: ${n.title}`)}">
+    <span class="mn-top">${goal ? icon("target", 12) : statusIcon(n, 12)}<span>${goal ? "Goal " : ""}${esc(n.id)}</span>
+      ${n.changed ? `<span class="mn-changed" title="Changed its mind ${n.changed} time${n.changed > 1 ? "s" : ""}">${icon("rotate", 11)}${n.changed}</span>` : ""}</span>
+    <span class="mn-title">${esc(n.title)}</span>
+    ${sub ? `<span class="mn-sub">${esc(sub)}</span>` : ""}</a>`;
+}
+
+function mapHtml(g, { focus } = {}) {
+  if (!g.nodes.length) return "";
+  const L = layoutMap(g);
+  const { w, h } = MAP;
+  const paths = L.edges.map((e) => {
+    const a = L.at.get(e.from), b = L.at.get(e.to);
+    const x1 = a.x + w / 2, y1 = a.y, x2 = b.x + w / 2, y2 = b.y + h, m = (y1 + y2) / 2;
+    return `<path class="medge ${e.kind}" data-from="${esc(e.from)}" data-to="${esc(e.to)}" d="M${x1} ${y1}C${x1} ${m} ${x2} ${m} ${x2} ${y2}"/>`;
+  }).join("");
+  return `<div class="map-scroll"><div class="map" style="width:${L.width}px;height:${L.height}px">
+    <svg class="medges" width="${L.width}" height="${L.height}" aria-hidden="true">${paths}</svg>
+    ${L.nodes.map((n) => mapNodeHtml(n, L.at.get(n.id), focus)).join("")}</div></div>`;
+}
+
+const mapLegend = () => `<div class="map-legend" aria-hidden="true">
+  <span><i class="lg goal"></i>Goal</span><span><i class="lg decision"></i>Decision</span>
+  <span><svg width="26" height="8"><path class="medge toward" d="M0 4H26"/></svg>step toward</span>
+  <span><svg width="26" height="8"><path class="medge depends_on" d="M0 4H26"/></svg>depends on</span>
+  <span>${icon("rotate", 12)}changed its mind</span></div>`;
+
+// Hovering or focusing a node lights up everything that led to it and everything it led to.
+function bindMaps(root = $("#main")) {
+  root.querySelectorAll(".map").forEach((map) => {
+    const ups = {}, downs = {};
+    map.querySelectorAll(".medge").forEach((p) => { (ups[p.dataset.from] ||= []).push(p.dataset.to); (downs[p.dataset.to] ||= []).push(p.dataset.from); });
+    const reach = (id, adj, seen) => { for (const n of adj[id] || []) if (!seen.has(n)) { seen.add(n); reach(n, adj, seen); } return seen; };
+    let current = null;
+    const trace = (id) => {
+      if (id === current) return;
+      current = id;
+      map.classList.toggle("tracing", !!id);
+      if (!id) return;
+      const keep = new Set([id, ...reach(id, ups, new Set()), ...reach(id, downs, new Set())]);
+      map.querySelectorAll(".mnode").forEach((n) => n.classList.toggle("lit", keep.has(n.dataset.node)));
+      map.querySelectorAll(".medge").forEach((p) => p.classList.toggle("lit", keep.has(p.dataset.from) && keep.has(p.dataset.to)));
+    };
+    map.addEventListener("pointerover", (e) => trace(e.target.closest(".mnode")?.dataset.node || null));
+    map.addEventListener("pointerleave", () => trace(null));
+    map.addEventListener("focusin", (e) => trace(e.target.closest(".mnode")?.dataset.node || null));
+    map.addEventListener("focusout", () => trace(null));
+    // Start with the focused node in view.
+    const f = map.querySelector(".mnode.focus");
+    if (f) { const sc = map.parentElement; sc.scrollLeft = f.offsetLeft - sc.clientWidth / 2 + MAP.w / 2; }
+  });
+}
+
+// Goals as an outline: each under the goals it serves (one serving several shows under each).
+function goalTreeHtml(goals) {
+  const ids = new Set(goals.map((g) => g.id));
+  const under = (parent) => goals.filter((g) => parent ? g.serves.includes(parent) : !g.serves.some((s) => ids.has(s)));
+  const row = (g) => {
+    const n = g.decisions;
+    const kids = under(g.id);
+    return `<li><a href="/g/${esc(g.id)}" data-nav class="gt-row ${esc(g.status)}">${goalIcon(g)}<span class="gt-id">${esc(g.id)}</span><span class="gt-title">${esc(g.title)}</span>
+      <span class="gt-meta">${g.status !== "active" ? `${GOAL_STATUS[g.status]} · ` : ""}${n.total ? `${n.total} decision${n.total === 1 ? "" : "s"}${n.open ? `, ${n.open} open` : ""}` : "no decisions yet"}</span></a>
+      ${kids.length ? `<ul>${kids.map(row).join("")}</ul>` : ""}</li>`;
+  };
+  return `<ul class="goal-tree">${under(null).map(row).join("")}</ul>`;
+}
+
+const refChip = (id, title) => `<a class="chip ref" href="/${id.startsWith("G") ? "g" : "d"}/${esc(id)}" data-nav title="${esc(title || "")}">${esc(id)}</a>`;
+
+function insightsHtml(ins) {
+  const titleOf = (id) => S.list.find((d) => d.id === id)?.title || S.goals.find((g) => g.id === id)?.title || "";
+  const chips = (ids) => ids.map((id) => refChip(id, titleOf(id))).join("");
+  const dead = ins.dead_ends.length ? `<div class="table-scroll"><table class="plain insight-table">
+      <tr><th>Option</th><th class="num" title="Decisions that picked it">Picked</th><th class="num" title="Picked, then changed or withdrawn">Reversed</th>
+        <th class="num" title="Picked for a goal that was later abandoned">Goal abandoned</th><th class="num" title="Ruled out, of the times it was offered">Ruled out</th><th>Where</th></tr>
+      ${ins.dead_ends.map((x) => `<tr><td><strong>${esc(x.label)}</strong>${x.dead_end_rate != null ? `<div class="muted small">${Math.round(x.dead_end_rate * 100)}% of picks were dead ends</div>` : ""}</td>
+        <td class="num">${x.picked}</td><td class="num ${x.reversed ? "bad" : ""}">${x.reversed || "—"}</td><td class="num ${x.abandoned ? "bad" : ""}">${x.abandoned || "—"}</td>
+        <td class="num">${x.ruled_out ? `${x.ruled_out} of ${x.offered}` : "—"}</td>
+        <td><div class="chips">${x.decisions.map((d) => `<a class="chip ref ${esc(d.outcome)}" href="/d/${esc(d.decision)}" data-nav title="${esc(`${d.title}: ${d.outcome.replace("_", " ")}${d.reason ? ` (${d.reason})` : ""}`)}">${esc(d.decision)}</a>`).join("")}</div></td></tr>`).join("")}
+    </table></div>` : `<p class="muted small">None yet. Options show up here once picking them didn't hold, or they keep being ruled out.</p>`;
+  const turns = ins.reversals.length ? ins.reversals.map((x) => `<div class="reversal">
+      <div class="rv-head"><a href="/d/${esc(x.decision)}" data-nav class="dep-title"><span class="dep-id">${esc(x.decision)}</span><span class="dep-name">${esc(x.title)}</span></a>
+        <span class="muted small nowrap" title="${esc(fullTime(x.at))}">${esc(x.by)} · ${ago(x.at)}</span></div>
+      <div class="rv-turn"><s>${esc(x.from.join(", "))}</s>${icon("arrow-right", 14)}<strong>${x.withdrawn ? "withdrawn" : esc(x.to.join(", "))}</strong></div>
+      ${x.note ? `<div class="rv-note">“${esc(x.note)}”</div>` : ""}
+      <div class="rv-links">
+        ${x.upstream.length ? `<span>Led there by ${chips(x.upstream)}</span>` : ""}
+        ${x.invalidated.length ? `<span class="warn">Already decided on top of it ${chips(x.invalidated)}</span>` : ""}
+        ${x.goals.length ? `<span>Toward ${chips(x.goals)}</span>` : ""}
+        <a href="/map?focus=${esc(x.decision)}" data-nav>Trace on the map</a></div></div>`).join("")
+    : `<p class="muted small">No decision has changed its mind yet.</p>`;
+  const sunk = ins.abandoned_goals.length ? ins.abandoned_goals.map((x) => `<div class="dep"><a href="/g/${esc(x.goal)}" data-nav class="dep-title">${goalIcon({ status: "abandoned" })}<span class="dep-id">${esc(x.goal)}</span><span class="dep-name">${esc(x.title)}</span></a>
+      <span class="dep-effect">${x.decisions} decision${x.decisions === 1 ? "" : "s"} went into it</span>${x.note ? `<div class="dep-note">${esc(x.note)}</div>` : ""}</div>`).join("")
+    : `<p class="muted small">No goal has been abandoned.</p>`;
+  return `<section class="block insights" aria-labelledby="ins-h"><div class="block-head"><h2 id="ins-h">What the history says</h2></div>
+    <h3 class="dep-head">Dead ends</h3>
+    <p class="section-note">Options that were picked and didn't hold, were picked for a goal that was then abandoned, or keep being ruled out. Matched by label across decisions. Think twice before spending time on them again.</p>
+    ${dead}
+    <h3 class="dep-head">Changes of mind</h3>
+    <p class="section-note">Each time a decision was changed or withdrawn after it was made: what led there, and what had already been decided on top of it.</p>
+    ${turns}
+    <h3 class="dep-head">Abandoned goals</h3>
+    ${sunk}
+  </section>`;
+}
+
+async function renderMap() {
+  const params = new URLSearchParams(location.search);
+  const focus = params.get("focus") || "";
+  const all = params.get("all") === "1";
+  const q = new URLSearchParams();
+  if (S.space) q.set("space", S.space);
+  if (focus) q.set("focus", focus);
+  if (all) q.set("all", "1");
+  const [g, ins] = await Promise.all([api("GET", `/api/graph?${q}`), api("GET", `/api/insights${S.space ? `?space=${encodeURIComponent(S.space)}` : ""}`)]);
+  if (location.pathname !== "/map") return;
+  const goals = S.goals.filter((x) => inSpace(x));
+  const main = $("#main");
+  const scroll = main.scrollTop, mapScroll = $(".map-scroll")?.scrollLeft;
+  main.innerHTML = `<div class="page wide">
+    <div class="map-head"><div><h1 class="d-title">Map</h1>
+      <p>Goals are why decisions are made. Each goal serves larger ones, from the vision down to technical goals, and each decision is a step toward one. Hover anything to trace what led to it and what it led to.</p></div>
+      <button class="btn primary" data-action="new-goal">${icon("plus", 15)}New goal</button></div>
+    ${g.nodes.length || focus ? `<div class="toolbar map-tools">
+        ${focus ? `<span class="afchip">Connected to ${esc(focus)}<a href="/map" data-nav aria-label="Show the whole map">${icon("x", 13)}</a></span>` : ""}
+        <label class="check-label small"><input type="checkbox" id="map-all" ${all ? "checked" : ""}> Show decisions without a goal</label>
+        <span class="spacer"></span>${mapLegend()}</div>
+      ${mapHtml(g, { focus })}`
+    : `<div class="empty-state"><span class="es-ic">${icon("target", 24)}</span><h2>No goals yet</h2>
+        <p>Start with the vision, then add the goals that serve it. Link decisions to the goal they're a step toward, and the map shows how every choice connects to why it was made.</p>
+        <button class="btn primary" data-action="new-goal">${icon("plus", 15)}New goal</button></div>`}
+    ${goals.length ? `<section class="block"><div class="block-head"><h2>Goals</h2><span class="count">${goals.filter((x) => x.status === "active").length} active</span></div>${goalTreeHtml(goals)}</section>` : ""}
+    ${insightsHtml(ins)}
+  </div>`;
+  main.scrollTop = scroll;
+  if (mapScroll != null && $(".map-scroll")) $(".map-scroll").scrollLeft = mapScroll;
+  $("#map-all")?.addEventListener("change", (e) => {
+    const p = new URLSearchParams(location.search);
+    if (e.target.checked) p.set("all", "1"); else p.delete("all");
+    navigate(`/map${p.toString() ? `?${p}` : ""}`, true);
+  });
+  bindMaps();
+  document.title = "Map · Decisions";
+}
+
+async function loadGoal(id) {
+  const seq = ++loadSeq;
+  const [g, ev, graph] = await Promise.all([
+    api("GET", `/api/goals/${id}`),
+    api("GET", `/api/goals/${id}/events`),
+    api("GET", `/api/graph?focus=${encodeURIComponent(id)}`),
+  ]);
+  if (seq !== loadSeq) return;
+  if (S.goal?.id !== g.id) S.editingGoal = false;
+  S.goal = g;
+  S.goalEvents = ev.events;
+  S.goalGraph = graph;
+  renderGoal();
+  renderSidebar();
+}
+
+function goalEventText(e) {
+  const x = e.data;
+  const quote = (t) => (t ? `<div class="sub">“${esc(t)}”</div>` : "");
+  switch (e.type) {
+    case "goal.created": return "created this goal";
+    case "goal.updated": {
+      const c = x.changes;
+      const serves = c.serves && (c.serves[1].length ? `made it serve <strong>${esc(c.serves[1].join(", "))}</strong>` : "made it a top-level goal");
+      const rest = Object.keys(c).filter((k) => k !== "serves");
+      return [serves, rest.length ? `edited the ${esc(rest.join(", "))}` : ""].filter(Boolean).join(" and ");
+    }
+    case "goal.achieved": return `marked it achieved${quote(x.note)}`;
+    case "goal.abandoned": return `abandoned it${quote(x.note)}`;
+    case "goal.reactivated": return `made it active again${quote(x.note)}`;
+    default: return esc(e.type);
+  }
+}
+
+function goalStatusHtml(g) {
+  if (g.status === "active") return "";
+  const achieved = g.status === "achieved";
+  return `<div class="outcome ${achieved ? "" : "cancelled"}">${icon(achieved ? "check-circle" : "ban", 20)}<div style="flex:1;min-width:0">
+    <div class="o-label">${GOAL_STATUS[g.status]}</div>
+    <div class="o-pick">${g.status_note ? esc(g.status_note) : achieved ? "Done" : "No longer pursued"}</div>
+    <div class="note" title="${esc(fullTime(g.closed_at))}">${ago(g.closed_at)}</div></div>
+    <button class="btn small" data-action="goal-status" data-status="active">${icon("rotate", 14)}Reactivate</button></div>`;
+}
+
+function renderGoal() {
+  const g = S.goal;
+  const main = $("#main");
+  const scroll = main.scrollTop;
+  const sep = `<span class="sep" aria-hidden="true">·</span>`;
+  const active = g.status === "active";
+  const head = S.editingGoal ? `<form class="edit-form" id="goal-form">
+      <label class="lf">Title<input class="input" name="title" value="${esc(g.title)}" style="font-size:16px;font-weight:600;height:40px"></label>
+      <label class="lf">Description <span style="font-weight:400">(markdown: what success looks like, and why it matters)</span><textarea class="input" name="description">${esc(g.description)}</textarea></label>
+      <div class="form-row"><button class="btn primary">Save</button><button type="button" class="btn ghost" data-action="cancel-goal-edit">Cancel</button></div></form>`
+    : `<div class="d-head" style="display:flex;gap:16px;align-items:flex-start;justify-content:space-between">
+      <div style="min-width:0"><h1 class="d-title">${esc(g.title)}</h1>
+        <div class="d-sub"><button class="chip id" data-action="copy-goal-ref" title="Copy a markdown link">${esc(g.id)}${icon("copy", 12)}</button>
+          <span class="chip status ${esc(g.status)}">${goalIcon(g, 12)}${esc(g.status)}</span>${spaceChip(g)}
+          <span title="${esc(fullTime(g.created_at))}">created ${ago(g.created_at)}</span>${g.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}</div></div>
+      <div class="d-actions">
+        <button class="btn small ghost" data-action="edit-goal">${icon("pencil", 14)}Edit</button>
+        ${active ? `<button class="btn small ghost" data-action="goal-status" data-status="achieved" title="It's done">${icon("check", 14)}Achieved</button>
+          <button class="btn small ghost danger" data-action="goal-status" data-status="abandoned" title="Stop pursuing it">${icon("ban", 14)}Abandon</button>` : ""}
+      </div></div>
+    ${g.description ? `<div class="context">${md(g.description)}</div>` : ""}`;
+  const row = (id, title, status, effect, remove, glyph) => `<div class="dep"><a href="/${id.startsWith("G") ? "g" : "d"}/${esc(id)}" data-nav class="dep-title">${glyph}<span class="dep-id">${esc(id)}</span><span class="dep-name">${esc(title)}</span></a>
+      <span class="dep-effect ${effect[0]}">${esc(effect[1])}</span>${remove || ""}</div>`;
+  const x = (action, id, what) => `<button class="icon-btn" data-action="${action}" data-id="${esc(id)}" title="${esc(what)}" aria-label="${esc(what)}">${icon("x", 14)}</button>`;
+  const goalEffect = (s) => [s.status === "achieved" ? "ok" : "", GOAL_STATUS[s.status]];
+  const decisionEffect = (d) => d.status === "resolved" ? ["ok", `→ ${d.outcome.join(", ")}`] : d.status === "open"
+    ? (d.waiting_on.length ? ["", `After ${d.waiting_on.join(", ")}`] : ["warn", "Undecided"]) : ["", d.status[0].toUpperCase() + d.status.slice(1)];
+  main.innerHTML = `<div class="page">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="/map" data-nav class="muted">Map</a>${icon("chevron", 14)}<span>${esc(g.id)}</span></nav>
+    ${head}
+    ${goalStatusHtml(g)}
+    <div class="cols goal-cols">
+      <section class="block"><div class="block-head"><h2>Serves</h2><span class="spacer"></span>
+          <button class="btn small ghost" data-action="add-serves">${icon("plus", 14)}Larger goal…</button></div>
+        ${g.serves.length ? g.serves.map((s) => row(s.goal, s.title, s.status, goalEffect(s), x("remove-serves", s.goal, `Stop serving ${s.goal}`), goalIcon(s))).join("")
+          : `<p class="section-note">A top-level goal: the vision, or something pursued for its own sake.</p>`}
+      </section>
+      <section class="block"><div class="block-head"><h2>Subgoals</h2><span class="spacer"></span>
+          <button class="btn small ghost" data-action="new-goal" data-serves="${esc(g.id)}">${icon("plus", 14)}New subgoal</button></div>
+        ${g.subgoals.length ? g.subgoals.map((s) => row(s.goal, s.title, s.status, goalEffect(s), "", goalIcon(s))).join("")
+          : `<p class="section-note">Break it down into the strategic, product or technical goals it takes.</p>`}
+      </section>
+    </div>
+    <section class="block"><div class="block-head"><h2>Decisions toward it</h2><span class="count">${g.decisions.length || ""}</span><span class="spacer"></span>
+        <button class="btn small ghost" data-action="link-decision">${icon("link", 14)}Link a decision…</button></div>
+      ${g.decisions.length ? g.decisions.map((d) => row(d.decision, d.title, d.status, decisionEffect(d), x("unlink-decision", d.decision, `Unlink ${d.decision}`), statusIcon(d))).join("")
+        : `<p class="section-note">None yet. Link an existing one, or have agents pass <code>"goals": ["${esc(g.id)}"]</code> (<code>decide create --goal ${esc(g.id)}</code>) when they ask.</p>`}
+    </section>
+    ${S.goalGraph.nodes.length > 1 ? `<section class="block"><div class="block-head"><h2>On the map</h2><span class="count">what it serves, and everything working toward it</span><span class="spacer"></span>
+        <a class="btn small ghost" href="/map?focus=${esc(g.id)}" data-nav>${icon("map", 14)}Open in the map</a></div>${mapHtml(S.goalGraph, { focus: g.id })}</section>` : ""}
+    <section class="block"><div class="block-head"><h2>Activity</h2><span class="count">${S.goalEvents.length} event${S.goalEvents.length === 1 ? "" : "s"} · tamper-evident</span></div>
+      <ul class="timeline">${[...S.goalEvents].reverse().map((e) => `<li>
+        <span class="ic ${e.type === "goal.achieved" ? "resolved" : e.type === "goal.abandoned" ? "bad" : ""}">${icon({ "goal.created": "sparkle", "goal.updated": "pencil", "goal.achieved": "check", "goal.abandoned": "ban", "goal.reactivated": "rotate" }[e.type] || "sparkle", 14)}</span>
+        <div class="ev"><span class="who">${esc(e.actor)}</span> <span class="what">${goalEventText(e)}</span><span class="when" title="${esc(fullTime(e.ts))}">${ago(e.ts)}</span>
+          <details><summary>Technical details</summary><div class="tech">#${e.seq} · ${esc(e.type)} · hash ${esc(e.hash.slice(0, 16))}…</div><pre>${esc(JSON.stringify(e.data, null, 2))}</pre></details></div></li>`).join("")}</ul></section>
+  </div>`;
+  main.scrollTop = scroll;
+  bindMaps();
+  document.title = `${g.id} · ${g.title}`;
+  const form = $("#goal-form");
+  if (form) {
+    form.querySelector("input").focus();
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const f = new FormData(form);
+      if (await goalAct(() => api("PATCH", `/api/goals/${g.id}`, { title: f.get("title"), description: f.get("description") }), "Saved")) {
+        S.editingGoal = false; renderGoal();
+      }
+    };
+  }
+}
+
+// Like act(), for goals: true once the server confirmed it.
+async function goalAct(fn, okMsg) {
+  try {
+    await fn();
+    await loadList();
+    if (S.goal) await loadGoal(S.goal.id);
+    if (okMsg) toast(okMsg);
+    return true;
+  } catch (e) { fail(e); return false; }
+}
+
+// Toward: the goals a decision is a step toward, shown under its title.
+function towardHtml(d) {
+  if (!d.goals?.length) return "";
+  return `<div class="toward">${icon("target", 14)}<span>Toward</span>
+    ${d.goals.map((g) => `<span class="chip goal ${esc(g.status)}"><a href="/g/${esc(g.goal)}" data-nav title="${esc(GOAL_STATUS[g.status])} goal">${esc(g.goal)} · ${esc(g.title)}</a>
+      <button class="chip-x" data-action="remove-goal" data-id="${esc(g.goal)}" aria-label="Unlink from ${esc(g.goal)}" title="Unlink">${icon("x", 12)}</button></span>`).join("")}
+    <button class="btn small ghost" data-action="add-goal">${icon("plus", 14)}Goal</button>
+    <a class="btn small ghost" href="/map?focus=${esc(d.id)}" data-nav>${icon("map", 14)}Trace on the map</a></div>`;
+}
+
+// An open decision whose every goal was abandoned may not be worth deciding.
+function goalGoneHtml(d) {
+  if (d.status !== "open" || !d.goals?.length || !d.goals.every((g) => g.status === "abandoned")) return "";
+  return `<div class="callout warn">${icon("target", 18)}
+    <div class="callout-main"><div><strong class="c-title">Its goal was abandoned</strong></div>
+      <div class="small">${d.goals.map((g) => `<a href="/g/${esc(g.goal)}" data-nav>${esc(g.goal)}</a> “${esc(g.title)}”`).join(" and ")} ${d.goals.length > 1 ? "are" : "is"} no longer pursued, so this may not need deciding.</div></div>
+    <div class="callout-actions"><button class="btn small" data-action="cancel-decision">${icon("ban", 14)}Cancel it</button></div></div>`;
+}
+
+async function newGoal(serves) {
+  const title = await ask({ title: serves ? `New subgoal of ${serves}` : "New goal", body: `<p>${serves ? "A step on the way to it" : "Start with the vision, then the goals that serve it"}. Describe what success looks like on its page.</p>`,
+    field: "Goal", placeholder: serves ? "e.g. Onboard a customer in a day" : "e.g. Be the default tool for EU utilities", ok: "Create goal" });
+  if (!title) return;
+  try {
+    const g = await api("POST", "/api/goals", { title, serves: serves ? [serves] : [], space: S.goal?.space || S.space || S.config.space });
+    await loadList();
+    navigate(`/g/${g.id}`);
+  } catch (err) { fail(err); }
+}
+
+const setGoals = (d, goals, okMsg) => act(() => api("PATCH", `/api/decisions/${d.id}`, { goals }), okMsg);
 
 // ------------------------------------------------------------------ interactions
 
@@ -1670,6 +2086,46 @@ document.addEventListener("click", async (e) => {
     }
     case "mark-resumed": return markResumed();
     case "add-dep": return addDependency();
+    case "add-goal": {
+      const v = await pickGoal({ title: `What is ${d.id} a step toward?`, body: `<p>Linking decisions to goals puts them on the map, next to why they were made.</p>`,
+        space: d.space, exclude: new Set(d.goals.map((g) => g.goal)), ok: "Link" });
+      return v && setGoals(d, [...d.goals.map((g) => g.goal), v], `Linked to ${v}`);
+    }
+    case "remove-goal": return setGoals(d, d.goals.map((g) => g.goal).filter((g) => g !== id), `Unlinked from ${id}`);
+    case "new-goal": return newGoal(a.dataset.serves);
+    case "edit-goal": S.editingGoal = true; return renderGoal();
+    case "cancel-goal-edit": S.editingGoal = false; return renderGoal();
+    case "copy-goal-ref": return copy(`[${S.goal.id}: ${S.goal.title}](${S.goal.url})`, "link");
+    case "goal-status": {
+      const g = S.goal, to = a.dataset.status;
+      const note = await ask({ title: { achieved: `Mark ${g.id} achieved?`, abandoned: `Abandon ${g.id}?`, active: `Make ${g.id} active again?` }[to],
+        body: to === "abandoned" ? `<p>Open decisions toward it are flagged, and the decisions made for it count as dead ends on the map. Say why, so the next person learns from it.</p>` : "",
+        field: to === "abandoned" ? "Why? (recorded in the log)" : "Note (optional)", ok: { achieved: "Mark achieved", abandoned: "Abandon goal", active: "Reactivate" }[to], danger: to === "abandoned" });
+      if (note === null) return;
+      return goalAct(() => api("PATCH", `/api/goals/${g.id}`, { status: to, note }), `${g.id} ${{ achieved: "achieved", abandoned: "abandoned", active: "is active again" }[to]}`);
+    }
+    case "add-serves": {
+      const g = S.goal;
+      const v = await pickGoal({ title: `What does ${g.id} serve?`, body: `<p>The larger goal this one is a step toward.</p>`, space: g.space,
+        exclude: new Set([g.id, ...g.serves.map((s) => s.goal), ...goalDescendants(g.id)]), ok: "Link" });
+      return v && goalAct(() => api("PATCH", `/api/goals/${g.id}`, { serves: [...g.serves.map((s) => s.goal), v] }), `Serves ${v}`);
+    }
+    case "remove-serves": return goalAct(() => api("PATCH", `/api/goals/${S.goal.id}`, { serves: S.goal.serves.map((s) => s.goal).filter((x) => x !== id) }), "Unlinked");
+    case "link-decision": {
+      const g = S.goal;
+      const linked = new Set(g.decisions.map((x) => x.decision));
+      const choices = S.list.filter((x) => x.space === g.space && !linked.has(x.id))
+        .map((x) => ({ value: x.id, label: `${x.id} · ${x.title}${x.status === "open" ? "" : ` (${x.status})`}` }));
+      if (!choices.length) return toast("Every decision in this space is already linked to it", { info: true });
+      const v = await ask({ title: `Link a decision to ${g.id}`, body: `<p>Which decision is a step toward “${esc(g.title)}”? Past decisions count too: that's how the map shows what led where.</p>`, field: "Decision", choices, ok: "Link" });
+      if (!v) return;
+      const goals = S.list.find((x) => x.id === v)?.goals || [];
+      return goalAct(() => api("PATCH", `/api/decisions/${v}`, { goals: [...goals, g.id] }), `Linked ${v}`);
+    }
+    case "unlink-decision": {
+      const goals = (S.list.find((x) => x.id === id)?.goals || []).filter((x) => x !== S.goal.id);
+      return goalAct(() => api("PATCH", `/api/decisions/${id}`, { goals }), `Unlinked ${id}`);
+    }
     case "remove-dep": return setDependencies(d.depends_on.filter((x) => x.decision !== id), "Dependency removed");
     case "decide-anyway": {
       const ok = await ask({ title: `Decide ${d.id} now?`, body: `<p>This removes its dependency on ${esc(d.waiting_on.join(" and "))}, so ${esc(d.source || "the requester")} can't count on that being settled first. Its deadline starts now.</p>`, ok: "Remove dependency" });
@@ -1807,25 +2263,32 @@ function palette() {
   let navigated = false;
   const commands = [
     ...Object.entries(STATUS_NAMES).map(([k, v]) => ({ kind: "cmd", icon: "filter", label: `Show ${v.toLowerCase()} decisions`, run: () => { S.status = k; storage("status", k); renderSidebar(); drawer(true); } })),
+    { kind: "cmd", icon: "map", label: "Map of goals and decisions", run: () => navigate("/map") },
+    { kind: "cmd", icon: "target", label: "New goal…", run: () => newGoal() },
     { kind: "cmd", icon: "settings", label: "Settings", run: () => navigate("/settings") },
     ...(S.d ? [{ kind: "cmd", icon: "copy", label: `Copy link to ${S.d.id}`, run: () => copy(`[${S.d.id}: ${S.d.title}](${S.d.url})`, "link") }] : []),
     ...(S.d?.status === "open" ? [{ kind: "cmd", icon: "link", label: `Make ${S.d.id} depend on another decision…`, run: addDependency }] : []),
   ];
   const decisions = [...S.list.filter((d) => d.status === "open").sort(byDeadline), ...S.list.filter((d) => d.status !== "open")]
     .map((d) => ({ kind: "decision", d, label: d.title, run: () => navigate(`/d/${d.id}`) }));
+  const goals = [...S.goals.filter((g) => g.status === "active"), ...S.goals.filter((g) => g.status !== "active")]
+    .map((g) => ({ kind: "goal", g, label: g.title, run: () => navigate(`/g/${g.id}`) }));
+  const GROUPS = { decision: "Decisions", goal: "Goals", cmd: "Commands" };
   let items = [], at = 0;
   const draw = () => {
     const q = input.value.trim().toLowerCase();
     const hit = (t) => q.split(/\s+/).every((w) => t.toLowerCase().includes(w));
     const ds = decisions.filter((x) => !q || hit(`${x.d.id} ${x.d.title} ${x.d.source || ""} ${x.d.status}`));
+    const gs = goals.filter((x) => !q || hit(`${x.g.id} ${x.g.title} ${x.g.status}`));
     const cs = commands.filter((c) => !q || hit(c.label));
-    items = [...ds.slice(0, 12), ...cs];
+    items = [...ds.slice(0, 12), ...gs.slice(0, 6), ...cs];
     at = Math.min(at, Math.max(0, items.length - 1));
     dlg.querySelector(".pal-more").textContent = ds.length > 12 ? `Showing 12 of ${ds.length} decisions` : "";
-    const group = (i) => i === 0 && ds.length ? `<li class="pal-group" role="presentation">Decisions</li>` : i === Math.min(ds.length, 12) && cs.length ? `<li class="pal-group" role="presentation">Commands</li>` : "";
+    const group = (i) => i === 0 || items[i - 1].kind !== items[i].kind ? `<li class="pal-group" role="presentation">${GROUPS[items[i].kind]}</li>` : "";
     list.innerHTML = items.length ? items.map((x, i) => `${group(i)}<li role="option" id="pal-${i}" aria-selected="${i === at}" class="${i === at ? "on" : ""}" data-i="${i}">
       ${x.kind === "decision" ? `${statusIcon(x.d)}<span class="pal-label">${esc(x.d.title)}</span><span class="pal-meta">${esc(x.d.id)}${isWaiting(x.d) ? ` · after ${esc(x.d.waiting_on[0])}` : x.d.status === "open" && x.d.due_at ? ` · ${until(x.d.due_at)}` : ` · ${esc(x.d.status)}`}</span>`
-                              : `${icon(x.icon, 15)}<span class="pal-label">${esc(x.label)}</span>`}</li>`).join("")
+        : x.kind === "goal" ? `${goalIcon(x.g, 15)}<span class="pal-label">${esc(x.g.title)}</span><span class="pal-meta">${esc(x.g.id)}${x.g.status === "active" ? "" : ` · ${esc(x.g.status)}`}</span>`
+        : `${icon(x.icon, 15)}<span class="pal-label">${esc(x.label)}</span>`}</li>`).join("")
       : `<li class="pal-empty">No matches</li>`;
     input.setAttribute("aria-activedescendant", items.length ? `pal-${at}` : "");
     list.querySelector(".on")?.scrollIntoView({ block: "nearest" });
@@ -1858,6 +2321,8 @@ document.addEventListener("keydown", (e) => {
   renderSkeleton();
   $("#mb-settings").innerHTML = icon("settings", 18);
   $("#settings-btn").innerHTML = icon("settings", 16);
+  $("#map-btn").innerHTML = icon("map", 16);
+  $("#mb-map").innerHTML = icon("map", 18);
   $("#logo-mark").innerHTML = icon("check", 14);
   $("#search-wrap").insertAdjacentHTML("afterbegin", icon("search", 15));
   $("#search-wrap").insertAdjacentHTML("beforeend", `<button class="kbd pal-hint" data-action="palette" title="Jump to anything (⌘K)" aria-label="Open command palette">⌘K</button>`);

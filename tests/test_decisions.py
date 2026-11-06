@@ -719,6 +719,143 @@ class DecisionsTest(unittest.TestCase):
         self.assertIn(f"affects {did}", run("get", up["id"]).stdout)
 
 
+    # ---------------------------------------------------------------- goals and the map
+
+    def goal(self, title, serves=(), **extra):
+        return self.call("POST", "/api/goals", {"title": title, "serves": list(serves)} | extra, expect=201)
+
+    def test_goals_form_a_hierarchy_that_decisions_work_toward(self):
+        vision = self.goal("Be the default tool for EU utilities")
+        onboard = self.goal("Onboard a customer in a day", [vision["id"]], description="Days, not months.")
+        self.assertEqual((vision["id"], onboard["id"]), ("G-1", "G-2"))
+        self.assertEqual(onboard["serves"], [{"goal": "G-1", "title": vision["title"], "status": "active"}])
+        d = self.create(goals=["g2"])
+        self.assertEqual([g["goal"] for g in d["goals"]], ["G-2"])
+        self.assertEqual(self.call("GET", "/api/decisions")["decisions"][0]["goals"], ["G-2"])
+        self.assertIn("**Toward:** G-2: Onboard a customer in a day", self.call("GET", f"/api/decisions/{d['id']}/markdown"))
+        g = self.call("GET", "/api/goals/G-1")
+        self.assertEqual([x["goal"] for x in g["subgoals"]], ["G-2"])
+        g = self.call("GET", "/api/goals/G-2")
+        self.assertEqual([(x["decision"], x["status"]) for x in g["decisions"]], [(d["id"], "open")])
+        listed = {x["id"]: x for x in self.call("GET", "/api/goals")["goals"]}
+        self.assertEqual((listed["G-2"]["serves"], listed["G-2"]["decisions"]["open"]), (["G-1"], 1))
+        # Unlinking is an edit of the decision, and logged as one.
+        d = self.call("PATCH", f"/api/decisions/{d['id']}", {"goals": []}, expect=200)
+        self.assertEqual(d["goals"], [])
+        self.assertEqual(self.types(d["id"])[-1], ("decision.updated", "agent"))
+
+    def test_goals_are_validated(self):
+        a = self.goal("A")
+        b = self.goal("B", [a["id"]])
+        c = self.goal("C", [b["id"]])
+        self.call("POST", "/api/goals", {"title": ""}, expect=400)
+        self.call("POST", "/api/goals", {"title": "x", "serves": ["G-99"]}, expect=404)
+        self.call("POST", "/api/goals", {"title": "x", "status": "done"}, expect=400)
+        self.call("PATCH", f"/api/goals/{a['id']}", {"serves": [a["id"]]}, expect=400)
+        self.assertIn("cycle", self.call("PATCH", f"/api/goals/{a['id']}", {"serves": [c["id"]]}, expect=400)["error"])
+        self.call("POST", "/api/decisions", {"title": "x", "goals": ["G-99"]}, expect=404)
+        self.call("POST", "/api/decisions", {"title": "x", "goals": "nope"}, expect=404)
+        self.call("GET", "/api/goals/G-99", expect=404)
+
+    def test_goal_status_and_events(self):
+        rx = Receiver()
+        self.call("POST", "/api/webhooks", {"url": rx.url, "events": ["goal.*"]}, expect=201)
+        g = self.goal("One shared platform")
+        g = self.call("PATCH", f"/api/goals/{g['id']}", {"title": "Run everyone on one platform", "status": "abandoned",
+                                                          "note": "Data residency"}, actor="me", expect=200)
+        self.assertEqual((g["status"], g["status_note"]), ("abandoned", "Data residency"))
+        self.assertIsNotNone(g["closed_at"])
+        evs = self.call("GET", f"/api/goals/{g['id']}/events")["events"]
+        self.assertEqual([(e["type"], e["goal_id"]) for e in evs],
+                         [("goal.created", g["id"]), ("goal.updated", g["id"]), ("goal.abandoned", g["id"])])
+        self.assertEqual(evs[-1]["data"], {"note": "Data residency", "previous_status": "active"})
+        g = self.call("PATCH", f"/api/goals/{g['id']}", {"status": "active"}, expect=200)
+        self.assertIsNone(g["closed_at"])
+        self.assertTrue(rx.wait_for(4))
+        payloads = {p["event"]["type"]: p for p in (json.loads(b) for _, b in rx.received)}
+        self.assertEqual(set(payloads), {"goal.created", "goal.updated", "goal.abandoned", "goal.reactivated"})
+        self.assertEqual((payloads["goal.abandoned"]["goal"]["id"], payloads["goal.abandoned"]["decision"]), (g["id"], None))
+        self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
+
+    def tenancy(self):
+        """A pivot: multi-tenant, decided on top of, then changed to per-customer, and its goal abandoned."""
+        vision = self.goal("Grid planning for every utility")
+        shared = self.goal("One shared platform", [vision["id"]])
+        tenancy = self.create(title="Tenancy model?", goals=[shared["id"]],
+                              options=[{"id": "mt", "label": "Multi-tenant"}, {"id": "pc", "label": "Per-customer"}])
+        isolation = self.create(title="Data isolation?", depends_on=[tenancy["id"]],
+                                options=[{"id": "rls", "label": "Row-level security"}, {"id": "db", "label": "DB per tenant"}])
+        loose = self.create(title="Unrelated?", options=["a", "b"])
+        resolve = lambda d, pick, note="": self.call("POST", f"/api/decisions/{d['id']}/resolve",
+                                                     {"selected": [pick], "note": note}, actor="me", expect=200)
+        resolve(tenancy, "mt")
+        resolve(isolation, "rls")
+        self.call("POST", f"/api/decisions/{tenancy['id']}/reopen", {}, actor="me", expect=200)
+        resolve(tenancy, "pc", "Data residency")
+        return vision, shared, tenancy, isolation, loose
+
+    def test_the_map_traces_what_led_where(self):
+        vision, shared, tenancy, isolation, loose = self.tenancy()
+        g = self.call("GET", "/api/graph")
+        nodes = {n["id"]: n for n in g["nodes"]}
+        # Decisions linked to a goal show up, and so does what they depend on; unrelated ones don't.
+        self.assertEqual(set(nodes), {vision["id"], shared["id"], tenancy["id"], isolation["id"]})
+        self.assertEqual((nodes[tenancy["id"]]["outcome"], nodes[tenancy["id"]]["changed"]), (["Per-customer"], 1))
+        self.assertIn({"from": shared["id"], "to": vision["id"], "kind": "serves"}, g["edges"])
+        self.assertIn({"from": tenancy["id"], "to": shared["id"], "kind": "toward"}, g["edges"])
+        self.assertIn({"from": isolation["id"], "to": tenancy["id"], "kind": "depends_on", "when": None}, g["edges"])
+        self.assertIn(loose["id"], {n["id"] for n in self.call("GET", "/api/graph?all=1")["nodes"]})
+        # Focused on a decision: everything that led to it, and what it led to.
+        focus = self.call("GET", f"/api/graph?focus={isolation['id']}")
+        self.assertEqual({n["id"] for n in focus["nodes"]}, {vision["id"], shared["id"], tenancy["id"], isolation["id"]})
+        focus = self.call("GET", f"/api/graph?focus={shared['id']}")
+        self.assertEqual({n["id"] for n in focus["nodes"]}, {vision["id"], shared["id"], tenancy["id"], isolation["id"]})
+        self.call("GET", "/api/graph?focus=D-99", expect=404)
+
+    def test_insights_find_dead_ends_and_reversals(self):
+        vision, shared, tenancy, isolation, loose = self.tenancy()
+        self.call("PATCH", f"/api/goals/{shared['id']}", {"status": "abandoned", "note": "Residency"}, expect=200)
+        for _ in range(2):
+            d = self.create(title="Where to run it?", options=[{"id": "k8s", "label": "Kubernetes"}, {"id": "fly", "label": "Fly"}])
+            self.call("POST", f"/api/decisions/{d['id']}/exclude", {"option_ids": ["k8s"], "reason": "Ops"}, expect=200)
+        i = self.call("GET", "/api/insights")
+        dead = {x["label"]: x for x in i["dead_ends"]}
+        self.assertEqual((dead["Multi-tenant"]["picked"], dead["Multi-tenant"]["reversed"]), (1, 1))
+        # Still picked, but for a goal that was abandoned.
+        self.assertEqual(dead["Per-customer"]["abandoned"], 1)
+        self.assertEqual((dead["Kubernetes"]["ruled_out"], dead["Kubernetes"]["dead_ends"]), (2, 0))
+        self.assertNotIn("Fly", dead)
+        [turn] = i["reversals"]
+        self.assertEqual((turn["decision"], turn["from"], turn["to"], turn["note"], turn["invalidated"], turn["goals"]),
+                         (tenancy["id"], ["Multi-tenant"], ["Per-customer"], "Data residency", [isolation["id"]],
+                          [shared["id"]]))
+        [gone] = i["abandoned_goals"]
+        self.assertEqual((gone["goal"], gone["decisions"], gone["note"]), (shared["id"], 1, "Residency"))
+        # Withdrawing a decision that was made counts as a reversal too.
+        self.call("POST", f"/api/decisions/{isolation['id']}/reopen", {}, expect=200)
+        self.call("POST", f"/api/decisions/{isolation['id']}/cancel", {"note": "moot"}, expect=200)
+        withdrawn = [x for x in self.call("GET", "/api/insights")["reversals"] if x["decision"] == isolation["id"]]
+        self.assertEqual((withdrawn[0]["withdrawn"], withdrawn[0]["upstream"]), (True, [tenancy["id"]]))
+
+    def test_cli_goals_map_and_insights(self):
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT}
+        run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,
+                                        capture_output=True, text=True)
+        vision = run("goal", "create", "Vision", "-q").stdout.strip()
+        sub = run("goal", "create", "Subgoal", "--serves", vision, "-q").stdout.strip()
+        did = run("create", "--title", "Which?", "-o", "a", "-o", "b", "--goal", sub, "-q", "--no-resume").stdout.strip()
+        self.assertEqual(self.call("GET", f"/api/decisions/{did}")["goals"][0]["goal"], sub)
+        self.assertIn(f"toward {sub} [active] Subgoal", run("get", did).stdout)
+        tree = run("goal", "list").stdout.splitlines()
+        self.assertTrue(tree[0].strip().startswith(f"{vision}  active"), tree)
+        self.assertTrue(tree[1].startswith("    ") and "Subgoal  (1 decision, 1 open)" in tree[1], tree)
+        self.assertIn(f"decision {did} [open] Which?", run("goal", "get", sub).stdout)
+        self.assertIn(f"toward {sub}", run("map", "--focus", did).stdout)
+        out = run("goal", "set", sub, "--status", "abandoned", "--note", "nope")
+        self.assertEqual(json.loads(out.stdout)["status"], "abandoned", out.stderr)
+        self.assertIn("Abandoned goals", run("insights").stdout)
+
+
 class RemoteTest(unittest.TestCase):
     """The server on one machine, agents on others: token auth, installing from the server, connect."""
 
@@ -902,6 +1039,15 @@ class SpacesTest(unittest.TestCase):
         # Dependencies stay inside a space too, even for the admin token.
         self.call("POST", "/api/decisions", {"title": "x", "depends_on": [p["id"]]}, token="tok-work", expect=404)
         self.call("POST", "/api/decisions", {"title": "x", "space": "work", "depends_on": [p["id"]]}, expect=404)
+        # So do goals: a token can't see another space's goals, or link to them.
+        g = self.call("POST", "/api/goals", {"title": "Private goal"}, token="tok-private", expect=201)
+        self.assertEqual(g["space"], "private")
+        self.call("GET", f"/api/goals/{g['id']}", token="tok-work", expect=404)
+        self.assertEqual(self.call("GET", "/api/goals", token="tok-work")["goals"], [])
+        self.assertEqual(self.call("GET", "/api/graph", token="tok-work")["nodes"], [])
+        self.call("POST", "/api/goals", {"title": "x", "serves": [g["id"]]}, token="tok-work", expect=404)
+        self.call("POST", "/api/decisions", {"title": "x", "goals": [g["id"]]}, token="tok-work", expect=404)
+        self.call("PATCH", f"/api/decisions/{p['id']}", {"goals": [g["id"]]}, token="tok-private", expect=200)
         # ...and none of it changed anything.
         self.assertEqual(self.call("GET", f"/api/decisions/{p['id']}", token="tok-private")["status"], "open")
 
