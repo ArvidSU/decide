@@ -436,51 +436,110 @@ root:
             node:
               id: deploy
               component: ./components/external/core/group
-              props:
-                title: Container deployment
-                description: Runs the server image from Dockerfile/compose.yaml. compose.yaml requires DECISIONS_TOKEN and DECISIONS_BASE_URL in a project-root .env. These commands need Docker, which is not currently installed on this machine. Resumers stay on the agent machines (Develop → Resumer status).
               children:
                 axis: vertical
                 first:
                   node:
-                    id: deploy-actions
-                    component: ./components/external/core/button
+                    id: remote
+                    component: ./components/external/core/group
                     props:
-                      items:
-                        - { name: Build & start, action: "process:compose-up" }
-                        - { name: Container status, action: "process:compose-ps" }
-                        - { name: Logs, action: "process:compose-logs" }
+                      title: Remote server
+                      description: The server on REMOTE_SSH (set with REMOTE_DIR in .dash-bored/.env), from compose.yaml in REMOTE_DIR. Deploy ships HEAD (commit first), rebuilds the image, backs the database up into REMOTE_DIR/backups/ (the last 10 are kept), restarts, and then reinstalls decide, the skill and the resumer on the remote and on this machine. If the schema changed it stops before restarting. Deploy and reset then replaces the database. It asks first, recreates the spaces and machine tokens, and reconnects both machines. Decisions are lost; the backup keeps them.
+                    children:
+                      axis: vertical
+                      first:
+                        axis: horizontal
+                        ratio: 0.6
+                        first:
+                          node:
+                            id: remote-status
+                            component: ./components/external/core/status
+                            props:
+                              label: Serves this checkout
+                              source: { shell: python3 .dash-bored/scripts/remote.py status, every: 60000, timeoutMs: 10000 }
+                        second:
+                          node:
+                            id: remote-actions
+                            component: ./components/external/core/button
+                            props:
+                              items:
+                                - { name: Deploy, action: "process:remote-deploy" }
+                                - { name: Deploy and reset database, action: "process:remote-deploy-reset" }
+                                - { name: Server logs, action: "process:remote-logs" }
+                      second:
+                        axis: vertical
+                        first:
+                          axis: horizontal
+                          first:
+                            node:
+                              id: remote-deploy
+                              component: ./components/external/core/command
+                              props:
+                                label: Deploy HEAD to the remote server and update both machines
+                                command: python3 .dash-bored/scripts/remote.py deploy
+                          second:
+                            node:
+                              id: remote-deploy-reset
+                              component: ./components/external/core/command
+                              props:
+                                label: Deploy, replacing a database older than the schema (asks first)
+                                command: python3 .dash-bored/scripts/remote.py deploy --reset-db
+                        second:
+                          node:
+                            id: remote-logs
+                            component: ./components/external/core/command
+                            props:
+                              label: Remote server logs
+                              command: 'ssh -o BatchMode=yes "$REMOTE_SSH" "cd ${REMOTE_DIR:-decisions} && /usr/local/bin/docker compose logs -f --tail 200"'
                 second:
-                  axis: vertical
-                  first:
-                    axis: vertical
-                    first:
-                      node:
-                        id: compose-up
-                        component: ./components/external/core/command
-                        props:
-                          label: docker compose up -d --build
-                          command: docker compose up -d --build
-                    second:
-                      node:
-                        id: compose-ps
-                        component: ./components/external/core/command
-                        props:
-                          label: docker compose ps
-                          command: docker compose ps
-                  second:
-                    axis: vertical
-                    first:
-                      node:
-                        id: compose-logs
-                        component: ./components/external/core/command
-                        props:
-                          label: docker compose logs -f
-                          command: docker compose logs -f --tail 200
-                    second:
-                      node:
-                        id: compose-down
-                        component: ./components/external/core/command
-                        props:
-                          label: docker compose down
-                          command: docker compose down
+                  node:
+                    id: container
+                    component: ./components/external/core/group
+                    props:
+                      title: Local container
+                      description: Runs the server image from Dockerfile/compose.yaml. compose.yaml requires DECISIONS_TOKEN and DECISIONS_BASE_URL in a project-root .env. These commands need Docker, which is not currently installed on this machine. Resumers stay on the agent machines (Develop → Resumer status).
+                    children:
+                      axis: vertical
+                      first:
+                        node:
+                          id: deploy-actions
+                          component: ./components/external/core/button
+                          props:
+                            items:
+                              - { name: Build & start, action: "process:compose-up" }
+                              - { name: Container status, action: "process:compose-ps" }
+                              - { name: Logs, action: "process:compose-logs" }
+                      second:
+                        axis: vertical
+                        first:
+                          axis: vertical
+                          first:
+                            node:
+                              id: compose-up
+                              component: ./components/external/core/command
+                              props:
+                                label: docker compose up -d --build
+                                command: docker compose up -d --build
+                          second:
+                            node:
+                              id: compose-ps
+                              component: ./components/external/core/command
+                              props:
+                                label: docker compose ps
+                                command: docker compose ps
+                        second:
+                          axis: vertical
+                          first:
+                            node:
+                              id: compose-logs
+                              component: ./components/external/core/command
+                              props:
+                                label: docker compose logs -f
+                                command: docker compose logs -f --tail 200
+                          second:
+                            node:
+                              id: compose-down
+                              component: ./components/external/core/command
+                              props:
+                                label: docker compose down
+                                command: docker compose down

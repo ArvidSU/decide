@@ -754,6 +754,17 @@ def _service_path(label):
     return _plist_path(label) if sys.platform == "darwin" else _unit_path(label)
 
 
+def _bootout(label: str):
+    """Unload a launchd job and wait until it's gone: bootout returns while the job is still being
+    torn down, and bootstrapping it again before then fails with "Input/output error"."""
+    target = f"gui/{os.getuid()}/{label}"
+    subprocess.run(["launchctl", "bootout", target], capture_output=True)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and subprocess.run(["launchctl", "print", target],
+                                                         capture_output=True).returncode == 0:
+        time.sleep(0.2)
+
+
 def _install_service(label: str, argv: list[str], env: dict, log: str):
     import plistlib
     import shlex
@@ -761,7 +772,7 @@ def _install_service(label: str, argv: list[str], env: dict, log: str):
         plist = {"Label": label, "ProgramArguments": argv, "EnvironmentVariables": env, "RunAtLoad": True,
                  "KeepAlive": True, "StandardOutPath": log, "StandardErrorPath": log}
         os.makedirs(os.path.dirname(_plist_path(label)), exist_ok=True)
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True)
+        _bootout(label)
         with open(_plist_path(label), "wb") as fh:
             plistlib.dump(plist, fh)
         subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", _plist_path(label)], check=True)
@@ -787,7 +798,7 @@ def _install_service(label: str, argv: list[str], env: dict, log: str):
 
 def _uninstall_service(label: str):
     if sys.platform == "darwin":
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True)
+        _bootout(label)
     elif sys.platform.startswith("linux"):
         subprocess.run(["systemctl", "--user", "disable", "--now", _unit_name(label)], capture_output=True)
     if os.path.exists(_service_path(label)):
