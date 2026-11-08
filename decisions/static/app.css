@@ -740,6 +740,10 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 .chip.goal.achieved a { color: var(--good); }
 .chip-x { display: grid; place-items: center; width: 20px; height: 20px; border: 0; border-radius: 50%; background: none; color: var(--muted); cursor: pointer; }
 .chip-x:hover { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--text); }
+.chip.tag { padding: 0 2px 0 9px; gap: 2px; }
+.chip.add-tag { gap: 3px; border-style: dashed; background: none; cursor: pointer; }
+.chip.add-tag:hover { border-color: var(--border-strong); color: var(--text); }
+.tag-input { height: 24px; width: 150px; padding: 0 9px; border-radius: 999px; border: 1px solid var(--accent); background: var(--panel); color: var(--text); font: inherit; font-size: 12.5px; outline: none; }
 
 .insights .dep-head { margin-top: 26px; }
 .insights .section-note { margin: 0 0 10px; }
@@ -767,6 +771,7 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
   .map-scroll { max-height: none; }
   .gt-meta { display: none; }
   .chip-x { width: 32px; height: 32px; }
+  .chip.add-tag, .tag-input { height: 32px; }
   .gt-row { min-height: 44px; }
   .tagb { height: 36px; }
 }

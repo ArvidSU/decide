@@ -32,6 +32,7 @@ const S = {
   goalEvents: [],
   goalGraph: null,
   editingGoal: false,
+  addingGoalTag: false,
 };
 
 function storage(key, value) {
@@ -1673,7 +1674,7 @@ async function loadGoal(id) {
     api("GET", `/api/graph?focus=${encodeURIComponent(id)}`),
   ]);
   if (seq !== loadSeq) return;
-  if (S.goal?.id !== g.id) S.editingGoal = false;
+  if (S.goal?.id !== g.id) S.editingGoal = S.addingGoalTag = false;
   S.goal = g;
   S.goalEvents = ev.events;
   S.goalGraph = graph;
@@ -1718,13 +1719,15 @@ function renderGoal() {
   const head = S.editingGoal ? `<form class="edit-form" id="goal-form">
       <label class="lf">Title<input class="input" name="title" value="${esc(g.title)}" style="font-size:16px;font-weight:600;height:40px"></label>
       <label class="lf">Description <span style="font-weight:400">(markdown: what success looks like, and why it matters)</span><textarea class="input" name="description">${esc(g.description)}</textarea></label>
-      <label class="lf">Tags <span style="font-weight:400">(comma-separated, e.g. business, product, tech: the map filters on them, and decisions toward it share them)</span><input class="input" name="tags" value="${esc(g.tags.join(", "))}"></label>
       <div class="form-row"><button class="btn primary">Save</button><button type="button" class="btn ghost" data-action="cancel-goal-edit">Cancel</button></div></form>`
     : `<div class="d-head" style="display:flex;gap:16px;align-items:flex-start;justify-content:space-between">
       <div style="min-width:0"><h1 class="d-title">${esc(g.title)}</h1>
         <div class="d-sub"><button class="chip id" data-action="copy-goal-ref" title="Copy a markdown link">${esc(g.id)}${icon("copy", 12)}</button>
           <span class="chip status ${esc(g.status)}">${goalIcon(g, 12)}${esc(g.status)}</span>${spaceChip(g)}
-          <span title="${esc(fullTime(g.created_at))}">created ${ago(g.created_at)}</span>${g.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}</div></div>
+          <span title="${esc(fullTime(g.created_at))}">created ${ago(g.created_at)}</span>
+          ${g.tags.map((t) => `<span class="chip tag">#${esc(t)}<button class="chip-x" data-action="remove-goal-tag" data-tag="${esc(t)}" aria-label="Remove #${esc(t)}" title="Remove">${icon("x", 12)}</button></span>`).join("")}
+          ${S.addingGoalTag ? `<input class="tag-input" id="goal-tag-input" placeholder="business, tech…" aria-label="New tags, comma-separated" autocomplete="off">`
+            : `<button class="chip add-tag" data-action="add-goal-tag" title="Topics like business, product or tech: the map filters on them, and decisions toward it share them">${icon("plus", 12)}tag</button>`}</div></div>
       <div class="d-actions">
         <button class="btn small ghost" data-action="edit-goal">${icon("pencil", 14)}Edit</button>
         ${active ? `<button class="btn small ghost" data-action="goal-status" data-status="achieved" title="It's done">${icon("check", 14)}Achieved</button>
@@ -1775,13 +1778,32 @@ function renderGoal() {
     form.onsubmit = async (e) => {
       e.preventDefault();
       const f = new FormData(form);
-      const tags = [...new Set(f.get("tags").split(",").map((t) => t.trim().replace(/^#/, "")).filter(Boolean))];
-      if (await goalAct(() => api("PATCH", `/api/goals/${g.id}`, { title: f.get("title"), description: f.get("description"), tags }), "Saved")) {
+      if (await goalAct(() => api("PATCH", `/api/goals/${g.id}`, { title: f.get("title"), description: f.get("description") }), "Saved")) {
         S.editingGoal = false; renderGoal();
       }
     };
   }
+  const tagInput = $("#goal-tag-input");
+  if (tagInput) {
+    tagInput.focus();
+    // Enter adds and stays open for the next tag; Escape, or leaving it empty, closes it.
+    let done = false;
+    const finish = async (more) => {
+      if (done) return;
+      done = true;
+      const add = [...new Set(tagInput.value.split(",").map((t) => t.trim().replace(/^#/, "")).filter((t) => t && !g.tags.includes(t)))];
+      S.addingGoalTag = more && !!tagInput.value.trim();
+      if (!add.length || !await setGoalTags(g, [...g.tags, ...add])) { S.addingGoalTag = false; renderGoal(); }
+    };
+    tagInput.onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); finish(true); }
+      else if (e.key === "Escape") { e.stopPropagation(); tagInput.value = ""; finish(false); }
+    };
+    tagInput.onblur = () => finish(false);
+  }
 }
+
+const setGoalTags = (g, tags, okMsg) => goalAct(() => api("PATCH", `/api/goals/${g.id}`, { tags }), okMsg);
 
 // Like act(), for goals: true once the server confirmed it.
 async function goalAct(fn, okMsg) {
@@ -2130,6 +2152,8 @@ document.addEventListener("click", async (e) => {
     case "map-tags-clear": return setMapTags([]);
     case "edit-goal": S.editingGoal = true; return renderGoal();
     case "cancel-goal-edit": S.editingGoal = false; return renderGoal();
+    case "add-goal-tag": S.addingGoalTag = true; return renderGoal();
+    case "remove-goal-tag": return setGoalTags(S.goal, S.goal.tags.filter((t) => t !== a.dataset.tag), `Removed #${a.dataset.tag}`);
     case "copy-goal-ref": return copy(`[${S.goal.id}: ${S.goal.title}](${S.goal.url})`, "link");
     case "goal-status": {
       const g = S.goal, to = a.dataset.status;
