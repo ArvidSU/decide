@@ -2,9 +2,9 @@
 
 Usage: python3 .dash-bored/scripts/freshness.py <server|cli|skill>
 
-server  the process listening on the Decisions port: up, and started after the last change to
-        the Python code it loaded (static/ and skill/ are read from disk per request, so they
-        don't count).
+server  the process listening on the Decisions port: up, running this checkout (and started
+        after the last change to its Python code; static/ and skill/ are read from disk per
+        request, so they don't count), or a copy identical to it.
 cli     the `decide` on this machine: an editable install of this checkout (always current
         code) whose metadata is newer than pyproject.toml, or a copy identical to this checkout.
 skill   every installed decisions/SKILL.md under the agents' skills dirs: a symlink into this
@@ -49,6 +49,23 @@ def ago(ts):
     return "just now"
 
 
+def files(root):
+    """Every file of the package, static/ and skill/ included: a server serves them from its copy."""
+    for dirpath, dirnames, names in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for f in names:
+            if not f.endswith(".pyc"):
+                yield os.path.join(dirpath, f)
+
+
+def differs(pkg):
+    """Files that differ between the package at `pkg` and this checkout's."""
+    mine = {os.path.relpath(p, PKG): sha(p) for p in files(PKG)}
+    theirs = {os.path.relpath(p, pkg): sha(p) for p in files(pkg)}
+    diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k))
+    return ", ".join(diff[:4]) + (" +%d more" % (len(diff) - 4) if len(diff) > 4 else "") if diff else ""
+
+
 def py_files(root):
     for dirpath, dirnames, files in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in ("__pycache__", "static", "skill")]
@@ -85,12 +102,43 @@ def server():
     if "decide" not in cmd and "decisions" not in cmd:
         out("warning", "%s on :%d is not a decisions server: %s" % (who, PORT, cmd[:120]))
         return
+    pkg = server_package(pid, cmd)
+    if pkg is None:
+        out("warning", "%s on :%d, but which copy of the code it runs is unknown: %s" % (who, PORT, cmd[:120]))
+        return
+    if os.path.realpath(pkg) != os.path.realpath(PKG):
+        diff = differs(pkg)
+        if diff:
+            out("warning", "Runs a copy from %s that differs from this checkout in %s (%s). Restart it with Develop → Serve."
+                % (short(pkg), diff, who))
+        else:
+            out("healthy", "Runs a copy identical to this checkout, from %s · %s" % (short(pkg), who))
+        return
     newer = sorted((p for p in py_files(PKG) if os.path.getmtime(p) > started), key=os.path.getmtime)
     if newer:
         out("warning", "Out of date: %s changed after it started (%s). Restart it."
             % (", ".join(os.path.relpath(p, PKG) for p in newer[-4:]) + (" +%d more" % (len(newer) - 4) if len(newer) > 4 else ""), who))
     else:
         out("healthy", "Running this checkout's code · %s" % who)
+
+
+def server_package(pid, cmd):
+    """The decisions package the server process imported: <its cwd>/decisions for `python -m decisions`,
+    otherwise whatever its interpreter imports (the `decide` script's)."""
+    if re.search(r"-m decisions\b", cmd):
+        r = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=5)
+        cwd = next((l[1:] for l in r.stdout.splitlines() if l.startswith("n")), None)
+        return os.path.join(cwd, "decisions") if cwd else None
+    try:
+        return os.path.dirname(os.path.realpath(probe(cmd.split()[0])["file"]))
+    except Exception:
+        return None
+
+
+def probe(interp):
+    """What `interp` imports as decisions. -I and cwd=/ keep this checkout (our cwd) off its path."""
+    r = subprocess.run(interp.split() + ["-I", "-c", PROBE], capture_output=True, text=True, timeout=10, cwd="/")
+    return json.loads(r.stdout)
 
 
 def find_decide():
@@ -118,8 +166,7 @@ def cli():
         first = fh.readline().strip()
     interp = first[2:].strip() if first.startswith("#!") else "python3"
     try:
-        r = subprocess.run(interp.split() + ["-c", PROBE], capture_output=True, text=True, timeout=10)
-        info = json.loads(r.stdout)
+        info = probe(interp)
     except Exception:
         out("error", "%s is broken (its Python can't import decisions). Reinstall it." % short(exe))
         return
@@ -132,12 +179,9 @@ def cli():
         else:
             out("healthy", "%s runs this checkout%s" % (short(exe), " (editable)" if editable else ""))
         return
-    mine = {os.path.relpath(p, PKG): sha(p) for p in py_files(PKG)}
-    theirs = {os.path.relpath(p, pkg): sha(p) for p in py_files(pkg)}
-    diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k))
+    diff = differs(pkg)
     if diff:
-        out("warning", "Out of date: %s is a copy from %s; differs in %s. Reinstall."
-            % (short(exe), short(pkg), ", ".join(diff[:4]) + (" +%d more" % (len(diff) - 4) if len(diff) > 4 else "")))
+        out("warning", "Out of date: %s is a copy from %s; differs in %s. Reinstall." % (short(exe), short(pkg), diff))
     else:
         out("healthy", "%s is a copy identical to this checkout" % short(exe))
 

@@ -80,7 +80,7 @@ root:
                       component: ./components/external/core/group
                       props:
                         title: This machine vs. this checkout
-                        description: Amber means the running server started before the code last changed, the database predates the schema in decisions/store.py (there are no migrations, so delete it), the `decide` CLI install predates pyproject.toml (or is a differing copy), or an installed SKILL.md differs from decisions/skill/SKILL.md. To replace an old database, Kill server, Delete old database (it asks first), then Restart server.
+                        description: Amber means the running server runs a copy of the code that differs from this checkout (e.g. the installed `decide` after a Deploy put the server's wheel on this machine) or started before the code last changed, the database predates the schema in decisions/store.py (there are no migrations, so delete it), the `decide` CLI install predates pyproject.toml (or is a differing copy), or an installed SKILL.md differs from decisions/skill/SKILL.md. To replace an old database, Kill server, Delete old database (it asks first), then Restart server.
                       children:
                         axis: vertical
                         first:
@@ -323,7 +323,7 @@ root:
                     component: ./components/external/core/group
                     props:
                       title: Run, test, install
-                      description: Serve starts the GUI + API on :8787, replacing whatever already listens there; Kill just stops it. Tests need Python ≥ 3.11, so they run through uv. Seeding adds demo decisions to the live database. Reinstall refreshes the editable `decide` CLI, and the skill/resumer commands update this machine's agent integration.
+                      description: Serve starts the GUI + API on :8787 straight from this checkout (not the installed `decide`, which a Deploy replaces with the remote server's wheel), replacing whatever already listens there; Kill just stops it. Tests need Python ≥ 3.11, so they run through uv. Seeding adds demo decisions to the live database. Reinstall refreshes the editable `decide` CLI, and the skill/resumer commands update this machine's agent integration.
                     children:
                       axis: vertical
                       first:
@@ -370,8 +370,8 @@ root:
                                   id: serve
                                   component: ./components/external/core/command
                                   props:
-                                    label: Serve GUI + API on :8787 (replaces a running server)
-                                    command: 'pids=$(lsof -nP -t -iTCP:8787 -sTCP:LISTEN); if [ -n "$pids" ]; then echo "stopping $pids"; kill $pids; while lsof -nP -t -iTCP:8787 -sTCP:LISTEN >/dev/null; do sleep 0.2; done; fi; exec decide serve --port 8787'
+                                    label: Serve this checkout's GUI + API on :8787 (replaces a running server)
+                                    command: 'pids=$(lsof -nP -t -iTCP:8787 -sTCP:LISTEN); if [ -n "$pids" ]; then echo "stopping $pids"; kill $pids; while lsof -nP -t -iTCP:8787 -sTCP:LISTEN >/dev/null; do sleep 0.2; done; fi; exec uv run --no-project --python ">=3.11" python -m decisions serve --port 8787'
                         second:
                           axis: vertical
                           first:
