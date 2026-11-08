@@ -14,6 +14,8 @@ const S = {
   status: storage("status") || "open",
   space: storage("space") || "",   // "" = every space this token sees
   q: "",
+  listTags: (storage("listTags") || "").split(",").filter(Boolean), // the sidebar shows only decisions with any of these
+  listInherit: storage("listInherit") !== "0", // ...counting the tags of the goals they're toward
   list: [],
   counts: {},
   d: null,            // current decision
@@ -537,8 +539,17 @@ function renderSidebar() {
         <div><strong>${open.length} waiting on you</strong>
         <span>${open[0].due_at ? `Next expires in ${until(open[0].due_at)} · ${esc(open[0].id)}` : `Oldest: ${esc(open[0].id)}`}</span></div></a>`
     : `<div class="attention clear"><span class="att-ic">${icon("check", 15)}</span><div><strong>All caught up</strong><span>${later ? `${later} more once others are decided` : "Nothing is waiting on you"}</span></div></div>`);
+  const tagsOf = decisionTags();
+  const goalTagged = S.goals.some((g) => inSpace(g) && g.tags.length);
+  const known = [...new Set([...S.listTags, ...list.flatMap(tagsOf)])].sort();
+  const listTags = $("#list-tags");
+  listTags.hidden = !known.length && !goalTagged;
+  setHtml(listTags, `${known.map((t) => `<button class="tagb ${S.listTags.includes(t) ? "on" : ""}" data-action="list-tag" data-tag="${esc(t)}" aria-pressed="${S.listTags.includes(t)}">#${esc(t)}</button>`).join("")}
+    ${S.listTags.length ? `<button class="btn small ghost" data-action="list-tags-clear">Show all</button>` : ""}
+    ${goalTagged ? `<label class="inherit" title="A decision also has the tags of the goals it's a step toward, like on the map"><input type="checkbox" data-action="list-inherit" ${S.listInherit ? "checked" : ""}>Goals' tags too</label>` : ""}`);
   const q = S.q.toLowerCase();
   let items = list.filter((d) => (S.status === "all" || d.status === S.status) &&
+    (!S.listTags.length || tagsOf(d).some((t) => S.listTags.includes(t))) &&
     (!q || d.title.toLowerCase().includes(q) || d.id.toLowerCase().includes(q) || (d.source || "").toLowerCase().includes(q)));
   // Most urgent first: open decisions by deadline, then those waiting on another one, then everything else.
   items = [...items.filter(actionable).sort(byDeadline), ...items.filter(isWaiting), ...items.filter((d) => d.status !== "open")];
@@ -563,7 +574,19 @@ function renderSidebar() {
           : due ? `<span class="dl-due" title="Expires ${esc(fullTime(d.due_at))} unless decided">${until(d.due_at)}</span>`
               : `<span class="dl-due" title="${esc(fullTime(d.created_at))}">${d.status === "expired" ? "expired" : ago(d.updated_at || d.created_at)}</span>`}
       </div></a>`;
-  }).join("") : `<div class="list-empty">${q ? `No decisions match “${esc(S.q)}”.` : `No ${S.status === "all" ? "" : esc(STATUS_NAMES[S.status].toLowerCase()) + " "}decisions.`}</div>`);
+  }).join("") : `<div class="list-empty">${q ? `No decisions match “${esc(S.q)}”.` : `No ${S.status === "all" ? "" : esc(STATUS_NAMES[S.status].toLowerCase()) + " "}decisions${S.listTags.length ? ` with ${S.listTags.map((t) => `#${esc(t)}`).join(" or ")}` : ""}.`}</div>`);
+}
+
+// A decision's tags for the sidebar filter: its own, plus its goals' while listInherit is on.
+function decisionTags() {
+  const goalTags = new Map(S.listInherit ? S.goals.map((g) => [g.id, g.tags]) : []);
+  return (d) => [...new Set([...d.tags, ...d.goals.flatMap((g) => goalTags.get(g) || [])])];
+}
+
+function setListTags(tags) {
+  S.listTags = tags;
+  storage("listTags", tags.length ? tags.join(",") : null);
+  renderSidebar();
 }
 
 // The sidebar is a drawer on narrow screens: while closed it's inert; while open, the page behind it is.
@@ -2163,6 +2186,12 @@ document.addEventListener("click", async (e) => {
       return setMapTags(tags.includes(t) ? tags.filter((x) => x !== t) : [...tags, t]);
     }
     case "map-tags-clear": return setMapTags([]);
+    case "list-tag": {
+      const t = a.dataset.tag;
+      return setListTags(S.listTags.includes(t) ? S.listTags.filter((x) => x !== t) : [...S.listTags, t]);
+    }
+    case "list-tags-clear": return setListTags([]);
+    case "list-inherit": S.listInherit = !S.listInherit; storage("listInherit", S.listInherit ? null : "0"); return renderSidebar();
     case "edit-goal": S.editingGoal = true; return renderGoal();
     case "cancel-goal-edit": S.editingGoal = false; return renderGoal();
     case "add-tag": S.addingTag = true; return tagged(a.dataset.kind).render();

@@ -49,7 +49,7 @@ decide skill install                  # teach your agents (Claude Code, Codex, a
 
 ## GUI
 
-* Sidebar: what's waiting on you and when the next one expires, then Open (most urgent first, with a countdown) / Resolved / Expired / Cancelled, search. The tab title shows the open count. On phones it's a drawer behind the menu button.
+* Sidebar: what's waiting on you and when the next one expires, then Open (most urgent first, with a countdown) / Resolved / Expired / Cancelled, search. Tag chips show only decisions with any of the picked tags (remembered per browser); "Goals' tags too" counts the tags of the goals a decision is toward, as the map does. The tab title shows the open count. On phones it's a drawer behind the menu button.
 * Open decisions show how long is left and what happens at the deadline. The callout turns amber under a day and red under 6 hours.
 * Filters sit in a toolbar: one button per attribute opens a popover (min/max, yes/no, value checkboxes with counts, text contains), plus free-text search. Active filters show as removable chips, with "Keep options with unknown values" so best-effort gaps don't hide options, and "Rule out N hidden" to record the filter as the reason. Short lists without attributes skip the filters.
 * Best value per attribute is marked when `better` is set. Click column headers to sort. Table or card view (cards when options have images, and on phones).
