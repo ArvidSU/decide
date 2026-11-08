@@ -513,6 +513,7 @@ const STATUS_NAMES = { open: "Open", resolved: "Resolved", expired: "Expired", c
 function renderSidebar() {
   const spaces = (S.config?.spaces || []).map((s) => s.name);
   if (S.space && !spaces.includes(S.space)) S.space = "";
+  if (!STATUS_NAMES[S.status]) S.status = "open";
   const spaceTabs = $("#space-tabs");
   spaceTabs.hidden = !multiSpace();
   if (multiSpace()) {
@@ -2061,7 +2062,7 @@ document.addEventListener("click", async (e) => {
   if (e.target.closest(".omenu") && !e.target.closest("[data-action]")) return;
   const nav = e.target.closest("a[data-nav]");
   if (nav && !e.metaKey && !e.ctrlKey) { e.preventDefault(); return navigate(nav.getAttribute("href")); }
-  const tab = e.target.closest("[data-status]");
+  const tab = e.target.closest("#status-tabs [data-status]");
   if (tab) { S.status = tab.dataset.status; storage("status", S.status); return renderSidebar(); }
   const spaceTab = e.target.closest("[data-space]");
   if (spaceTab) {
