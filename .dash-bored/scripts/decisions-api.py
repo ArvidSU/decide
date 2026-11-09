@@ -166,6 +166,8 @@ def recent_list():
             bits.append("“%s”" % res["note"][:80])
         if rs.get("status"):
             bits.append("agent resume: " + rs["status"])
+        if d.get("issues"):
+            bits.append("acted on in " + ", ".join(i["key"] for i in d["issues"]))
         if d.get("outdated_by"):
             bits.append("outdated: %s changed since" % ", ".join(d["outdated_by"]))
             state = "warning"

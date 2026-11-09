@@ -114,4 +114,12 @@ Then run the `to keep waiting: …` command from the previous `decide wait` outp
 
 `decide get D-12 --json` returns `resolution.selected` (option IDs), `selected_options`, `resolution.note`, and the `goals` it serves. The note is the user's rationale or extra instructions; follow it. Where you act on the decision (commit, PR, Linear comment, a written summary), reference it as `[D-12: title](url)`.
 
+If the work is tracked in an issue (Linear, Jira, GitHub, …), whether you created it or found it, link it back so the decision shows where it's being carried out:
+
+```sh
+decide issue D-12 https://linear.app/acme/issue/LIN-42
+```
+
+Link the issue for the work itself, not the one the question came from (that goes in `links`).
+
 The user may revise a decision later (another `decision.resolved`, or `decision.reopened`). The latest resolution is authoritative. If `outdated_by` is non-empty, a decision this one depends on changed after it was made. Check with the user before acting on it. A revision may skip notifying you (e.g. a typo fix), so check `decide get` before acting on an older one.

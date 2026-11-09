@@ -124,6 +124,8 @@ def _summary(d: dict) -> str:
         r = d["resolution"]
         chosen = ", ".join(f"{s}: {by_id[s]['label']}" if s in by_id else s for s in r["selected"])
         lines.append(f"  decided: {chosen}" + (f"  — {r['note']}" if r.get("note") else ""))
+    for i in d.get("issues", []):
+        lines.append(f"  acted on in {i['key']}: {i['url']}")
     for o in d["options"]:
         if o["suggested_by"] and d["status"] == "open":
             more = "".join(f" — {x}" for x in (o["description"], o["url"]) if x)
@@ -231,6 +233,8 @@ def cmd_create(args):
         body["due_at"] = _parse_due(args.due)
     if args.goal:
         body["goals"] = [*body.get("goals", []), *args.goal]
+    if args.issue:
+        body["issues"] = [*body.get("issues", []), *args.issue]
     for dep in args.depends_on or []:
         up, _, when = dep.partition("=")
         body.setdefault("depends_on", []).append({"decision": up, **({"when": when.split(",")} if when else {})})
@@ -265,6 +269,21 @@ def cmd_get(args):
         _print(c.call("GET", f"/api/decisions/{args.id}"))
     else:
         print(_summary(c.call("GET", f"/api/decisions/{args.id}")))
+
+
+def cmd_issue(args):
+    c = Client()
+    issues = c.call("GET", f"/api/decisions/{args.id}")["issues"]
+    if args.remove:
+        keep = [i for i in issues if args.url not in (i["url"], i["key"])]
+        if len(keep) == len(issues):
+            sys.exit(f"error: {args.id} isn't linked to {args.url}")
+        issues = keep
+    else:
+        issues = [*issues, {"url": args.url, **({"key": args.key} if args.key else {})}]
+    d = c.call("PATCH", f"/api/decisions/{args.id}", {"issues": issues})
+    for i in d["issues"]:
+        print(f"{i['key']}  {i['url']}")
 
 
 def cmd_list(args):
@@ -1044,6 +1063,8 @@ def main(argv=None):
     s.add_argument("--due", help="deadline, after which the undecided decision expires: 36h, 2d, 1w, or an ISO "
                                  "timestamp (default: the server's deadline_days, normally 4 days)")
     s.add_argument("--goal", action="append", metavar="G-N", help="a goal this decision is a step toward (repeatable)")
+    s.add_argument("--issue", action="append", metavar="URL",
+                   help="an issue (Linear, Jira, GitHub, …) where it's being acted on (repeatable)")
     s.add_argument("--depends-on", action="append", metavar="D-N[=OPT,...]",
                    help="locked until decision D-N is decided; with =OPT,... it only applies if D-N picks one "
                         "of those options, and is cancelled otherwise (repeatable)")
@@ -1061,6 +1082,13 @@ def main(argv=None):
     s.add_argument("--json", action="store_true")
     s.add_argument("--markdown", action="store_true")
     s.set_defaults(fn=cmd_get)
+
+    s = sub.add_parser("issue", help="link a decision to the issue where it's being acted on (Linear, Jira, GitHub, …)")
+    s.add_argument("id")
+    s.add_argument("url", help="the issue's URL (with --remove: its URL or key)")
+    s.add_argument("--key", help="what to call it, e.g. LIN-42 (default: read off the URL)")
+    s.add_argument("--remove", action="store_true", help="unlink it instead")
+    s.set_defaults(fn=cmd_issue)
 
     s = sub.add_parser("list", help="list decisions")
     s.add_argument("--status", default="open")

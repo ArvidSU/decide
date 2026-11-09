@@ -65,6 +65,8 @@ def decision_markdown(d: dict) -> str:
         lines.append("")
     if any(m.get("estimate") for o in d["options"] for m in o.get("attribute_meta", {}).values()):
         lines.append("_~ = estimate_\n")
+    if d["issues"]:
+        lines.append("**Acted on in:** " + ", ".join(f"[{i['key']}]({i['url']})" for i in d["issues"]))
     if d["links"]:
         lines.append("**Links:** " + ", ".join(f"[{l.get('title') or l['url']}]({l['url']})" for l in d["links"]))
     return "\n".join(lines).rstrip() + "\n"

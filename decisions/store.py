@@ -15,6 +15,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   max_select INTEGER,
   attribute_defs TEXT NOT NULL DEFAULT '{}',
   links TEXT NOT NULL DEFAULT '[]',
+  issues TEXT NOT NULL DEFAULT '[]',
   tags TEXT NOT NULL DEFAULT '[]',
   metadata TEXT NOT NULL DEFAULT '{}',
   resolution TEXT,
@@ -364,6 +366,33 @@ def _links(value) -> list:
     return out
 
 
+def _issue_key(url: str) -> str:
+    """What to call an issue by its URL: ABC-123 (Linear, Jira, …), repo#42 (GitHub, GitLab), else the host."""
+    parts = urllib.parse.urlsplit(url)
+    if m := re.search(r"\b([A-Z][A-Z0-9]*-\d+)\b", parts.path + "?" + parts.query):
+        return m.group(1)
+    if m := re.search(r"/([^/]+)/(?:-/)?(issues|pull|merge_requests)/(\d+)", parts.path):
+        return f"{m.group(1)}{'!' if m.group(2) == 'merge_requests' else '#'}{m.group(3)}"
+    return parts.hostname or url
+
+
+def _issues(value) -> list:
+    """`issues`: where the decision is being acted on. URLs or {url, key?}; key defaults to one read off the URL."""
+    if not isinstance(value, list):
+        raise ApiError(400, "issues must be a list of URLs or {url, key?} objects")
+    out = {}
+    for item in value:
+        if isinstance(item, str):
+            item = {"url": item}
+        if not isinstance(item, dict) or not isinstance(item.get("url"), str) \
+                or not re.match(r"https?://[^\s/]+", item["url"].strip()):
+            raise ApiError(400, "issues must be a list of http(s) URLs or {url, key?} objects")
+        url = item["url"].strip()
+        key = item.get("key")
+        out[url] = {"url": url, "key": key.strip() if isinstance(key, str) and key.strip() else _issue_key(url)}
+    return list(out.values())
+
+
 def _dependencies(value) -> list[dict]:
     """`depends_on`: ["D-12", {"decision": "D-12", "when": ["redis"], "note": "…"}, …]."""
     if not isinstance(value, list):
@@ -596,6 +625,7 @@ class Store:
             "max_select": row["max_select"],
             "attribute_defs": defs,
             "links": json.loads(row["links"]),
+            "issues": json.loads(row["issues"]),
             "tags": json.loads(row["tags"]),
             "metadata": json.loads(row["metadata"]),
             "due_at": row["due_at"],
@@ -822,11 +852,13 @@ class Store:
                 due_at = None if waiting else self.default_due_at(space)
             self.conn.execute(
                 """INSERT INTO decisions (id, num, space, title, context, source, min_select, max_select,
-                   attribute_defs, links, tags, metadata, due_at, idempotency_key, created_at, updated_at, resume)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   attribute_defs, links, issues, tags, metadata, due_at, idempotency_key, created_at, updated_at,
+                   resume)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (did, num, space, title, _opt_type(body, "context", str, ""),
                  _opt_type(body, "source", str, actor), min_select, max_select, canonical(defs),
-                 canonical(_links(body.get("links"))), canonical(_opt_type(body, "tags", list, [])),
+                 canonical(_links(body.get("links"))), canonical(_issues(body.get("issues") or [])),
+                 canonical(_opt_type(body, "tags", list, [])),
                  canonical(_opt_type(body, "metadata", dict, {})), due_at,
                  key, ts, ts, canonical(r) if (r := _resume(body.get("resume"))) else None),
             )
@@ -895,7 +927,7 @@ class Store:
                     k: d[k] for k in ("id", "space", "url", "title", "source", "status", "tags", "created_at",
                                       "updated_at", "resolved_at", "due_at", "resolution",
                                       "pending_attribute_requests", "min_select", "max_select", "resume_state",
-                                      "waiting_on", "outdated_by")
+                                      "waiting_on", "outdated_by", "issues")
                 } | {"option_count": counts[0], "excluded_count": counts[1] or 0,
                      "goals": [g["goal"] for g in d["goals"]]})
         return out
@@ -952,6 +984,11 @@ class Store:
                 if val != old:
                     changes["links"] = [old, val]
                     sets["links"] = canonical(val)
+            if "issues" in body:
+                val, old = _issues(body["issues"] or []), json.loads(row["issues"])
+                if val != old:
+                    changes["issues"] = [old, val]
+                    sets["issues"] = canonical(val)
             if "attributes" in body:
                 old = json.loads(row["attribute_defs"])
                 new = dict(old)

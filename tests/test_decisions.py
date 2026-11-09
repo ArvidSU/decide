@@ -954,6 +954,47 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual(json.loads(out.stdout)["status"], "abandoned", out.stderr)
         self.assertIn("Abandoned goals", run("insights").stdout)
 
+    def test_issues_record_where_a_decision_is_acted_on(self):
+        d = self.create(issues=["https://linear.app/acme/issue/LIN-42/cache-search"])
+        self.assertEqual(d["issues"], [{"url": "https://linear.app/acme/issue/LIN-42/cache-search", "key": "LIN-42"}])
+        did = d["id"]
+        self.call("POST", f"/api/decisions/{did}/resolve", {"selected": ["1"]}, expect=200)
+        keys = lambda urls: [i["key"] for i in self.call("PATCH", f"/api/decisions/{did}", {"issues": urls})["issues"]]
+        self.assertEqual(keys([
+            "https://acme.atlassian.net/browse/OPS-7",
+            "https://acme.atlassian.net/jira/software/projects/OPS/boards/1?selectedIssue=OPS-8",
+            "https://github.com/ArvidSU/decide/issues/12",
+            "https://github.com/ArvidSU/decide/pull/13",
+            "https://gitlab.com/acme/api/-/merge_requests/5",
+            {"url": "https://tracker.example/t/991", "key": "Ticket 991"},
+            "https://tracker.example/t/992",
+            "https://github.com/ArvidSU/decide/issues/12",  # the same issue twice counts once
+        ]), ["OPS-7", "OPS-8", "decide#12", "decide#13", "api!5", "Ticket 991", "tracker.example"])
+        for bad in (["javascript:alert(1)"], [{"key": "LIN-1"}], "https://linear.app/x"):
+            self.call("PATCH", f"/api/decisions/{did}", {"issues": bad}, expect=400)
+        # Linking one is a logged change, and doesn't reopen or otherwise touch the decision.
+        d = self.call("GET", f"/api/decisions/{did}")
+        self.assertEqual(d["status"], "resolved")
+        changes = [e for e in self.call("GET", f"/api/decisions/{did}/events")["events"] if e["type"] == "decision.updated"]
+        self.assertEqual(changes[-1]["data"]["changes"]["issues"][1], d["issues"])
+        self.assertIn("**Acted on in:** [OPS-7](https://acme.atlassian.net/browse/OPS-7)",
+                      self.call("GET", f"/api/decisions/{did}/markdown"))
+        self.assertEqual(self.call("GET", "/api/decisions?status=resolved")["decisions"][0]["issues"], d["issues"])
+
+    def test_cli_issue(self):
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT}
+        run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,
+                                        capture_output=True, text=True)
+        did = run("create", "--title", "Which?", "-o", "a", "--issue", "https://linear.app/a/issue/LIN-1",
+                  "-q", "--no-resume").stdout.strip()
+        out = run("issue", did, "https://github.com/o/r/issues/4", "--key", "GH-4")
+        self.assertEqual(out.stdout.split("\n")[:2], ["LIN-1  https://linear.app/a/issue/LIN-1",
+                                                      "GH-4  https://github.com/o/r/issues/4"], out.stderr)
+        self.assertIn("acted on in GH-4: https://github.com/o/r/issues/4", run("get", did).stdout)
+        run("issue", did, "LIN-1", "--remove")
+        self.assertEqual([i["key"] for i in self.call("GET", f"/api/decisions/{did}")["issues"]], ["GH-4"])
+        self.assertNotEqual(run("issue", did, "LIN-1", "--remove").returncode, 0)
+
 
 class RemoteTest(unittest.TestCase):
     """The server on one machine, agents on others: token auth, installing from the server, connect."""

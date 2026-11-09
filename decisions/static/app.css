@@ -753,6 +753,9 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 .chip.goal.abandoned a { color: var(--muted); text-decoration: line-through; }
 .chip.goal.achieved { background: var(--good-soft); }
 .chip.goal.achieved a { color: var(--good); }
+.chip.issue { padding: 0 2px 0 9px; gap: 2px; }
+.chip.issue a { display: inline-flex; align-items: center; gap: 4px; color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.chip.issue a .i { color: var(--faint); }
 .chip-x { display: grid; place-items: center; width: 20px; height: 20px; border: 0; border-radius: 50%; background: none; color: var(--muted); cursor: pointer; }
 .chip-x:hover { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--text); }
 .chip.tag { padding: 0 2px 0 9px; gap: 2px; }
