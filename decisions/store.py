@@ -219,8 +219,10 @@ STATUSES = ("open", "resolved", "cancelled", "expired")
 # The event that put a decision in each closed status. `expired` = nobody decided before due_at;
 # `cancelled` = somebody closed it on purpose.
 TERMINAL_EVENTS = {"resolved": "decision.resolved", "cancelled": "decision.cancelled", "expired": "decision.expired"}
-# Events that wake the requesting agent's session (via the resumer).
+# Events that wake the requesting agent's session (via the resumer): the outcome, and while it's open,
+# the user asking it to fill values in.
 RESUME_TRIGGERS = {"resolved": "decision.resolved", "expired": "decision.expired"}
+FILL_TRIGGERS = ("options.suggested", "attributes.requested")
 DEADLINE_ACTOR = "deadline"
 # Actor for what a decision's dependencies do to it: cancel it when it no longer applies, unlock it.
 DEPENDENCY_ACTOR = "dependency"
@@ -744,15 +746,22 @@ class Store:
                 self._unlock(did, upstream)
 
     def _resume_state(self, did: str, row) -> dict | None:
-        """Where the requester's resumption stands for the latest resolution (or expiry)."""
+        """Where the requester's resumption stands for the latest resolution (or expiry) or, while the decision
+        is open, the latest request to fill values in since it was (re)opened."""
         if not row["resume"]:
             return None
-        trigger = RESUME_TRIGGERS.get(row["status"])
-        # A resolution that silenced the resumer doesn't count: the state is that of the one before.
-        res = trigger and next((ev for ev in self.conn.execute(
-            "SELECT seq, ts, data FROM events WHERE decision_id=? AND type=? ORDER BY seq DESC", (did, trigger))
-            if "resumer" not in json.loads(ev["data"]).get("silenced", ())), None)
-        if not res:
+        if row["status"] == "open":
+            res = self.conn.execute(
+                f"SELECT seq, ts, type FROM events WHERE decision_id=? AND type IN ({','.join('?' * len(FILL_TRIGGERS))}, "
+                "'decision.reopened') ORDER BY seq DESC LIMIT 1", (did, *FILL_TRIGGERS)).fetchone()
+            trigger = res and res["type"] in FILL_TRIGGERS and res["type"]
+        else:
+            trigger = RESUME_TRIGGERS.get(row["status"])
+            # A resolution that silenced the resumer doesn't count: the state is that of the one before.
+            res = trigger and next((ev for ev in self.conn.execute(
+                "SELECT seq, ts, data FROM events WHERE decision_id=? AND type=? ORDER BY seq DESC", (did, trigger))
+                if "resumer" not in json.loads(ev["data"]).get("silenced", ())), None)
+        if not trigger or not res:
             return {"status": "armed"}
         ev = self.conn.execute(
             "SELECT * FROM events WHERE decision_id=? AND type LIKE 'resume.%' AND seq>? ORDER BY seq DESC LIMIT 1",
@@ -1476,7 +1485,8 @@ class Store:
 
     # ------------------------------------------------------------------ resumption
 
-    RESUME_EVENTS = ("started", "finished", "failed", "manual")
+    # `skipped`: a request to fill values in that the resumer left alone (the agent is still waiting on it live).
+    RESUME_EVENTS = ("started", "finished", "failed", "manual", "skipped")
 
     def resume_event(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         did = norm_id(raw_id)

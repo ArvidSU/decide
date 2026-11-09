@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import agents
 from .config import load_config
-from .store import event_matches
+from .store import FILL_TRIGGERS, event_matches
 from .webhooks import verify
 
 EXIT_TIMEOUT = 124
@@ -621,6 +621,14 @@ SERVER_SERVICE = "com.decisions.server"
 
 def _resume_prompt(d: dict) -> str:
     instruction = d["resume"].get("prompt") or "Continue the task that was waiting on this decision."
+    if d["status"] == "open":
+        asked = [f'their own option "{o["label"]}"' for o in d["options"] if o["suggested_by"] and not o["excluded"]
+                 and any(o["id"] in p["missing"] for p in d["pending_attribute_requests"].values())]
+        asked += [f'"{k}"' for k, v in d["attribute_defs"].items() if v.get("requested") and k in d["pending_attribute_requests"]]
+        return (f'[decisions] {d["id"]} "{d["title"]}" is still open, and the user asked you to fill in '
+                f'{", ".join(asked) or "some values"}. `decide get {d["id"]}` lists what\'s missing. Fill it in as in '
+                f'step 3 of the decisions skill, then end your turn without waiting: you\'ll be resumed again when '
+                f'it\'s decided. Don\'t act on the decision yet.')
     if d["status"] == "expired":
         return (f'[decisions] {d["id"]} "{d["title"]}" expired: the user didn\'t decide before its deadline '
                 f'({d.get("due_at")}), so it was closed unanswered. Treat it as not important enough to block on: '
@@ -680,9 +688,20 @@ def _resume_one(client: Client, d: dict, command: str | None, log_dir: str):
     print(f"[resumer] {d['id']}: exited {code}", flush=True)
 
 
+def _skip_fill(client: Client, d: dict) -> str | None:
+    """Why not to resume a session to fill values in: a session still waiting on the decision is alive, and
+    resuming it as well would run it twice. Long-pollers stay listed for a while after they wake up."""
+    if not d["pending_attribute_requests"]:
+        return "nothing is left to fill in"
+    polling = [x["actor"] for x in client.call("GET", f"/api/decisions/{d['id']}/listeners")["listeners"]
+               if x["kind"] == "long-poll"]
+    return f"{', '.join(polling)} is waiting on it live" if polling else None
+
+
 def cmd_resumer_run(args):
     """Long-running: resume the requesting agent session whenever a decision with a resume target
-    is resolved, or expires undecided (unless --no-expired). Pulls the event feed with a persisted cursor, so nothing is missed while it (or the
+    is resolved, or expires undecided (unless --no-expired), and while it's open, when the user asks it to fill
+    values in (unless --no-fill). Pulls the event feed with a persisted cursor, so nothing is missed while it (or the
     machine) is down; heartbeats so the GUI can warn you when it isn't running."""
     client = Client(actor=os.environ.get("DECISIONS_ACTOR") or "resumer")
     me = machine_name()
@@ -700,7 +719,8 @@ def cmd_resumer_run(args):
     overrides = _agent_commands(args)
     described = args.command or "; ".join(f"{a}: {agents.resume_command(a, overrides)}"
                                           for a in dict.fromkeys([*agents.AGENTS, *overrides]))
-    types = "decision.resolved" + ("" if args.no_expired else ",decision.expired")
+    types = ",".join(["decision.resolved", *([] if args.no_expired else ["decision.expired"]),
+                      *([] if args.no_fill else FILL_TRIGGERS)])
     print(f"[resumer] {me}: watching {client.url} from event {cursor} for {types}; commands: {described}", flush=True)
     last_beat = 0.0
     while True:
@@ -728,8 +748,13 @@ def cmd_resumer_run(args):
             age = time.time() - datetime.fromisoformat(ev["ts"].replace("Z", "+00:00")).timestamp()
             # Only the latest resolution, only if nobody (e.g. you, manually) already resumed it.
             if mine and state.get("status") == "pending" and state.get("trigger_seq") == ev["seq"]:
+                skip = _skip_fill(client, d) if ev["type"] in FILL_TRIGGERS else None
                 if age > max_age:
                     print(f"[resumer] {d['id']}: skipping, {d['status']} {age / 86400:.1f} days ago", flush=True)
+                elif skip:
+                    client.call("POST", f"/api/decisions/{d['id']}/resume-events",
+                                {"status": "skipped", "trigger_seq": ev["seq"], "reason": skip})
+                    print(f"[resumer] {d['id']}: not resuming, {skip}", flush=True)
                 else:
                     command = args.command or agents.resume_command(target["agent"], overrides)
                     threading.Thread(target=_resume_one, args=(client, d, command, log_dir),
@@ -841,7 +866,7 @@ def cmd_resumer_install(args):
     Client().call("GET", "/api/config")  # fail now, not in the background, if the server is unreachable
     os.makedirs(STATE_DIR, exist_ok=True)
     argv = [decide, "resumer", "run", *(["--command", args.command] if args.command else []),
-            *(["--no-expired"] if args.no_expired else [])]
+            *(["--no-expired"] if args.no_expired else []), *(["--no-fill"] if args.no_fill else [])]
     for item in args.agent_command or []:
         argv += ["--agent-command", item]
     _install_service(RESUMER_SERVICE, argv, _service_env(decide, *found.values()),
@@ -1134,13 +1159,17 @@ def main(argv=None):
     r.add_argument("--command", help=resume_help)
     r.add_argument("--agent-command", action="append", help=agent_help)
     expired_help = "don't resume sessions whose decision expired undecided (default: resume them, saying so)"
+    fill_help = ("don't resume sessions to fill in an option the user added or an attribute they asked for "
+                 "(default: resume them unless they're waiting on it live)")
     r.add_argument("--max-age-days", type=float, default=14, help="don't resume decisions resolved longer ago")
     r.add_argument("--no-expired", action="store_true", help=expired_help)
+    r.add_argument("--no-fill", action="store_true", help=fill_help)
     r.set_defaults(fn=cmd_resumer_run)
     r = rsub.add_parser("install", help="install as a background service (launchd / systemd --user)")
     r.add_argument("--command", help=resume_help)
     r.add_argument("--agent-command", action="append", help=agent_help)
     r.add_argument("--no-expired", action="store_true", help=expired_help)
+    r.add_argument("--no-fill", action="store_true", help=fill_help)
     r.set_defaults(fn=cmd_resumer_install)
     r = rsub.add_parser("uninstall", help="remove the background service")
     r.set_defaults(fn=cmd_resumer_uninstall)

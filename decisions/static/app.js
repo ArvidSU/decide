@@ -1160,19 +1160,23 @@ function resumeHtml(d) {
   const where = r.machine ? ` on ${esc(r.machine)}` : "";
   const stale = st && st.status === "pending" && (Date.now() - new Date(st.since).getTime() > 60000 || !rs.online);
   const expired = st?.trigger === "decision.expired";
+  // While it's open, the resumer wakes the session to fill in what you asked for; it resumes again when you decide.
+  const fill = d.status === "open" && st?.trigger && st.trigger !== "decision.resolved";
+  const why = expired ? " to tell it this expired" : fill ? " to fill in what you asked for" : "";
   const copyBtn = (primary) => `<button class="btn small ${primary ? "primary" : ""}" data-action="copy-resume">${icon("terminal", 14)}${d.resume_command ? "Copy resume command" : "Copy session ID"}</button>`;
   let cls = "", ic = "play", title, text = "", actions = "";
-  switch (st?.status) {
+  switch (st?.status === "skipped" ? "armed" : st?.status) {
     case "armed":
       if (rs.online) { title = "Resumes automatically"; text = `The ${agent} session${where} picks back up when you decide or it expires.`; }
       else { cls = "warn"; ic = "help"; title = "Won't resume automatically"; text = `The resumer${where} is offline. Start it with <code>decide resumer run</code>, or resume the session yourself after deciding.`; actions = copyBtn(false); }
       break;
     case "pending":
-      if (stale) { cls = "bad"; ic = "help"; title = "Not resumed"; text = `The ${agent} session${where} hasn't been picked up${expired ? " to hear that this expired" : ""}${rs.online ? "" : " because the resumer is offline"}.`; actions = copyBtn(true) + `<button class="btn small ghost" data-action="mark-resumed">Mark resumed</button>`; }
-      else { title = expired ? "Telling the agent it expired…" : "Resuming…"; text = `Starting the ${agent} session${where}.`; }
+      if (stale) { cls = "bad"; ic = "help"; title = "Not resumed"; text = `The ${agent} session${where} hasn't been picked up${why}${rs.online ? "" : " because the resumer is offline"}.`; actions = copyBtn(true) + `<button class="btn small ghost" data-action="mark-resumed">Mark resumed</button>`; }
+      else { title = expired ? "Telling the agent it expired…" : fill ? "Asking the agent…" : "Resuming…"; text = `Starting the ${agent} session${where}${why}.`; }
       break;
-    case "started": title = "Agent working"; text = `Resumed the ${agent} session ${ago(st.since)}${expired ? " to tell it this expired" : ""}.`; break;
-    case "finished": cls = "ok"; ic = "check-circle"; title = "Agent resumed"; text = `The ${agent} session ran ${ago(st.since)}${expired ? " and heard this expired" : ""} and finished.`; break;
+    case "started": title = fill ? "Agent filling in" : "Agent working"; text = `Resumed the ${agent} session ${ago(st.since)}${why}.`; break;
+    case "finished": cls = "ok"; ic = "check-circle"; title = "Agent resumed";
+      text = `The ${agent} session ran ${ago(st.since)}${expired ? " and heard this expired" : why} and finished.${fill ? " It resumes again when you decide." : ""}`; break;
     case "failed":
       cls = "bad"; ic = "ban"; title = "Resume failed";
       text = `${ago(st.since)}${st.detail?.exit_code != null ? `, exit ${st.detail.exit_code}` : ""}${st.detail?.error ? `: ${esc(st.detail.error)}` : ""}. Resume the session yourself.`;
@@ -1286,7 +1290,7 @@ function tableHtml({ metas, visible, best }, single) {
         ${cols.map((m) => {
           const v = o.attributes[m.key];
           const isBest = best[m.key] !== undefined && v === best[m.key];
-          const cls = [v == null ? "missing" : "", typeof v === "number" ? "num" : "", isBest ? "best" : ""].join(" ");
+          const cls = [v == null ? "missing" : "", typeof v === "number" || m.type === "number" ? "num" : "", isBest ? "best" : ""].join(" ");
           return `<td class="${cls}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? bestTag(m) : ""}${cellHtml(v, m, o.attribute_meta[m.key], asked(o, m.key))}</td>`;
         }).join("")}
         <td class="act">${optMenuHtml(o, false)}</td>

@@ -627,6 +627,54 @@ class DecisionsTest(unittest.TestCase):
         self.assertTrue(line.startswith("decision.expired|[decisions] "))
         self.assertIn("expired", line)
 
+    def test_resumer_resumes_to_fill_in_unless_the_session_is_waiting_live(self):
+        state = os.path.join(self.tmp, "state")
+        out = os.path.join(self.tmp, "resumed.txt")
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT, "DECISIONS_STATE_DIR": state,
+                            "CLAUDE_CODE_SESSION_ID": "sess-x"}
+        run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,
+                                        capture_output=True, text=True)
+        did = run("create", "--title", "Which jacket?", "-o", "Wool coat", "-q").stdout.strip()
+        self.call("PATCH", f"/api/decisions/{did}/options/1", {"attributes": {"price": 2400}})
+        settled = lambda: self.call("GET", f"/api/decisions/{did}")["resume_state"]
+        def until(status):
+            deadline = time.time() + 10
+            while settled()["status"] != status and time.time() < deadline:
+                time.sleep(0.1)
+            return settled()
+        resumer = subprocess.Popen(
+            [sys.executable, "-m", "decisions", "resumer", "run", "--command",
+             f'echo "$DECISION_EVENT|$RESUME_PROMPT" >> {out}'],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            resumer.stdout.readline()
+            self.call("POST", f"/api/decisions/{did}/options", {"label": "Down jacket", "suggested": True},
+                      actor="me", expect=201)
+            st = until("finished")
+            self.assertEqual((st["status"], st["trigger"]), ("finished", "options.suggested"))
+            # A session still waiting on it hears the request itself, so it isn't resumed a second time.
+            waiter = subprocess.Popen([sys.executable, "-m", "decisions", "wait", did, "--on", "attributes.requested"],
+                                      env=env, stdout=subprocess.DEVNULL)
+            for _ in range(50):
+                if self.call("GET", f"/api/decisions/{did}/listeners")["listeners"]:
+                    break
+                time.sleep(0.1)
+            self.call("POST", f"/api/decisions/{did}/attribute-requests", {"key": "warmth"}, actor="me", expect=201)
+            waiter.wait(10)
+            st = until("skipped")
+            self.assertEqual((st["status"], st["trigger"]), ("skipped", "attributes.requested"))
+            self.assertIn("waiting on it live", st["detail"]["reason"])
+        finally:
+            resumer.terminate(); resumer.wait()
+        lines = open(out).read().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("options.suggested|[decisions] "))
+        self.assertIn('their own option "Down jacket"', lines[0])
+        # Reopening starts over: it's armed for the outcome again.
+        self.call("POST", f"/api/decisions/{did}/resolve", {"selected": ["1"], "silence": ["resumer"]}, actor="me")
+        self.call("POST", f"/api/decisions/{did}/reopen", {})
+        self.assertEqual(settled(), {"status": "armed"})
+
     # ---------------------------------------------------------------- dependencies
 
     def caching(self):
