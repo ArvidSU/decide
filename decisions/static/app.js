@@ -289,6 +289,9 @@ function attrMeta(d, key) {
   };
 }
 
+// Whether the requester was asked for this value and hasn't answered yet.
+const asked = (o, key) => S.d.status === "open" && !!S.d.pending_attribute_requests[key]?.missing.includes(o.id);
+
 function filterActive(f) {
   if (!f) return false;
   return (f.min !== undefined && f.min !== "") || (f.max !== undefined && f.max !== "") ||
@@ -305,7 +308,7 @@ function passes(o, metas) {
     const f = u.filters[m.key];
     if (!filterActive(f)) continue;
     const v = o.attributes[m.key];
-    if (v === null || v === undefined) { if (!u.keepUnknown) return false; continue; }
+    if (v === null || v === undefined) { if (!u.keepUnknown && !asked(o, m.key)) return false; continue; }
     if (f.min !== undefined && f.min !== "" && !(Number(v) >= Number(f.min))) return false;
     if (f.max !== undefined && f.max !== "" && !(Number(v) <= Number(f.max))) return false;
     if (f.bool && f.bool !== "any" && Boolean(v) !== (f.bool === "yes")) return false;
@@ -362,8 +365,11 @@ function partition() {
   return { metas, visible, filtered, excluded, best };
 }
 
-// Wraps a value with its provenance (estimate / source / note) from option.attribute_meta.
-function cellHtml(v, m, meta) {
+// Wraps a value with its provenance (estimate / source / note) from option.attribute_meta. A missing value
+// is either one the requester was asked for and hasn't filled in yet, or one it marked as unknown.
+function cellHtml(v, m, meta, asked) {
+  if (v == null && meta?.unknown) return `<span class="unknown" title="${esc(["Couldn't be found", meta.note].filter(Boolean).join(": "))}">?</span>`;
+  if (v == null && asked) return `<span class="awaiting" title="Asked ${esc(S.d.source || "the requester")}, waiting for it"><i></i><i></i><i></i><span class="sr-only">waiting</span></span>`;
   const html = valueHtml(v, m);
   if (!meta || v == null) return html;
   const tip = [meta.estimate ? "Estimate" : "", meta.source ? "Source: " + meta.source : "", meta.note || ""].filter(Boolean).join(" · ");
@@ -421,7 +427,7 @@ async function loadDecision(id, { keepSelection = false } = {}) {
   S.deliveries = dl.deliveries;
   if (switched || !keepSelection) {
     S.selection = new Set(d.resolution ? d.resolution.selected : []);
-    if (switched) { S.focus = -1; S.editing = S.addingTag = false; S.silenced = new Set(); }
+    if (switched) { S.focus = -1; S.editing = S.addingTag = S.suggesting = false; S.silenced = new Set(); }
   }
   for (const s of [...S.selection]) if (!d.options.some((o) => o.id === s)) S.selection.delete(s);
   renderDecision();
@@ -568,7 +574,7 @@ function renderSidebar() {
     return `<a href="/d/${esc(d.id)}" data-nav class="dl-item ${current ? "active" : ""} ${d.status} ${urgency(d)} ${isWaiting(d) ? "waiting" : ""}" ${current ? `aria-current="page"` : ""}>
       ${statusIcon(d)}<span class="dl-title">${esc(d.title)}</span>
       <div class="dl-meta">${meta}
-        ${pending ? `<span class="dl-flag" title="Waiting for requested attributes"><span class="dot"></span>attrs</span>` : ""}
+        ${pending ? `<span class="dl-flag" title="Waiting for values asked of the requester"><span class="dot"></span>attrs</span>` : ""}
         ${["pending", "failed"].includes(d.resume_state?.status) && d.status === "resolved" ? `<span class="dl-flag bad" title="The requesting agent hasn't been resumed"><span class="dot bad"></span>not resumed</span>` : ""}
         ${d.outdated_by?.length && d.status === "resolved" ? `<span class="dl-flag" title="${esc(d.outdated_by.join(", "))} changed after this was decided"><span class="dot"></span>outdated</span>` : ""}
         ${isWaiting(d) ? `<span class="dl-due" title="Can't be decided until ${esc(d.waiting_on.join(", "))} is">after ${esc(d.waiting_on[0])}</span>`
@@ -633,7 +639,7 @@ function renderEmpty() {
 const HOOK_EVENTS = {
   "Outcome": { "decision.resolved": "Decided", "decision.expired": "Expired undecided", "decision.cancelled": "Cancelled", "decision.reopened": "Reopened" },
   "Activity": { "decision.created": "Created", "decision.updated": "Edited or deadline moved", "decision.commented": "Commented", "attributes.requested": "Attributes requested" },
-  "Options": { "options.added": "Options added", "options.updated": "Options updated", "options.excluded": "Options ruled out" },
+  "Options": { "options.added": "Options added", "options.suggested": "Options suggested", "options.updated": "Options updated", "options.excluded": "Options ruled out" },
   "Dependencies": { "decision.unblocked": "Unlocked: what it waited on is settled", "dependency.changed": "Something it depends on changed" },
   "Goals": { "goal.created": "Goal created", "goal.updated": "Goal edited", "goal.achieved": "Goal achieved", "goal.abandoned": "Goal abandoned", "goal.reactivated": "Goal active again" },
 };
@@ -858,8 +864,9 @@ function renderDecision() {
         <span class="pick-rule">${rule}</span>
         <div class="seg" role="group" aria-label="View"><button data-action="view" data-view="table" class="${view === "table" ? "on" : ""}" aria-pressed="${view === "table"}">${icon("table", 14)}Table</button><button data-action="view" data-view="cards" class="${view === "cards" ? "on" : ""}" aria-pressed="${view === "cards"}">${icon("grid", 14)}Cards</button></div>
       </div>
-      ${d.options.length ? filtersHtml(parts) : `<div class="panel muted">No options yet. The agent can add them with <code>POST /api/decisions/${esc(d.id)}/options</code>.</div>`}
+      ${d.options.length ? filtersHtml(parts) : `<div class="panel muted">No options yet. ${esc(d.source || "The requester")} can add them, or add your own.</div>`}
       ${view === "table" ? tableHtml(parts, single) : cardsHtml(parts, single)}
+      ${suggestHtml(d)}
       ${filtered.length ? `<details class="subtle-list" ${u.openFiltered ? "open" : ""} data-key="openFiltered"><summary>Hidden by filters (${filtered.length})</summary>
         <div class="mini-opts">${filtered.map((o) => miniHtml(o, "filtered")).join("")}</div></details>` : ""}
       ${excluded.length ? `<details class="subtle-list" ${u.openExcluded ? "open" : ""} data-key="openExcluded"><summary>Ruled out (${excluded.length})</summary>
@@ -1004,7 +1011,7 @@ function closedOptionsHtml(d) {
   if (narrow.matches) return head + `<div class="cards readonly">${opts.map((o) => `
     <div class="card ${chosen.has(o.id) ? "selected" : ""} ${o.excluded ? "excluded" : ""}">
       ${o.image ? `<img class="hero" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
-      <div class="body">${chosen.has(o.id) ? `<span class="sel-badge">${icon("check", 13)}Selected</span>` : ""}<div class="top"><div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}</div></div>
+      <div class="body">${chosen.has(o.id) ? `<span class="sel-badge">${icon("check", 13)}Selected</span>` : ""}<div class="top"><div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}${suggestedTag(o)}</div></div>
         ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}
         ${o.excluded ? `<div class="opt-desc">Ruled out${o.exclude_reason ? `: ${esc(o.exclude_reason)}` : ""}</div>` : ""}
         ${metas.length ? `<dl>${metas.map((m) => `<dt>${esc(m.label)}</dt><dd class="${o.attributes[m.key] == null ? "missing" : ""}">${cellHtml(o.attributes[m.key], m, o.attribute_meta[m.key])}</dd>`).join("")}</dl>` : ""}</div>
@@ -1016,7 +1023,7 @@ function closedOptionsHtml(d) {
         <tr class="${chosen.has(o.id) ? "selected" : ""} ${o.excluded ? "excluded" : ""}">
           <td class="check">${chosen.has(o.id) ? `<span class="picked" title="Picked">${icon("check-circle", 18)}</span>` : ""}</td>
           <td>${o.image ? `<img class="thumb" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
-            <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}${chosen.has(o.id) ? `<span class="sr-only"> (picked)</span>` : ""}</div>
+            <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}${suggestedTag(o)}${chosen.has(o.id) ? `<span class="sr-only"> (picked)</span>` : ""}</div>
             ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}
             ${o.excluded ? `<div class="opt-desc">Ruled out${o.exclude_reason ? `: ${esc(o.exclude_reason)}` : ""}</div>` : ""}</td>
           ${metas.map((m) => {
@@ -1274,13 +1281,13 @@ function tableHtml({ metas, visible, best }, single) {
       <tr class="opt ${S.selection.has(o.id) ? "selected" : ""} ${S.focus === i ? "focus" : ""}" data-option="${esc(o.id)}">
         <td class="check"><span class="pick-hit"><input class="pick" type="${single ? "radio" : "checkbox"}" name="pick" data-pick="${esc(o.id)}" ${S.selection.has(o.id) ? "checked" : ""} aria-label="Select ${esc(o.label)}"></span></td>
         <td>${o.image ? `<img class="thumb" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
-          <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}</div>
+          <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}${suggestedTag(o)}</div>
           ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}</td>
         ${cols.map((m) => {
           const v = o.attributes[m.key];
           const isBest = best[m.key] !== undefined && v === best[m.key];
           const cls = [v == null ? "missing" : "", typeof v === "number" ? "num" : "", isBest ? "best" : ""].join(" ");
-          return `<td class="${cls}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? bestTag(m) : ""}${cellHtml(v, m, o.attribute_meta[m.key])}</td>`;
+          return `<td class="${cls}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? bestTag(m) : ""}${cellHtml(v, m, o.attribute_meta[m.key], asked(o, m.key))}</td>`;
         }).join("")}
         <td class="act">${optMenuHtml(o, false)}</td>
       </tr>`).join("")}</tbody></table></div>`;
@@ -1294,16 +1301,37 @@ function cardsHtml({ metas, visible, best }, single) {
       ${o.image ? `<img class="hero" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
       <div class="body">
         <div class="top"><span class="pick-hit"><input class="pick" type="${single ? "radio" : "checkbox"}" name="pick" data-pick="${esc(o.id)}" ${S.selection.has(o.id) ? "checked" : ""} aria-label="Select ${esc(o.label)}"></span>
-          <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}</div>
+          <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}${suggestedTag(o)}</div>
           ${optMenuHtml(o, true)}</div>
         ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}
         ${cols.length ? `<dl>${cols.map((m) => {
           const v = o.attributes[m.key];
           const isBest = best[m.key] !== undefined && v === best[m.key];
-          return `<dt>${esc(m.label)}</dt><dd class="${v == null ? "missing" : ""} ${isBest ? "best" : ""}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? bestTag(m) : ""}${cellHtml(v, m, o.attribute_meta[m.key])}</dd>`;
+          return `<dt>${esc(m.label)}</dt><dd class="${v == null ? "missing" : ""} ${isBest ? "best" : ""}" ${isBest ? `title="${esc(bestTitle(m))}"` : ""}>${isBest ? bestTag(m) : ""}${cellHtml(v, m, o.attribute_meta[m.key], asked(o, m.key))}</dd>`;
         }).join("")}</dl>` : ""}
       </div>
     </div>`).join("")}</div>`;
+}
+
+function suggestedTag(o) {
+  if (!o.suggested_by) return "";
+  const yours = o.suggested_by === (S.config?.owner || "me");
+  return ` <span class="suggested" title="${esc(`Added by ${o.suggested_by} ${ago(o.suggested_at)}`)}">${yours ? "yours" : `from ${esc(o.suggested_by)}`}</span>`;
+}
+
+// None of the options fit: add your own. The requester is asked to fill in its attributes; its cells show
+// that they're on the way, and it can be picked right away.
+function suggestHtml(d) {
+  const who = esc(d.source || "the requester");
+  if (!S.suggesting) return `<button class="suggest-btn" data-action="suggest">${icon("plus", 15)}${d.options.length ? "None of these? Add your own option" : "Add an option"}</button>`;
+  return `<form class="suggest-form" id="suggest-form">
+    <div class="form-row">
+      <label class="lf grow">Option<input class="input" name="label" placeholder="What you have in mind" required autocomplete="off"></label>
+      <label class="lf grow">Details for ${who}<input class="input" name="details" placeholder="A link, model, or what makes it fit" autocomplete="off"></label>
+      <button class="btn primary">Add</button><button type="button" class="btn ghost" data-action="cancel-suggest">Cancel</button>
+    </div>
+    <p class="section-note">${who} is asked to fill in ${attrKeys(d).length ? "its attributes" : "the details"}. You can pick it right away.</p>
+  </form>`;
 }
 
 // "Rule out" offers both the quick action and one with a reason, so neither depends on a hidden modifier.
@@ -1410,7 +1438,7 @@ const EYE_OFF = icon("eye-off", 15);
 
 const EVENT_ICONS = {
   "decision.created": "sparkle", "decision.updated": "pencil", "decision.resolved": "check", "decision.reopened": "rotate",
-  "decision.cancelled": "ban", "decision.expired": "clock", "decision.commented": "message", "options.added": "plus", "options.updated": "pencil",
+  "decision.cancelled": "ban", "decision.expired": "clock", "decision.commented": "message", "options.added": "plus", "options.suggested": "plus", "options.updated": "pencil",
   "option.removed": "minus", "options.excluded": "x", "options.included": "undo", "attributes.requested": "help",
   "attributes.request_cancelled": "ban", "webhook.acked": "check", "webhook.redelivered": "send",
   "decision.unblocked": "unlock", "dependency.changed": "link",
@@ -1445,6 +1473,7 @@ function eventText(e) {
     case "decision.cancelled": return `cancelled it${x.note ? quote(x.note) : ""}`;
     case "decision.commented": return `commented<div class="comment">${esc(x.text)}</div>`;
     case "options.added": return `added ${x.options.map((o) => `<strong>${esc(o.label)}</strong>`).join(", ")}`;
+    case "options.suggested": return `suggested ${x.options.map((o) => `<strong>${esc(o.label)}</strong>`).join(", ")} and asked for its details`;
     case "options.updated": {
       const ids = Object.keys(x.options);
       const attrs = [...new Set(ids.flatMap((id) => Object.keys(x.options[id].attributes || {})))];
@@ -1987,6 +2016,24 @@ function bindDecision() {
     note.closest(".decide-bar").classList.toggle("with-reason", !!note.value);
   });
 
+  const suggestForm = $("#suggest-form");
+  if (suggestForm) {
+    if (!suggestForm.contains(document.activeElement)) suggestForm.querySelector("input").focus();
+    suggestForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const f = new FormData(suggestForm);
+      const label = f.get("label").trim(), details = f.get("details").trim();
+      if (!label) return;
+      const link = /^https?:\/\/\S+$/.test(details);
+      const option = { label, description: link ? "" : details, url: link ? details : null, suggested: true };
+      S.suggesting = false;
+      if (!await act(() => api("POST", `/api/decisions/${d.id}/options`, option), `Added “${label}”, asked ${d.source || "the requester"} to fill it in`)) {
+        S.suggesting = true; renderDecision();
+      }
+    };
+    suggestForm.onkeydown = (e) => { if (e.key === "Escape") { e.stopPropagation(); S.suggesting = false; renderDecision(); $('[data-action="suggest"]')?.focus(); } };
+  }
+
   const attrForm = $("#attr-form");
   if (attrForm) attrForm.onsubmit = (e) => {
     e.preventDefault();
@@ -2136,6 +2183,8 @@ document.addEventListener("click", async (e) => {
       const due = new Date(from + Number(a.dataset.days) * 86400000).toISOString();
       return act(() => api("PATCH", `/api/decisions/${d.id}`, { due_at: due }), `Deadline moved to ${whenTime(due)}`);
     }
+    case "suggest": S.suggesting = true; return renderDecision();
+    case "cancel-suggest": S.suggesting = false; renderDecision(); return $('[data-action="suggest"]')?.focus();
     case "edit": S.editing = true; return renderDecision();
     case "cancel-edit": S.editing = false; return renderDecision();
     case "copy-install": copy(installCommand(S.config, S.config.auth && S.token), "install command"); return;

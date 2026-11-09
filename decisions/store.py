@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS options (
   attribute_meta TEXT NOT NULL DEFAULT '{}',
   excluded INTEGER NOT NULL DEFAULT 0,
   exclude_reason TEXT,
+  suggested_by TEXT,
+  suggested_at TEXT,
   position INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -211,6 +213,7 @@ DEFAULT_WEBHOOK_EVENTS = [
     "decision.cancelled",
     "decision.expired",
     "attributes.requested",
+    "options.suggested",
 ]
 STATUSES = ("open", "resolved", "cancelled", "expired")
 # The event that put a decision in each closed status. `expired` = nobody decided before due_at;
@@ -554,6 +557,8 @@ class Store:
             "attribute_meta": json.loads(row["attribute_meta"]),
             "excluded": bool(row["excluded"]),
             "exclude_reason": row["exclude_reason"],
+            "suggested_by": row["suggested_by"],
+            "suggested_at": row["suggested_at"],
             "position": row["position"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -565,14 +570,16 @@ class Store:
             "SELECT * FROM options WHERE decision_id=? ORDER BY position, rowid", (did,))]
         defs = json.loads(row["attribute_defs"])
         resolution = json.loads(row["resolution"]) if row["resolution"] else None
+        # Values the requester was asked for: a requested attribute on every option, and every attribute on an
+        # option the user suggested. A value counts as answered once it's filled in or marked unknown.
+        keys = list(dict.fromkeys([*defs, *(k for o in options for k in o["attributes"])]))
         pending = {}
-        for key, d in defs.items():
-            if not d.get("requested"):
-                continue
+        for key in keys:
             missing = [o["id"] for o in options
-                       if not o["excluded"] and o["attributes"].get(key) is None]
+                       if not o["excluded"] and (defs.get(key, {}).get("requested") or o["suggested_by"])
+                       and o["attributes"].get(key) is None and not o["attribute_meta"].get(key, {}).get("unknown")]
             if missing:
-                pending[key] = {"description": d.get("description", ""), "missing": missing}
+                pending[key] = {"description": defs.get(key, {}).get("description", ""), "missing": missing}
         subs = self.conn.execute(
             "SELECT * FROM subscriptions WHERE decision_id=? ORDER BY created_at", (did,)).fetchall()
         out = {
@@ -816,7 +823,7 @@ class Store:
             )
             self._write_dependencies(did, deps)
             self._write_decision_goals(did, goals)
-            self._insert_options(did, _opt_type(body, "options", list, []))
+            self._insert_options(did, _opt_type(body, "options", list, []), actor)
             hooks = body.get("webhooks") or ([body["webhook"]] if body.get("webhook") else [])
             created_subs = [self._create_sub(h, did, space) for h in hooks]
             self._event(did, "decision.created", actor, {"decision": self._decision_dict(did)})
@@ -1668,7 +1675,7 @@ class Store:
 
     # ------------------------------------------------------------------ options
 
-    def _insert_options(self, did: str, items: list) -> list[str]:
+    def _insert_options(self, did: str, items: list, actor: str) -> list[str]:
         row = self._decision_row(did)
         nxt = row["next_option"]
         pos = self.conn.execute(
@@ -1693,12 +1700,15 @@ class Store:
                 raise ApiError(409, f"option id {oid!r} already exists in {did}")
             existing.add(oid)
             pos += 1
+            suggested = bool(item.get("suggested"))
             self.conn.execute(
                 """INSERT INTO options (decision_id, id, label, description, url, image, attributes,
-                   attribute_meta, position, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   attribute_meta, suggested_by, suggested_at, position, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (did, oid, label, _opt_type(item, "description", str, ""), _opt_type(item, "url", str),
                  _opt_type(item, "image", str), canonical(_opt_type(item, "attributes", dict, {})),
-                 canonical(_opt_type(item, "attribute_meta", dict, {})), pos, ts, ts))
+                 canonical(_opt_type(item, "attribute_meta", dict, {})),
+                 actor if suggested else None, ts if suggested else None, pos, ts, ts))
             added.append(oid)
         self.conn.execute("UPDATE decisions SET next_option=? WHERE id=?", (nxt, did))
         return added
@@ -1708,12 +1718,17 @@ class Store:
         items = body if isinstance(body, list) else body.get("options", [body])
         with self.tx():
             self._decision_row(did, scope)
-            added = self._insert_options(did, items)
+            added = self._insert_options(did, items, actor)
             self._touch(did)
             opts = [self._option_dict(r) for r in self.conn.execute(
                 f"SELECT * FROM options WHERE decision_id=? AND id IN ({','.join('?' * len(added))})",
                 (did, *added))] if added else []
-            self._event(did, "options.added", actor, {"options": opts})
+            # Options the user suggested ask the requester to fill them in, so they get their own event.
+            suggested = [o for o in opts if o["suggested_by"]]
+            if len(suggested) < len(opts) or not opts:
+                self._event(did, "options.added", actor, {"options": [o for o in opts if not o["suggested_by"]]})
+            if suggested:
+                self._event(did, "options.suggested", actor, {"options": suggested})
             return self._decision_dict(did)
 
     def _apply_option_patch(self, did: str, oid: str, patch: dict) -> dict | None:

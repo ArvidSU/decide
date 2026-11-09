@@ -188,6 +188,30 @@ class DecisionsTest(unittest.TestCase):
         types = [e["type"] for e in self.call("GET", f"/api/decisions/{did}/events")["events"]]
         self.assertEqual(types, ["decision.created", "options.excluded", "attributes.requested", "options.updated"])
 
+    def test_suggested_option_asks_for_its_attributes(self):
+        did = self.create()["id"]
+        d = self.call("POST", f"/api/decisions/{did}/options",
+                      {"label": "Down jacket", "description": "The one from Fjällräven", "suggested": True},
+                      actor="me", expect=201)
+        o = d["options"][-1]
+        self.assertEqual((o["id"], o["suggested_by"]), ("3", "me"))
+        self.assertIsNone(d["options"][0]["suggested_by"])
+        # Every attribute the others have is asked for, alongside requested ones.
+        self.assertEqual({k: p["missing"] for k, p in d["pending_attribute_requests"].items()},
+                         {"price": ["3"], "color": ["3"]})
+        # Filled in, or marked unknown, counts as answered.
+        d = self.call("PATCH", f"/api/decisions/{did}/options",
+                      [{"id": "3", "attributes": {"price": 2900},
+                        "attribute_meta": {"color": {"unknown": True, "note": "comes in several"}}}])
+        self.assertEqual(d["pending_attribute_requests"], {})
+        events = self.call("GET", f"/api/decisions/{did}/events")["events"]
+        self.assertEqual([e["type"] for e in events], ["decision.created", "options.suggested", "options.updated"])
+        self.assertEqual(events[1]["data"]["options"][0]["label"], "Down jacket")
+        # An agent adding options plainly isn't suggesting them.
+        d = self.call("POST", f"/api/decisions/{did}/options", [{"label": "Fleece"}], actor="agent", expect=201)
+        self.assertIsNone(d["options"][-1]["suggested_by"])
+        self.assertEqual(self.call("GET", f"/api/decisions/{did}/events")["events"][-1]["type"], "options.added")
+
     # ---------------------------------------------------------------- log
 
     def test_event_log_is_immutable_and_chained(self):

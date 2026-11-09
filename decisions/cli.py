@@ -124,9 +124,15 @@ def _summary(d: dict) -> str:
         r = d["resolution"]
         chosen = ", ".join(f"{s}: {by_id[s]['label']}" if s in by_id else s for s in r["selected"])
         lines.append(f"  decided: {chosen}" + (f"  — {r['note']}" if r.get("note") else ""))
+    for o in d["options"]:
+        if o["suggested_by"] and d["status"] == "open":
+            more = "".join(f" — {x}" for x in (o["description"], o["url"]) if x)
+            lines.append(f"  option {o['id']!r} suggested by {o['suggested_by']}: {o['label']}{more}")
     for key, p in d.get("pending_attribute_requests", {}).items():
-        lines.append(f"  attribute requested: {key!r} ({p['description']}) missing on options {', '.join(p['missing'])}")
-        lines.append(f"    -> fill with: decide fill {d['id']}  (stdin: [{{\"id\": ..., \"attributes\": {{\"{key}\": ...}}}}])")
+        what = f" ({p['description']})" if p["description"] else ""
+        lines.append(f"  attribute requested: {key!r}{what} missing on options {', '.join(p['missing'])}")
+    if d.get("pending_attribute_requests"):
+        lines.append(f"    -> fill with: decide fill {d['id']}  (stdin: [{{\"id\": ..., \"attributes\": {{...}}}}])")
     return "\n".join(lines)
 
 
@@ -1084,7 +1090,7 @@ def main(argv=None):
     s = sub.add_parser("wait", help="block until a decision is resolved (long-poll; no inbound port needed)")
     s.add_argument("id")
     s.add_argument("--on", default="decision.resolved,decision.cancelled,decision.expired",
-                   help="comma-separated event types to wake on, e.g. add attributes.requested")
+                   help="comma-separated event types to wake on, e.g. add attributes.requested,options.suggested")
     s.add_argument("--after", type=int, help="only events after this cursor (from a previous wait)")
     s.add_argument("--timeout", type=float, default=0, help="seconds; 0 = wait forever")
     s.add_argument("--json", action="store_true")
@@ -1104,7 +1110,7 @@ def main(argv=None):
     s = sub.add_parser("watch", help="wait for a decision via its own throwaway webhook; optionally run a command")
     s.add_argument("id")
     s.add_argument("--on", default="decision.resolved,decision.cancelled,decision.expired",
-                   help="comma-separated event types, e.g. add attributes.requested")
+                   help="comma-separated event types, e.g. add attributes.requested,options.suggested")
     s.add_argument("--exec", help="shell command to run on the event; decision data is in DECISION_* env vars")
     s.add_argument("--forever", action="store_true", help="keep handling events instead of exiting after one")
     s.add_argument("--keep", action="store_true", help="leave the webhook registered on exit")

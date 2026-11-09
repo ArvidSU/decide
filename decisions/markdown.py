@@ -53,11 +53,14 @@ def decision_markdown(d: dict) -> str:
         for o in d["options"]:
             mark = "✅" if res and o["id"] in res["selected"] else ("✗" if o["excluded"] else "")
             label = f"[{o['label']}]({o['url']})" if o["url"] else o["label"]
+            if o["suggested_by"]:
+                label += f" _(suggested by {o['suggested_by']})_"
             if o["excluded"] and o["exclude_reason"]:
                 label += f" _(excluded: {o['exclude_reason']})_"
             meta = o.get("attribute_meta", {})
             cells = [mark, label, *(("~" if meta.get(k, {}).get("estimate") else "") + _fmt(o["attributes"][k])
-                                    if k in o["attributes"] else "—" for k in keys)]
+                                    if k in o["attributes"] else "?" if meta.get(k, {}).get("unknown") else "—"
+                                    for k in keys)]
             lines.append("| " + " | ".join(c.replace("|", "\\|").replace("\n", " ") for c in cells) + " |")
         lines.append("")
     if any(m.get("estimate") for o in d["options"] for m in o.get("attribute_meta", {}).values()):

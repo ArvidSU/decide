@@ -343,6 +343,18 @@ table.opts { width: 100%; border-collapse: collapse; font-size: 14px; }
 .opt-label a { color: var(--text); text-decoration: underline; text-decoration-color: var(--border-strong); text-underline-offset: 3px; }
 .opt-label a:hover { text-decoration-color: var(--text); }
 .opt-desc { color: var(--muted); font-size: 13px; margin-top: 2px; }
+/* Options you added, and values the requester was asked for: dots in the "requested" colour until they arrive. */
+.suggested { display: inline-block; margin-left: 6px; font-size: 11px; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 0 5px; line-height: 17px; vertical-align: 1px; }
+.awaiting { display: inline-flex; gap: 3px; align-items: center; height: 1em; }
+.awaiting i { width: 5px; height: 5px; border-radius: 50%; background: var(--warn); opacity: .35; animation: awaiting 1.4s ease-in-out infinite; }
+.awaiting i:nth-child(2) { animation-delay: .2s; }
+.awaiting i:nth-child(3) { animation-delay: .4s; }
+@keyframes awaiting { 30% { opacity: 1; } 60%, 100% { opacity: .35; } }
+.unknown { color: var(--faint); cursor: help; text-decoration: underline dotted; text-underline-offset: 3px; }
+.suggest-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; margin-top: 10px; padding: 10px; border: 1px dashed var(--border-strong); border-radius: var(--radius); background: none; color: var(--muted); font: inherit; font-size: 13.5px; cursor: pointer; }
+.suggest-btn:hover { color: var(--text); background: var(--sunken); }
+.suggest-form { margin-top: 10px; padding: 12px; border: 1px dashed var(--border-strong); border-radius: var(--radius); }
+.suggest-form .section-note { margin: 8px 0 0; }
 .thumb { width: 40px; height: 40px; object-fit: cover; border-radius: 6px; float: left; margin-right: 10px; background: var(--sunken); }
 .omenu { position: relative; display: inline-block; }
 .omenu > summary { list-style: none; }

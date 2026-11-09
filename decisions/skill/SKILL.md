@@ -79,14 +79,14 @@ Say in `context` how the decisions relate, so the user sees it while deciding th
 Run this **in the background** if your agent can (e.g. Claude Code's `run_in_background: true`), so you are re-invoked when it exits and can keep working meanwhile. Otherwise run it in the foreground; it has no time limit:
 
 ```sh
-decide wait D-12 --on decision.resolved,decision.cancelled,decision.expired,attributes.requested
+decide wait D-12 --on decision.resolved,decision.cancelled,decision.expired,attributes.requested,options.suggested
 ```
 
 It exits `0` whenever something you're waiting for happens. Read the first output line to see what happened:
 - `event: decision.resolved` → go to step 4.
 - `event: decision.cancelled` → the user closed it on purpose, or (actor `dependency`) a decision it depended on went the other way: stop that part, and tell the user.
 - `event: decision.expired` → nobody decided before the deadline, so treat it as not important enough to block on. Continue with your own best judgement where the task needs an answer, or drop that part. Say what you chose and why. Don't create the same decision again unless the user asks.
-- `event: attributes.requested` → go to step 3.
+- `event: attributes.requested` or `event: options.suggested` → go to step 3.
 
 Any non-zero exit is a real error (`124` = the timeout you set). While the decision is still open, the output ends with a `to keep waiting: decide wait …` line. Run exactly that line next, again in the background. While you wait, the user sees your actor name in the decision's Listening panel. For the full JSON, use `decide get D-12 --json`.
 
@@ -96,9 +96,9 @@ Any non-zero exit is a real error (`124` = the timeout you set). While the decis
 
 When you're resumed, your prompt starts with `[decisions] D-12 "…" was resolved by …`. Continue with step 4. If it says `… expired`, handle it like `event: decision.expired` above. The resumed session is headless and has limited permissions (by default it can edit files in the project and run `decide`). If you need something it doesn't allow, say so in your final message instead of failing silently.
 
-## 3. Answer attribute requests
+## 3. Fill in what the user asked for
 
-`event: attributes.requested`, or a non-empty `pending_attribute_requests`, means the user wants another attribute on the options. `decide get D-12` lists the key, description and missing option IDs. Fill them in, best effort:
+`event: attributes.requested` means the user wants another attribute on the options. `event: options.suggested` means none of your options fit and the user added their own (its `suggested_by` is set): all you have is its label, and maybe a description or `url`. Either way, `pending_attribute_requests` lists each key with its description and the option IDs missing it, and `decide get D-12` prints them. Fill them in, best effort. For the user's own option, look it up as you did your own: every attribute the others have, plus `description` and `url` if you find them (a fill patch can set those too).
 
 ```sh
 decide fill D-12 --json fill.json
@@ -106,7 +106,7 @@ decide fill D-12 --json fill.json
 
 where `fill.json` contains `[{"id": "redis", "attributes": {"risk": "medium"}}, {"id": "http", "attributes": {"risk": "low"}}]`.
 
-Use the same value conventions as in step 1. **Mark values you estimated or inferred** with `attribute_meta`, so the GUI shows them as "≈ value" and the user knows what to double-check: `{"id": "redis", "attributes": {"price_sek": 11990}, "attribute_meta": {"price_sek": {"estimate": true, "source": "from memory, Nov 2026"}}}`. You can also set `attribute_meta` when creating options. If you genuinely can't determine a value, leave it out rather than guess.
+Use the same value conventions as in step 1. **Mark values you estimated or inferred** with `attribute_meta`, so the GUI shows them as "≈ value" and the user knows what to double-check: `{"id": "redis", "attributes": {"price_sek": 11990}, "attribute_meta": {"price_sek": {"estimate": true, "source": "from memory, Nov 2026"}}}`. You can also set `attribute_meta` when creating options. If you genuinely can't determine a value, don't guess: mark it `"attribute_meta": {"<key>": {"unknown": true, "note": "why"}}`, so the user isn't left waiting for it.
 
 Then run the `to keep waiting: …` command from the previous `decide wait` output, in the background.
 
