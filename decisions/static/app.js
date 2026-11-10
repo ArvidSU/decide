@@ -2001,7 +2001,6 @@ function issuesHtml(kind, x) {
 const issued = (kind) => kind === "goal"
   ? { x: S.goal, save: (issues, okMsg) => goalAct(() => api("PATCH", `/api/goals/${S.goal.id}`, { issues }), okMsg) }
   : { x: S.d, save: (issues, okMsg) => act(() => api("PATCH", `/api/decisions/${S.d.id}`, { issues }), okMsg) };
-}
 
 // An open decision whose every goal was abandoned may not be worth deciding.
 function goalGoneHtml(d) {
