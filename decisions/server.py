@@ -360,6 +360,14 @@ class Handler(BaseHTTPRequestHandler):
     def proof_event(self, gid):
         return 201, self.store.proof_event(gid, self._body(), self.actor, self.scope)
 
+    @route("POST", "/api/goals/([^/]+)/resume-events")
+    def goal_resume_event(self, gid):
+        return 201, self.store.goal_resume_event(gid, self._body(), self.actor, self.scope)
+
+    @route("GET", "/api/goals/([^/]+)/listeners")
+    def goal_listeners(self, gid):
+        return {"listeners": self.store.goal_listeners(gid, self.scope)}
+
     @route("GET", "/api/graph")
     def graph(self):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
@@ -422,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
         evs = self.store.wait_events(
             int(g("after", 0)), g("decision"), _types(self.qs, None),
-            min(float(g("wait", 0)), MAX_WAIT), int(g("limit", 200)), self.scope, g("goal"))
+            min(float(g("wait", 0)), MAX_WAIT), int(g("limit", 200)), self.scope, g("goal"), self.actor)
         return {"events": evs, "cursor": evs[-1]["seq"] if evs else max(int(g("after", 0)), 0)}
 
     @route("GET", "/api/events/verify")

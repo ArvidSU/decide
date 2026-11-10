@@ -1825,6 +1825,12 @@ function goalEventText(e) {
     case "proof.passed": return "ran the proof, and it passed";
     case "proof.failed": return `${x.exit_code == null ? "couldn't run the proof" : "ran the proof, and it failed"}${quote(x.error || `exit ${x.exit_code}`)}`;
     case "proof.removed": return "removed the proof";
+    case "proof.retargeted": return `made the ${esc(x.resume?.agent || "agent")} session <code>${esc(x.resume?.session_id || "")}</code> the one to tell the result`;
+    case "resume.started": return "started resuming the agent session with the result";
+    case "resume.finished": return "resumed the agent session with the result";
+    case "resume.failed": return `couldn't resume the agent session${quote(x.error || (x.exit_code != null ? `exit ${x.exit_code}` : ""))}`;
+    case "resume.skipped": return `left the result to the live session${quote(x.reason)}`;
+    case "resume.manual": return "resumed the agent session by hand";
     default: return esc(e.type);
   }
 }
@@ -1837,6 +1843,30 @@ function goalStatusHtml(g) {
     <div class="o-pick">${g.status_note ? esc(g.status_note) : achieved ? "Done" : "No longer pursued"}</div>
     <div class="note" title="${esc(fullTime(g.closed_at))}">${ago(g.closed_at)}</div></div>
     <button class="btn small" data-action="goal-status" data-status="active">${icon("rotate", 14)}Reactivate</button></div>`;
+}
+
+// After the proof has run: is the agent session that owns the goal being told the result? It's woken by the
+// resumer on its own machine, like a decision's requester (resumeHtml), with a cap on failures in a row.
+function proofResumeHtml(p) {
+  const st = p.resume_state, r = p.resume;
+  if (!r || !st || st.status === "armed") return "";
+  const agent = esc(r.agent), failed = st.trigger === "proof.failed";
+  const copyBtn = `<button class="btn small" data-action="goal-copy-resume">${icon("terminal", 14)}${p.resume_command ? "Copy resume command" : "Copy session ID"}</button>`;
+  const stale = st.status === "pending" && Date.now() - new Date(st.since).getTime() > 60000;
+  let text = "", actions = "";
+  switch (st.status) {
+    case "pending":
+      if (stale) { text = `<strong>The ${agent} session on ${esc(r.machine)} hasn't been told.</strong> Is that machine's resumer running?`; actions = copyBtn; }
+      else text = `Telling the ${agent} session${failed ? " to fix it" : " to carry on"}…`;
+      break;
+    case "started": text = `The ${agent} session is ${failed ? "working on it" : "carrying on"}, resumed ${ago(st.since)}.`; break;
+    case "finished": text = `The ${agent} session was told ${ago(st.since)}.`; break;
+    case "failed": text = `<strong>Resuming the ${agent} session failed</strong> ${ago(st.since)}${st.detail?.error ? `: ${esc(st.detail.error)}` : ""}. Tell it yourself.`; actions = copyBtn; break;
+    case "skipped": text = `The ${agent} session heard it live.`; break;
+    case "manual": text = `You resumed the ${agent} session yourself ${ago(st.since)}.`; break;
+    case "capped": text = `<strong>The ${agent} session wasn't told:</strong> the proof has failed ${st.failures} times in a row, and the agent is woken for at most ${st.max_failures}. Look into it, or tell the agent yourself; a new proof or a pass starts the count over.`; actions = copyBtn; break;
+  }
+  return `${text}${actions ? ` ${actions}` : ""}`;
 }
 
 // How the goal is proved achieved: what was agreed on, where it stands, and the button that asks for it.
@@ -1874,6 +1904,8 @@ function proofHtml(g) {
   }
   const can = p.agreed && p.ready && !p.busy;
   action += `<button class="btn small ${can ? "primary" : ""}" data-action="proof-run" ${can ? "" : `disabled title="${esc(why)}"`}>${icon("play", 14)}${run?.status === "passed" ? "Prove again" : "Prove it"}</button>`;
+  const told = proofResumeHtml(p);
+  if (told) text += ` ${told}`;
   const online = rs.online ? `<span class="live on" style="display:inline-block"></span> resumer online` : `<span class="live off" style="display:inline-block"></span> resumer offline${rs.last_seen ? `, last seen ${ago(rs.last_seen)}` : ""}`;
   return `<section class="block proof"><div class="block-head"><h2>Proof</h2><span class="count" title="${esc(p.hash)}: identifies exactly what was agreed on">sha256 ${esc(p.hash.slice(0, 12))}</span><span class="spacer"></span>
       <button class="btn small ghost danger" data-action="proof-remove" ${p.busy ? "disabled" : ""}>Remove</button></div>
@@ -2387,6 +2419,10 @@ document.addEventListener("click", async (e) => {
       return goalAct(() => api("POST", `/api/goals/${g.id}/proof/agree`, { hash: p.hash }), "Agreed");
     }
     case "proof-run": return goalAct(() => api("POST", `/api/goals/${S.goal.id}/proof/run`), "Asked for the proof");
+    case "goal-copy-resume": {
+      const p = S.goal.proof;
+      return p.resume_command ? copy(p.resume_command, "resume command") : copy(p.resume.session_id, "session ID");
+    }
     case "proof-remove": {
       const ok = await ask({ title: `Remove ${S.goal.id}'s proof?`, body: `<p>The log keeps what was agreed on and every run.</p>`, ok: "Remove proof", danger: true });
       if (ok === null) return;

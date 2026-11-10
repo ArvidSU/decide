@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import agents
 from .config import load_config
-from .store import FILL_TRIGGERS, event_matches, script_hash
+from .store import FILL_TRIGGERS, PROOF_RESUME_TRIGGERS, event_matches, script_hash
 from .webhooks import verify
 
 EXIT_TIMEOUT = 124
@@ -239,16 +239,23 @@ def cmd_create(args):
         up, _, when = dep.partition("=")
         body.setdefault("depends_on", []).append({"decision": up, **({"when": when.split(",")} if when else {})})
     # Inside an agent session, remember how to resume it once the decision is made.
-    detected = (args.agent or agents.detect_agent() or "agent", args.session) if args.session \
-        else agents.detect_session()
-    if detected and "resume" not in body and not args.no_resume:
-        body["resume"] = {"session_id": detected[1], "cwd": os.getcwd(), "agent": detected[0],
-                          "machine": machine_name()}
+    if "resume" not in body and (target := _resume_target(args)):
+        body["resume"] = target
     d = Client().call("POST", "/api/decisions", body)
     if args.quiet:
         print(d["id"])
     else:
         _print(d)
+
+
+def _resume_target(args) -> dict | None:
+    """The agent session this command runs in (from its env var, or --agent/--session), as a resume target the
+    resumer can pick back up on this machine. None outside a session, or with --no-resume."""
+    detected = (args.agent or agents.detect_agent() or "agent", args.session) if args.session \
+        else agents.detect_session()
+    if not detected or args.no_resume:
+        return None
+    return {"session_id": detected[1], "cwd": os.getcwd(), "agent": detected[0], "machine": machine_name()}
 
 
 def _parse_due(raw: str) -> str:
@@ -399,6 +406,9 @@ def cmd_goal_proof(args):
             sys.exit(f"error: can't read script {path}: {exc}")
     body = {"command": command, "success": success, "scripts": scripts, "cwd": cwd, "machine": machine_name(),
             "timeout": args.timeout or old.get("timeout")}
+    # Inside an agent session: that session hears how the proof went, through the resumer.
+    if target := _resume_target(args):
+        body["resume"] = target
     g = c.call("PUT", f"/api/goals/{args.id}/proof", {k: v for k, v in body.items() if v is not None})
     if args.json:
         return _print(g)
@@ -406,7 +416,11 @@ def cmd_goal_proof(args):
 
 
 def cmd_goal_ready(args):
-    g = Client().call("POST", f"/api/goals/{args.id}/proof/ready", {"ready": not args.no, "note": args.note or ""})
+    body = {"ready": not args.no, "note": args.note or ""}
+    # The session that claims the work done is the one to wake with the result.
+    if not args.no and (target := _resume_target(args)):
+        body["resume"] = target
+    g = Client().call("POST", f"/api/goals/{args.id}/proof/ready", body)
     print(f"{g['id']}  {_proof_line(g['proof'])}\n  {g['url']}")
 
 
@@ -718,6 +732,8 @@ def cmd_fill(args):
 STATE_DIR = os.path.expanduser(os.environ.get("DECISIONS_STATE_DIR", "~/.local/state/decisions"))
 RESUMER_SERVICE = "com.decisions.resumer"
 SERVER_SERVICE = "com.decisions.server"
+# A `decide goal wait` that disconnected this recently (seconds) is taken to have heard the result itself.
+LIVE_WAIT_GRACE = 5
 
 
 def _resume_prompt(d: dict) -> str:
@@ -743,6 +759,34 @@ def _resume_prompt(d: dict) -> str:
             f'Full details: `decide get {d["id"]} --json`.')
 
 
+def _goal_resume_prompt(g: dict) -> str:
+    """What the session that owns a goal is told when its proof has run: what happened, and what to do now."""
+    p, run, state = g["proof"], g["proof"]["run"], g["proof"]["resume_state"]
+    x = run["detail"]
+    how = ", ".join(s for s in (f'exit {x["exit_code"]}' if x.get("exit_code") is not None else None,
+                                f'{x["duration_s"]}s' if x.get("duration_s") is not None else None) if s)
+    where = f' on {p["machine"]}' if p["machine"] != p["resume"]["machine"] else ""
+    log = f' Full log: {x["log"]}{where}.' if x.get("log") else ""
+    tail = f'\n\nOutput (tail):\n{x["output_tail"].rstrip()}' if x.get("output_tail") else ""
+    if run["status"] == "passed":
+        return (f'[decisions] {g["id"]} "{g["title"]}" is achieved: its proof `{p["command"]}` passed'
+                f'{f" ({how})" if how else ""}, and the goal was marked achieved. Continue with the next piece of work '
+                f'the user asked for; if there is none, end your turn. Don\'t run `decide goal wait`.'
+                f'{log} Details: `decide goal get {g["id"]} --json`.{tail}')
+    n, cap = state["failures"], state["max_failures"]
+    error = f': {x["error"]}' if x.get("error") else ""
+    guard = (f'This is failure {n} of {cap} in a row. ' + (
+        "After this one you won't be resumed again until the proof passes, or is proposed anew and agreed on again."
+        if n >= cap else f"After {cap} in a row you won't be resumed again until the proof passes, or is proposed "
+                         f"anew and agreed on again."))
+    return (f'[decisions] {g["id"]} "{g["title"]}": its proof `{p["command"]}` failed{f" ({how})" if how else ""}'
+            f'{error}. {guard} Fix the work, not the proof; if the proof itself was wrong, change it with '
+            f'`decide goal proof {g["id"]} …`, say so, and the user has to agree to it again. Then run the command '
+            f'yourself, and when it passes run `decide goal ready {g["id"]} --note "what you changed"` and end your '
+            f'turn: you\'ll be resumed with the result when the user asks for the proof again. Don\'t run `decide '
+            f'goal wait`.{log} Details: `decide goal get {g["id"]} --json`.{tail}')
+
+
 def _agent_commands(args) -> dict[str, str]:
     """--agent-command NAME=CMD flags as {agent: command}."""
     out = {}
@@ -754,39 +798,56 @@ def _agent_commands(args) -> dict[str, str]:
     return out
 
 
-def _resume_one(client: Client, d: dict, command: str | None, log_dir: str):
+def _decision_wakeup(d: dict) -> dict:
+    """What `_resume_one` needs to wake the session behind a decision."""
     state = d["resume_state"]
-    seq = state["trigger_seq"]
-    cwd = d["resume"].get("cwd") or os.path.expanduser("~")
-    agent = d["resume"]["agent"]
+    payload = {"event": {"type": state.get("trigger", "decision.resolved"), "seq": state["trigger_seq"]},
+               "delivery": {"id": ""}, "decision": d}
+    return {"id": d["id"], "path": f"/api/decisions/{d['id']}", "resume": d["resume"], "state": state,
+            "prompt": _resume_prompt(d), "env": _payload_env(payload, "")}
+
+
+def _goal_wakeup(g: dict) -> dict:
+    """What `_resume_one` needs to wake the session behind a goal, after its proof's result."""
+    p, state = g["proof"], g["proof"]["resume_state"]
+    payload = {"event": {"type": state["trigger"], "seq": state["trigger_seq"]}, "delivery": {"id": ""},
+               "decision": None, "goal": g}
+    env = _payload_env(payload, "") | {"GOAL_ID": g["id"], "GOAL_TITLE": g["title"], "GOAL_URL": g["url"],
+                                       "PROOF_HASH": p["hash"], "PROOF_RESULT": p["run"]["status"]}
+    return {"id": g["id"], "path": f"/api/goals/{g['id']}", "resume": p["resume"], "state": state,
+            "prompt": _goal_resume_prompt(g), "env": env}
+
+
+def _resume_one(client: Client, w: dict, command: str | None, log_dir: str):
+    """Run the agent's resume command for one wake-up (a decision's outcome or a goal's proof result), logging
+    `resume.started` and then `resume.finished` / `resume.failed` against the event that triggered it."""
+    seq = w["state"]["trigger_seq"]
+    cwd = w["resume"].get("cwd") or os.path.expanduser("~")
+    agent = w["resume"]["agent"]
+    report = lambda status, **detail: client.call("POST", f"{w['path']}/resume-events",
+                                                  {"status": status, "trigger_seq": seq, **detail})
     error = (f"cwd does not exist: {cwd}" if not os.path.isdir(cwd) else
              f"no resume command for agent {agent!r}; give the resumer --agent-command {agent}=..."
              if not command else None)
     if error:
-        client.call("POST", f"/api/decisions/{d['id']}/resume-events",
-                    {"status": "failed", "trigger_seq": seq, "error": error})
-        print(f"[resumer] {d['id']}: {error}", flush=True)
+        report("failed", error=error)
+        print(f"[resumer] {w['id']}: {error}", flush=True)
         return
-    log = os.path.join(log_dir, f"{d['id']}-{seq}.log")
-    payload = {"event": {"type": state.get("trigger", "decision.resolved"), "seq": seq}, "delivery": {"id": ""},
-               "decision": d}
-    env = os.environ | _payload_env(payload, "") | {
-        "RESUME_SESSION_ID": d["resume"]["session_id"], "RESUME_CWD": cwd, "RESUME_AGENT": agent,
-        "RESUME_PROMPT": _resume_prompt(d)}
+    log = os.path.join(log_dir, f"{w['id']}-{seq}.log")
+    env = os.environ | w["env"] | {
+        "RESUME_SESSION_ID": w["resume"]["session_id"], "RESUME_CWD": cwd, "RESUME_AGENT": agent,
+        "RESUME_PROMPT": w["prompt"]}
     with open(log, "w") as fh:
         proc = subprocess.Popen(command, shell=True, cwd=cwd, env=env, stdout=fh, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL)
-        client.call("POST", f"/api/decisions/{d['id']}/resume-events",
-                    {"status": "started", "trigger_seq": seq, "pid": proc.pid, "log": log})
-        print(f"[resumer] {d['id']}: resuming {agent} session {d['resume']['session_id']} (pid {proc.pid}, log {log})",
+        report("started", pid=proc.pid, log=log)
+        print(f"[resumer] {w['id']}: resuming {agent} session {w['resume']['session_id']} (pid {proc.pid}, log {log})",
               flush=True)
         code = proc.wait()
     with open(log) as fh:
         tail = fh.read()[-1500:]
-    client.call("POST", f"/api/decisions/{d['id']}/resume-events",
-                {"status": "finished" if code == 0 else "failed", "trigger_seq": seq,
-                 "exit_code": code, "log": log, "output_tail": tail})
-    print(f"[resumer] {d['id']}: exited {code}", flush=True)
+    report("finished" if code == 0 else "failed", exit_code=code, log=log, output_tail=tail)
+    print(f"[resumer] {w['id']}: exited {code}", flush=True)
 
 
 def _prove_one(client: Client, g: dict, seq: int, log_dir: str):
@@ -842,11 +903,22 @@ def _skip_fill(client: Client, d: dict) -> str | None:
     return f"{', '.join(polling)} is waiting on it live" if polling else None
 
 
+def _skip_proof_result(client: Client, g: dict) -> str | None:
+    """Why not to wake a goal's session with its proof's result: it's still alive, in `decide goal wait`.
+    That wait wakes on the same event we're acting on, so one that just disconnected counts too; one that
+    heard an earlier result and ended its turn doesn't, however recently."""
+    polling = [x["actor"] for x in client.call("GET", f"/api/goals/{g['id']}/listeners")["listeners"]
+               if x["connected"] or x["idle"] < LIVE_WAIT_GRACE]
+    return f"{', '.join(polling)} is waiting on it live" if polling else None
+
+
 def cmd_resumer_run(args):
     """Long-running: resume the requesting agent session whenever a decision with a resume target
     is resolved, or expires undecided (unless --no-expired), and while it's open, when the user asks it to fill
-    values in (unless --no-fill). Also runs a goal's proof when the user asks for it (unless --no-proofs). Pulls the event feed with a persisted cursor, so nothing is missed while it (or the
-    machine) is down; heartbeats so the GUI can warn you when it isn't running."""
+    values in (unless --no-fill). Also runs a goal's proof when the user asks for it (unless --no-proofs), and
+    resumes the session that owns a goal when its proof has passed or failed. Pulls the event feed with a
+    persisted cursor, so nothing is missed while it (or the machine) is down; heartbeats so the GUI can warn
+    you when it isn't running."""
     client = Client(actor=os.environ.get("DECISIONS_ACTOR") or "resumer")
     me = machine_name()
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -864,7 +936,8 @@ def cmd_resumer_run(args):
     described = args.command or "; ".join(f"{a}: {agents.resume_command(a, overrides)}"
                                           for a in dict.fromkeys([*agents.AGENTS, *overrides]))
     types = ",".join(["decision.resolved", *([] if args.no_expired else ["decision.expired"]),
-                      *([] if args.no_fill else FILL_TRIGGERS), *([] if args.no_proofs else ["proof.requested"])])
+                      *([] if args.no_fill else FILL_TRIGGERS), *([] if args.no_proofs else ["proof.requested"]),
+                      *PROOF_RESUME_TRIGGERS])
     print(f"[resumer] {me}: watching {client.url} from event {cursor} for {types}; commands: {described}", flush=True)
     last_beat = 0.0
     while True:
@@ -885,6 +958,7 @@ def cmd_resumer_run(args):
             continue
         for ev in res["events"]:
             age = time.time() - datetime.fromisoformat(ev["ts"].replace("Z", "+00:00")).timestamp()
+            wake = skip = None
             if ev["type"] == "proof.requested":
                 g = client.call("GET", f"/api/goals/{ev['goal_id']}")
                 p = g["proof"] or {}
@@ -893,25 +967,32 @@ def cmd_resumer_run(args):
                 if p.get("machine") == me and p["busy"] and p["run"]["status"] == "requested" \
                         and p["run"]["seq"] == ev["seq"]:
                     threading.Thread(target=_prove_one, args=(client, g, ev["seq"], log_dir), daemon=True).start()
-                d = None
+            elif ev["type"] in PROOF_RESUME_TRIGGERS:
+                # The proof ran wherever its scripts live; the session is woken where it lives, by that
+                # machine's resumer. The state is `capped` after too many failures in a row: leave it be.
+                g = client.call("GET", f"/api/goals/{ev['goal_id']}")
+                if (g["proof"] or {}).get("resume_state"):
+                    wake = _goal_wakeup(g)
+                    skip = _skip_proof_result(client, g)
             else:
                 d = client.call("GET", f"/api/decisions/{ev['decision_id']}")
-            state = d and d.get("resume_state") or {}
-            target = d and d.get("resume") or {}
-            # Sessions live on one machine; leave other machines' decisions to their own resumer.
-            mine = target.get("machine") == me
-            # Only the latest resolution, only if nobody (e.g. you, manually) already resumed it.
+                if d.get("resume_state"):
+                    wake = _decision_wakeup(d)
+                    skip = _skip_fill(client, d) if ev["type"] in FILL_TRIGGERS else None
+            state = wake and wake["state"] or {}
+            # Sessions live on one machine; leave other machines' sessions to their own resumer.
+            mine = wake and wake["resume"].get("machine") == me
+            # Only the latest outcome, only if nobody (e.g. you, manually) already resumed it.
             if mine and state.get("status") == "pending" and state.get("trigger_seq") == ev["seq"]:
-                skip = _skip_fill(client, d) if ev["type"] in FILL_TRIGGERS else None
                 if age > max_age:
-                    print(f"[resumer] {d['id']}: skipping, {d['status']} {age / 86400:.1f} days ago", flush=True)
+                    print(f"[resumer] {wake['id']}: skipping, {ev['type']} {age / 86400:.1f} days ago", flush=True)
                 elif skip:
-                    client.call("POST", f"/api/decisions/{d['id']}/resume-events",
+                    client.call("POST", f"{wake['path']}/resume-events",
                                 {"status": "skipped", "trigger_seq": ev["seq"], "reason": skip})
-                    print(f"[resumer] {d['id']}: not resuming, {skip}", flush=True)
+                    print(f"[resumer] {wake['id']}: not resuming, {skip}", flush=True)
                 else:
-                    command = args.command or agents.resume_command(target["agent"], overrides)
-                    threading.Thread(target=_resume_one, args=(client, d, command, log_dir),
+                    command = args.command or agents.resume_command(wake["resume"]["agent"], overrides)
+                    threading.Thread(target=_resume_one, args=(client, wake, command, log_dir),
                                      daemon=True).start()
             cursor = ev["seq"]
             with open(cursor_file, "w") as fh:
@@ -1143,6 +1224,15 @@ def cmd_token_revoke(args):
     _print(Client().call("DELETE", f"/api/tokens/{args.id}"))
 
 
+def _resume_flags(parser, when: str):
+    """--no-resume / --session / --agent: which agent session the resumer wakes `when`."""
+    parser.add_argument("--no-resume", action="store_true",
+                        help="don't record this agent session for automatic resumption")
+    parser.add_argument("--session", help=f"agent session to resume {when} (default: detected, or DECISIONS_SESSION_ID)")
+    parser.add_argument("--agent", help=f"which agent --session belongs to ({', '.join(agents.AGENTS)}, or any name "
+                                        "the resumer has an --agent-command for)")
+
+
 def main(argv=None):
     from . import __version__
     p = argparse.ArgumentParser(prog="decide", description="General-purpose decision log.")
@@ -1206,11 +1296,7 @@ def main(argv=None):
                         "of those options, and is cancelled otherwise (repeatable)")
     s.add_argument("--json", help="read the request body from a file, or - for stdin")
     s.add_argument("--quiet", "-q", action="store_true", help="print only the decision id")
-    s.add_argument("--no-resume", action="store_true",
-                   help="don't record this agent session for automatic resumption")
-    s.add_argument("--session", help="agent session to resume when decided (default: detected, or DECISIONS_SESSION_ID)")
-    s.add_argument("--agent", help=f"which agent --session belongs to ({', '.join(agents.AGENTS)}, or any name "
-                                   "the resumer has an --agent-command for)")
+    _resume_flags(s, "when decided")
     s.set_defaults(fn=cmd_create)
 
     s = sub.add_parser("get", help="show a decision")
@@ -1279,11 +1365,13 @@ def main(argv=None):
     r.add_argument("--timeout", type=float, help="seconds before the run counts as failed (default 3600)")
     r.add_argument("--remove", action="store_true", help="remove the proof")
     r.add_argument("--json", action="store_true")
+    _resume_flags(r, "with the proof's result")
     r.set_defaults(fn=cmd_goal_proof)
     r = gsub.add_parser("ready", help="flag a goal as achieved and ready to prove: enables the user's Prove button")
     r.add_argument("id")
     r.add_argument("--note", help="what was done, for the user")
     r.add_argument("--no", action="store_true", help="take it back: not ready after all")
+    _resume_flags(r, "with the proof's result")
     r.set_defaults(fn=cmd_goal_ready)
     r = gsub.add_parser("wait", help="block until something happens to a goal's proof")
     r.add_argument("id")

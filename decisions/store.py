@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -238,6 +238,11 @@ GOAL_EVENTS = {"active": "goal.reactivated", "achieved": "goal.achieved", "aband
 # How a goal is proved achieved: a command the resumer runs on the agent's machine when the user asks for it.
 # These events report on a run, and put it in that state.
 PROOF_RUN_EVENTS = ("started", "passed", "failed")
+# A proof's result wakes the session that owns the goal (`proof.resume`), the way a resolution wakes a decision's.
+PROOF_RESUME_TRIGGERS = ("proof.passed", "proof.failed")
+# Loop guard: after this many `proof.failed` in a row the agent isn't resumed again, until the proof passes or
+# is proposed anew (`proof.proposed` / `proof.changed`), which reset the count.
+PROOF_RESUME_FAILURES = 3
 PROOF_TIMEOUT = 3600
 # A run that hasn't reported back this long (seconds) after its timeout is given up on, so it can be asked for again.
 PROOF_GRACE = 300
@@ -1315,7 +1320,8 @@ class Store:
                     "issues": json.loads(row["issues"]),
                     "serves": self._serves_ids(row["id"]),
                     "proof": (p := self._proof_view(row["id"], row)) and {
-                        "agreed": bool(p["agreed"]), "ready": bool(p["ready"]), "run": p["run"] and p["run"]["status"]},
+                        "agreed": bool(p["agreed"]), "ready": bool(p["ready"]), "run": p["run"] and p["run"]["status"],
+                        "resume": p["resume_state"] and p["resume_state"]["status"]},
                     "decisions": {"total": n["total"], "open": n["open"], "resolved": n["resolved"]}})
         return out
 
@@ -1379,8 +1385,38 @@ class Store:
             f"SELECT * FROM events WHERE goal_id=? AND seq>? AND type IN ({','.join('?' * len(PROOF_RUN_EVENTS))}) "
             "ORDER BY seq DESC LIMIT 1", (gid, req["seq"], *(f"proof.{k}" for k in PROOF_RUN_EVENTS))).fetchone()
         if ev:
-            run |= {"status": ev["type"].split(".", 1)[1], "since": ev["ts"], "detail": json.loads(ev["data"])}
+            run |= {"status": ev["type"].split(".", 1)[1], "since": ev["ts"], "detail": json.loads(ev["data"]),
+                    "event_seq": ev["seq"]}
         return run
+
+    def _proof_failures(self, gid: str) -> int:
+        """`proof.failed` in a row: since the proof last passed or was proposed anew."""
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE goal_id=? AND type='proof.failed' AND seq > COALESCE((SELECT MAX(seq) "
+            "FROM events WHERE goal_id=? AND type IN ('proof.passed', 'proof.proposed', 'proof.changed')), 0)",
+            (gid, gid)).fetchone()[0]
+
+    def _proof_resume_state(self, gid: str, proof: dict, run: dict | None) -> dict | None:
+        """Where the owning session's resumption stands for the latest result of the current proof. Mirrors
+        `_resume_state`: `pending` until a `resume.*` event follows the result; `capped` when the proof has
+        failed too many times in a row for the agent to be woken again."""
+        if not proof.get("resume"):
+            return None
+        trigger = run and f"proof.{run['status']}"
+        if trigger not in PROOF_RESUME_TRIGGERS or run["hash"] != proof["hash"]:
+            return {"status": "armed"}
+        failures = self._proof_failures(gid) if trigger == "proof.failed" else 0
+        state = {"status": "pending", "trigger": trigger, "trigger_seq": run["event_seq"], "since": run["since"],
+                 "failures": failures, "max_failures": PROOF_RESUME_FAILURES}
+        ev = self.conn.execute(
+            "SELECT * FROM events WHERE goal_id=? AND type LIKE 'resume.%' AND seq>? ORDER BY seq DESC LIMIT 1",
+            (gid, run["event_seq"])).fetchone()
+        if ev:
+            state |= {"status": ev["type"].split(".", 1)[1], "since": ev["ts"], "actor": ev["actor"],
+                      "detail": json.loads(ev["data"])}
+        elif failures > PROOF_RESUME_FAILURES:
+            state["status"] = "capped"
+        return state
 
     def _proof_view(self, gid: str, row) -> dict | None:
         if not row["proof"]:
@@ -1390,7 +1426,8 @@ class Store:
         waited = run and (datetime.now(timezone.utc) - parse_ts(run["since"])).total_seconds()
         # Asked for and not reported back yet. Past its timeout it's given up on: the resumer died or is offline.
         busy = bool(run and run["status"] in ("requested", "started") and waited <= proof["timeout"] + PROOF_GRACE)
-        return proof | {"run": run, "busy": busy}
+        return proof | {"run": run, "busy": busy, "resume_command": manual_command(proof.get("resume")),
+                        "resume_state": self._proof_resume_state(gid, proof, run)}
 
     def _proof_row(self, gid: str, scope: Scope) -> tuple:
         row = self._goal_row(gid, scope)
@@ -1400,23 +1437,29 @@ class Store:
         return row, view
 
     def _write_proof(self, gid: str, proof: dict | None):
-        stored = proof and {k: v for k, v in proof.items() if k not in ("run", "busy")}
+        stored = proof and {k: v for k, v in proof.items() if k not in ("run", "busy", "resume_command", "resume_state")}
         self.conn.execute("UPDATE goals SET proof=?, updated_at=? WHERE id=?",
                           (canonical(stored) if stored else None, now_iso(), gid))
 
     def set_proof(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         """Propose how the goal is proved achieved, or change it. A change is logged with both hashes and
-        has to be agreed on again."""
+        has to be agreed on again. `resume` (as on a decision) is the session to wake with the result; it isn't
+        part of what's agreed on, and is kept when left out."""
         gid = norm_goal_id(raw_id)
         proof = _proof(body)
         with self.tx():
             row = self._goal_row(gid, scope)
             old = self._proof_view(gid, row)
+            resume = _resume(body["resume"]) if "resume" in body else old and old.get("resume")
             if old and old["hash"] == proof["hash"]:
+                if resume != old.get("resume"):
+                    self._write_proof(gid, old | {"resume": resume})
+                    self._event(None, "proof.retargeted", actor, {"hash": proof["hash"], "resume": resume}, goal_id=gid)
                 return self._goal_dict(gid)
             if old and old["busy"]:
                 raise ApiError(409, f"{gid}'s proof is running; change it when it has finished")
             # Whether the goal is ready to be proved is the agent's claim about the work, not about the script.
+            proof |= {"resume": resume}
             self._write_proof(gid, proof | {"proposed_by": actor, "proposed_at": now_iso(), "agreed": None,
                                             "ready": old["ready"] if old else None})
             if old:
@@ -1461,15 +1504,19 @@ class Store:
 
     def ready_proof(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         """The agent's claim that the goal is achieved (or, `ready: false`, that it isn't after all). It's what
-        lets the user ask for the proof."""
+        lets the user ask for the proof. A `resume` given here replaces the session the result wakes: the
+        session that claims the work done is the one that hears how it went."""
         gid = norm_goal_id(raw_id)
         ready = _opt_type(body, "ready", bool, True)
         note = _opt_type(body, "note", str, "")
         with self.tx():
             _, proof = self._proof_row(gid, scope)
+            retarget = {"resume": _resume(body["resume"])} if "resume" in body and ready else {}
             if ready or proof["ready"]:
-                self._write_proof(gid, proof | {"ready": {"by": actor, "at": now_iso(), "note": note} if ready else None})
-                self._event(None, "proof.ready" if ready else "proof.not_ready", actor, {"note": note}, goal_id=gid)
+                self._write_proof(gid, proof | retarget | {
+                    "ready": {"by": actor, "at": now_iso(), "note": note} if ready else None})
+                self._event(None, "proof.ready" if ready else "proof.not_ready", actor, {"note": note} | retarget,
+                            goal_id=gid)
             return self._goal_dict(gid)
 
     def request_proof(self, raw_id: str, actor: str, scope: Scope = ALL) -> dict:
@@ -1734,6 +1781,19 @@ class Store:
             self._touch(did)
             self._event(did, f"resume.{kind}", actor, {k: v for k, v in body.items() if k != "status"})
             return self._decision_dict(did)
+
+    def goal_resume_event(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """The resumer's (or a person's) report on waking the session that owns a goal, after its proof's result."""
+        gid = norm_goal_id(raw_id)
+        kind = body.get("status")
+        if kind not in self.RESUME_EVENTS:
+            raise ApiError(400, f"status must be one of {', '.join(self.RESUME_EVENTS)}")
+        with self.tx():
+            _, proof = self._proof_row(gid, scope)
+            if not proof.get("resume"):
+                raise ApiError(400, f"{gid}'s proof has no resume target")
+            self._event(None, f"resume.{kind}", actor, {k: v for k, v in body.items() if k != "status"}, goal_id=gid)
+            return self._goal_dict(gid)
 
     def resumer_heartbeat(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
         machine = str(body.get("machine") or body.get("host") or "default")
@@ -2150,22 +2210,22 @@ class Store:
         return self.q1("SELECT COALESCE(MAX(seq), 0) FROM events")[0]
 
     def wait_events(self, after=0, decision_id=None, types=None, timeout=0.0, limit=200,
-                    scope: Scope = ALL, goal_id=None) -> list[dict]:
-        deadline = time.monotonic() + timeout
-        with self.cond:
-            while True:
-                evs = self.events(after, decision_id, types, limit, scope, goal_id)
-                remaining = deadline - time.monotonic()
-                if evs or remaining <= 0:
-                    return evs
-                self.cond.wait(remaining)
+                    scope: Scope = ALL, goal_id=None, actor: str = "api") -> list[dict]:
+        # A long-poll on one goal (`decide goal wait`) is a live session the resumer shouldn't also wake.
+        tracked = goal_id and timeout > 0 and (norm_goal_id(goal_id), actor, tuple(types or ()))
+        with self._waiting(tracked) if tracked else nullcontext():
+            deadline = time.monotonic() + timeout
+            with self.cond:
+                while True:
+                    evs = self.events(after, decision_id, types, limit, scope, goal_id)
+                    remaining = deadline - time.monotonic()
+                    if evs or remaining <= 0:
+                        return evs
+                    self.cond.wait(remaining)
 
-    def wait_decision(self, raw_id: str, types: list[str], after: int | None, timeout: float,
-                      actor: str = "api", scope: Scope = ALL) -> dict:
-        did = norm_id(raw_id)
-        with self.lock:
-            self._decision_row(did, scope)
-        key = (did, actor, tuple(types))
+    @contextmanager
+    def _waiting(self, key: tuple):
+        """Count a long-poller on a decision or goal while it's connected."""
         with self.lock:
             w = self.waiters.get(key)
             # Clients re-poll in chunks; treat a quick reconnect as the same continuous wait.
@@ -2173,26 +2233,46 @@ class Store:
                 w = self.waiters[key] = {"since": now_iso(), "connections": 0, "last_seen": time.time()}
             w["connections"] += 1
         try:
-            return self._wait_decision(did, types, after, timeout, actor)
+            yield
         finally:
             with self.lock:
                 w["connections"] -= 1
                 w["last_seen"] = time.time()
 
+    def wait_decision(self, raw_id: str, types: list[str], after: int | None, timeout: float,
+                      actor: str = "api", scope: Scope = ALL) -> dict:
+        did = norm_id(raw_id)
+        with self.lock:
+            self._decision_row(did, scope)
+        with self._waiting((did, actor, tuple(types))):
+            return self._wait_decision(did, types, after, timeout, actor)
+
+    def _long_pollers(self, subject: str) -> list[dict]:
+        """Who is long-polling a decision or goal right now. Call under the lock."""
+        out = []
+        for (wid, actor, types), w in list(self.waiters.items()):
+            idle = time.time() - w["last_seen"]
+            if not w["connections"] and idle > 90:
+                del self.waiters[(wid, actor, types)]
+                continue
+            if wid == subject:
+                out.append({"kind": "long-poll", "id": f"poll:{actor}", "actor": actor, "events": list(types),
+                            "since": w["since"], "connected": w["connections"] > 0, "idle": round(idle, 1)})
+        return out
+
+    def goal_listeners(self, raw_id: str, scope: Scope = ALL) -> list[dict]:
+        """Sessions long-polling this goal (`decide goal wait`)."""
+        gid = norm_goal_id(raw_id)
+        with self.lock:
+            self._goal_row(gid, scope)
+            return self._long_pollers(gid)
+
     def listeners(self, raw_id: str, scope: Scope = ALL) -> list[dict]:
         """Everyone who will hear about this decision: long-pollers and webhooks."""
         did = norm_id(raw_id)
-        out = []
         with self.lock:
             space = self._decision_row(did, scope)["space"]
-            for (wdid, actor, types), w in list(self.waiters.items()):
-                idle = time.time() - w["last_seen"]
-                if not w["connections"] and idle > 90:
-                    del self.waiters[(wdid, actor, types)]
-                    continue
-                if wdid == did:
-                    out.append({"kind": "long-poll", "id": f"poll:{actor}", "actor": actor, "events": list(types), "since": w["since"],
-                                "connected": w["connections"] > 0})
+            out = self._long_pollers(did)
             subs = self.conn.execute(
                 "SELECT * FROM subscriptions WHERE active=1 AND (decision_id=? OR "
                 "(decision_id IS NULL AND (space IS NULL OR space=?)))", (did, space))

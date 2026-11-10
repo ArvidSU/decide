@@ -967,7 +967,7 @@ class DecisionsTest(unittest.TestCase):
         p = self.call("POST", f"/api/goals/{gid}/proof/ready", {"note": "released 1.4"}, expect=200)["proof"]
         self.assertEqual((p["ready"]["by"], p["ready"]["note"]), ("agent", "released 1.4"))
         self.assertEqual(self.call("GET", "/api/goals?status=all")["goals"][0]["proof"],
-                         {"agreed": True, "ready": True, "run": None})
+                         {"agreed": True, "ready": True, "run": None, "resume": None})
 
         run(actor="agent", expect=403)
         p = run(expect=201)["proof"]
@@ -1057,6 +1057,182 @@ class DecisionsTest(unittest.TestCase):
         heard, g = prove("passed")
         self.assertEqual((g["status"], g["proof"]["run"]["status"]), ("achieved", "passed"))
         self.assertIn("passed", decide("goal", "get", gid).stdout)
+
+    def test_proof_result_arms_the_goals_session_for_resumption(self):
+        gid = self.goal("Ship it")["id"]
+        spec = {"success": "released", "command": "./prove.sh", "machine": "mb", "cwd": "/work"}
+        session = {"session_id": "sess-1", "cwd": "/work", "agent": "claude-code", "machine": "mb"}
+        proof = lambda: self.call("GET", f"/api/goals/{gid}")["proof"]
+        state = lambda: proof()["resume_state"]
+        # No session recorded: nothing to resume. A session on the proof is armed, outside what's agreed on.
+        self.assertIsNone(self.call("PUT", f"/api/goals/{gid}/proof", spec, expect=200)["proof"]["resume_state"])
+        self.call("POST", f"/api/goals/{gid}/resume-events", {"status": "manual"}, actor="me", expect=400)
+        first = proof()["hash"]
+        p = self.call("PUT", f"/api/goals/{gid}/proof", spec | {"resume": session}, expect=200)["proof"]
+        self.assertEqual((p["hash"], p["resume"], p["resume_state"]), (first, session, {"status": "armed"}))
+        self.assertIn("claude --resume sess-1", p["resume_command"])
+        self.assertEqual(self.call("GET", f"/api/goals/{gid}/events")["events"][-1]["type"], "proof.retargeted")
+        # Flagging ready from another session makes that one the target; leaving `resume` out keeps it.
+        self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": first}, actor="me", expect=200)
+        self.call("POST", f"/api/goals/{gid}/proof/ready", {"resume": session | {"session_id": "sess-2"}}, expect=200)
+        self.assertEqual(proof()["resume"]["session_id"], "sess-2")
+        self.call("PUT", f"/api/goals/{gid}/proof", spec, expect=200)
+        self.assertEqual(proof()["resume"]["session_id"], "sess-2")
+
+        report = lambda status, **x: self.call("POST", f"/api/goals/{gid}/proof/events",
+                                               {"status": status, "request_seq": proof()["run"]["seq"]} | x,
+                                               actor="resumer", expect=201)
+        resumed = lambda status, **x: self.call("POST", f"/api/goals/{gid}/resume-events",
+                                                {"status": status, "trigger_seq": state()["trigger_seq"]} | x,
+                                                actor="resumer", expect=201)
+        fail = lambda: (self.call("POST", f"/api/goals/{gid}/proof/ready", {}, expect=200),
+                        self.call("POST", f"/api/goals/{gid}/proof/run", actor="me", expect=201),
+                        report("failed", exit_code=1, output_tail="still on 1.3"))
+        # A failed run: pending against that very event, until the resumer reports in.
+        fail()
+        events = self.call("GET", f"/api/goals/{gid}/events")["events"]
+        self.assertEqual(state(), {"status": "pending", "trigger": "proof.failed", "trigger_seq": events[-1]["seq"],
+                                   "since": events[-1]["ts"], "failures": 1, "max_failures": 3})
+        resumed("started", pid=1)
+        self.assertEqual(state()["status"], "started")
+        g = resumed("finished", exit_code=0)
+        self.assertEqual((g["proof"]["resume_state"]["status"], g["proof"]["resume_state"]["actor"]), ("finished", "resumer"))
+        # The loop guard: the fourth failure in a row isn't offered for resumption.
+        fail()
+        self.assertEqual((state()["status"], state()["failures"]), ("pending", 2))
+        resumed("finished")
+        fail()
+        self.assertEqual((state()["status"], state()["failures"]), ("pending", 3))
+        resumed("finished")
+        fail()
+        self.assertEqual((state()["status"], state()["failures"]), ("capped", 4))
+        # Proposing the proof anew resets it; passing arms nothing further and achieves the goal.
+        self.call("PUT", f"/api/goals/{gid}/proof", spec | {"command": "./prove2.sh"}, expect=200)
+        self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": proof()["hash"]}, actor="me", expect=200)
+        fail()
+        self.assertEqual((state()["status"], state()["failures"]), ("pending", 1))
+        resumed("finished")
+        self.call("POST", f"/api/goals/{gid}/proof/ready", {}, expect=200)
+        self.call("POST", f"/api/goals/{gid}/proof/run", actor="me", expect=201)
+        g = report("passed", exit_code=0)
+        self.assertEqual((g["status"], g["proof"]["resume_state"]["trigger"], g["proof"]["resume_state"]["failures"]),
+                         ("achieved", "proof.passed", 0))
+        # A session in `decide goal wait` is listed, so the resumer can leave it to hear the result itself.
+        self.assertEqual(self.call("GET", f"/api/goals/{gid}/listeners")["listeners"], [])
+        t = threading.Thread(target=self.call, args=("GET", f"/api/events?goal={gid}&types=proof.passed&after=999999&wait=2"),
+                             kwargs={"actor": "claude-code"}, daemon=True)
+        t.start(); time.sleep(0.3)
+        live = self.call("GET", f"/api/goals/{gid}/listeners")["listeners"]
+        self.assertEqual((live[0]["actor"], live[0]["connected"], live[0]["events"]), ("claude-code", True, ["proof.passed"]))
+        t.join()
+        self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
+
+    def test_resumer_wakes_the_goals_session_with_the_proofs_result(self):
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(work)
+        out = os.path.join(self.tmp, "resumed.txt")
+        state_dir = os.path.join(self.tmp, "state")
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT, "DECISIONS_MACHINE": "mb",
+                            "DECISIONS_STATE_DIR": state_dir, "CLAUDE_CODE_SESSION_ID": "sess-g"}
+        decide = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=work,
+                                           capture_output=True, text=True)
+        with open(os.path.join(work, "prove.sh"), "w") as fh:
+            fh.write('echo "checking $GOAL_ID"; test -f released\n')
+        gid = decide("goal", "create", "Ship it", "-q").stdout.strip()
+        decide("goal", "proof", gid, "--command", "sh prove.sh", "--success", "`released` exists", "--script", "prove.sh")
+        goal = lambda i=gid: self.call("GET", f"/api/goals/{i}")
+        self.assertEqual((goal()["proof"]["resume"]["session_id"], goal()["proof"]["resume"]["machine"],
+                          goal()["proof"]["resume_state"]), ("sess-g", "mb", {"status": "armed"}))
+        agree = lambda i=gid: self.call("POST", f"/api/goals/{i}/proof/agree", {"hash": goal(i)["proof"]["hash"]},
+                                        actor="me", expect=200)
+        agree()
+        # One record per wake-up: the prompt spans lines (it ends with the proof's output).
+        lines = lambda: open(out).read().split("<<END>>\n")[:-1] if os.path.exists(out) else []
+        settled = lambda i=gid: next((True for _ in range(150) if goal(i)["proof"]["resume_state"]["status"]
+                                      in ("finished", "failed", "skipped", "capped") or time.sleep(0.1)), False)
+        start = lambda: subprocess.Popen(
+            [sys.executable, "-m", "decisions", "resumer", "run", "--command",
+             f'echo "$RESUME_SESSION_ID|$PROOF_RESULT|$GOAL_ID|$RESUME_PROMPT" >> {out}; echo "<<END>>" >> {out}'],
+            env=env | {"DECISIONS_ACTOR": "resumer"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        resumer = start()
+        self.assertEqual(resumer.stdout.readline()[:10], "[resumer] ")
+        time.sleep(0.3)
+
+        # The proof fails: the session that flagged the goal ready is woken, told why, and what to do.
+        decide("goal", "ready", gid, "--note", "done")
+        self.call("POST", f"/api/goals/{gid}/proof/run", actor="me", expect=201)
+        self.assertTrue(settled())
+        self.assertEqual(len(lines()), 1)
+        self.assertTrue(lines()[0].startswith(f"sess-g|failed|{gid}|[decisions] {gid}"), lines())
+        for s in ("failed (exit 1", "failure 1 of 3 in a row", "Fix the work, not the proof", f"decide goal ready {gid}",
+                  "Don't run `decide goal wait`", f"checking {gid}"):
+            self.assertIn(s, lines()[0])
+        self.assertEqual(goal()["proof"]["resume_state"]["status"], "finished")
+
+        # Replaying the whole feed resumes nothing twice: the result was already acted on.
+        resumer.terminate(); resumer.wait()
+        with open(os.path.join(state_dir, "resumer.cursor"), "w") as fh:
+            fh.write("0")
+        resumer = start()
+        resumer.stdout.readline()
+        time.sleep(1)
+        self.assertEqual(len(lines()), 1)
+
+        # A session still in `decide goal wait` hears it itself; the resumer leaves it alone.
+        waiter = subprocess.Popen([sys.executable, "-m", "decisions", "goal", "wait", gid, "--timeout", "20"],
+                                  env=env | {"DECISIONS_ACTOR": "claude-code"}, cwd=work, stdout=subprocess.PIPE, text=True)
+        time.sleep(0.5)
+        decide("goal", "ready", gid)
+        self.call("POST", f"/api/goals/{gid}/proof/run", actor="me", expect=201)
+        self.assertTrue(waiter.communicate(timeout=30)[0].startswith("event: proof.failed"))
+        self.assertTrue(settled())
+        self.assertEqual((goal()["proof"]["resume_state"]["status"], len(lines())), ("skipped", 1))
+
+        # Passing: the goal is achieved and the session (its wait long over) is told to carry on.
+        time.sleep(5.5)
+        open(os.path.join(work, "released"), "w").close()
+        decide("goal", "ready", gid)
+        self.call("POST", f"/api/goals/{gid}/proof/run", actor="me", expect=201)
+        self.assertTrue(settled())
+        self.assertEqual((goal()["status"], len(lines())), ("achieved", 2))
+        self.assertTrue(lines()[1].startswith(f"sess-g|passed|{gid}|[decisions] {gid}"), lines())
+        self.assertIn("is achieved", lines()[1])
+        self.assertIn("Continue with the next piece of work", lines()[1])
+
+        # The proof runs elsewhere, but the session lives here: this resumer wakes it. Until the cap.
+        other = self.goal("Elsewhere")["id"]
+        self.call("PUT", f"/api/goals/{other}/proof", {
+            "success": "x", "command": "x", "machine": "ci", "cwd": "/w",
+            "resume": {"session_id": "sess-e", "cwd": work, "agent": "claude-code", "machine": "mb"}}, expect=200)
+        agree(other)
+        for n in range(1, 5):
+            self.call("POST", f"/api/goals/{other}/proof/ready", {}, expect=200)
+            seq = self.call("POST", f"/api/goals/{other}/proof/run", actor="me", expect=201)["proof"]["run"]["seq"]
+            self.call("POST", f"/api/goals/{other}/proof/events", {"status": "failed", "request_seq": seq, "exit_code": 2},
+                      actor="ci-resumer", expect=201)
+            self.assertTrue(settled(other))
+            self.assertEqual((goal(other)["proof"]["resume_state"]["status"], len(lines())),
+                             ("finished" if n <= 3 else "capped", 2 + min(n, 3)), n)
+        self.assertIn("failure 3 of 3 in a row. After this one you won't be resumed again", lines()[-1])
+        self.assertTrue(lines()[-1].startswith("sess-e|failed|"))
+
+        # And a session on another machine is that machine's business.
+        theirs = self.goal("Theirs")["id"]
+        self.call("PUT", f"/api/goals/{theirs}/proof", {
+            "success": "x", "command": "x", "machine": "mb", "cwd": work,
+            "resume": {"session_id": "sess-t", "cwd": work, "agent": "claude-code", "machine": "desktop"}}, expect=200)
+        agree(theirs)
+        self.call("POST", f"/api/goals/{theirs}/proof/ready", {}, expect=200)
+        self.call("POST", f"/api/goals/{theirs}/proof/run", actor="me", expect=201)
+        for _ in range(100):
+            if goal(theirs)["proof"]["run"]["status"] == "failed":
+                break
+            time.sleep(0.1)
+        time.sleep(0.5)
+        resumer.terminate(); resumer.wait()
+        self.assertEqual((goal(theirs)["proof"]["run"]["status"], goal(theirs)["proof"]["resume_state"]["status"]),
+                         ("failed", "pending"))
+        self.assertEqual(len(lines()), 5)
 
     def test_cli_goals_map_and_insights(self):
         env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT}

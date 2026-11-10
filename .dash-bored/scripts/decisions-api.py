@@ -211,6 +211,8 @@ def goals_list():
             bits.append("proof " + (p["run"] if p["run"] in ("passed", "failed") else "running" if p["run"]
                                     else "ready" if p["agreed"] and p["ready"] else "agreed" if p["agreed"]
                                     else "to agree on"))
+            if p.get("resume") and p["resume"] != "armed":
+                bits.append("agent resume: " + p["resume"])
         if g.get("issues"):
             bits.append("worked on in " + ", ".join(i["key"] for i in g["issues"]))
         if g.get("status_note"):
