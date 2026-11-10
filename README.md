@@ -20,7 +20,7 @@ Open http://127.0.0.1:8787 in your browser. Leave the server running and, in a s
 in the cloned repository, optionally load demo decisions or install the CLI:
 
 ```sh
-python3 examples/seed.py              # optional: demo decisions
+python3 examples/seed.py              # optional: demo goals, decisions and proofs
 python3 -m unittest discover tests    # tests
 uv tool install --editable .          # puts `decide` on PATH
 decide skill install                  # teach your agents (Claude Code, Codex, anything reading ~/.agents/skills)
