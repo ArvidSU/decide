@@ -4,13 +4,14 @@
 
 // A link like http://server:8787/#token=… logs this browser in (the hash never reaches the server).
 if (location.hash.startsWith("#token=")) {
-  storage("token", decodeURIComponent(location.hash.slice(7)));
+  const t = decodeURIComponent(location.hash.slice(7)).trim();
+  if (validToken(t)) storage("token", t);
   history.replaceState(null, "", location.pathname + location.search);
 }
 
 const S = {
   config: null,
-  token: storage("token") || "",
+  token: validToken(storage("token")) ? storage("token") : "",  // a bad saved token would break every request
   status: storage("status") || "open",
   space: storage("space") || "",   // "" = every space this token sees
   q: "",
@@ -36,6 +37,11 @@ const S = {
   editingGoal: false,
   addingTag: false,
 };
+
+// It goes in the Authorization header, which fetch() refuses outright if it has spaces or non-ASCII.
+function validToken(t) {
+  return /^[!-~]+$/.test(t || "");
+}
 
 function storage(key, value) {
   try {
@@ -135,8 +141,14 @@ async function api(method, path, body) {
   const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   if (res.status === 401) {
     // Requests fired together share one sign-in dialog.
-    tokenAsk ||= ask({ title: "Sign in", body: "<p>This decisions server needs its API token.</p>", field: "Token", type: "password", ok: "Sign in", cancel: "" })
-      .finally(() => (tokenAsk = null));
+    tokenAsk ||= (async () => {
+      let msg = "<p>This decisions server needs its API token.</p>";
+      for (;;) {
+        const t = await ask({ title: "Sign in", body: msg, field: "Token", type: "password", ok: "Sign in", cancel: "" });
+        if (!t || validToken(t)) return t;
+        msg = `<p class="dialog-error">That isn't a token: tokens have no spaces or non-ASCII characters.</p>`;
+      }
+    })().finally(() => (tokenAsk = null));
     const t = await tokenAsk;
     if (t) { S.token = t; storage("token", t); return api(method, path, body); }
     throw new Error("unauthorized");

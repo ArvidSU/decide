@@ -544,6 +544,7 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 .dialog h3 { font-size: 16px; font-weight: 650; }
 .dialog-body { color: var(--muted); font-size: 14px; }
 .dialog-body p { margin: 0; }
+.dialog-body .dialog-error { color: var(--bad); }
 .dialog-body .install-cmd { margin: 10px 0 0; color: var(--text); }
 .dialog-field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); font-weight: 550; }
 .dialog-field .input { font-weight: 400; font-size: 14px; height: 38px; color: var(--text); }
