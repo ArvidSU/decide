@@ -137,6 +137,6 @@ If the work is tracked in an issue (Linear, Jira, GitHub, …), whether you crea
 decide issue D-12 https://linear.app/acme/issue/LIN-42
 ```
 
-Link the issue for the work itself, not the one the question came from (that goes in `links`).
+Link the issue for the work itself, not the one the question came from (that goes in `links`). You can link it as soon as it exists, before the decision is made. When an issue tracks the work toward a goal, link it to the goal the same way: `decide goal issue G-7 https://linear.app/acme/issue/LIN-40` (or `decide goal create … --issue URL`).
 
 The user may revise a decision later (another `decision.resolved`, or `decision.reopened`). The latest resolution is authoritative. If `outdated_by` is non-empty, a decision this one depends on changed after it was made. Check with the user before acting on it. A revision may skip notifying you (e.g. a typo fix), so check `decide get` before acting on an older one.

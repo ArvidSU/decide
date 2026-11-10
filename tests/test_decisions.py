@@ -1120,6 +1120,48 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual([i["key"] for i in self.call("GET", f"/api/decisions/{did}")["issues"]], ["GH-4"])
         self.assertNotEqual(run("issue", did, "LIN-1", "--remove").returncode, 0)
 
+    def test_issues_link_at_any_status(self):
+        d = self.create()
+        d = self.call("PATCH", f"/api/decisions/{d['id']}", {"issues": ["https://linear.app/a/issue/LIN-5"]})
+        self.assertEqual((d["status"], [i["key"] for i in d["issues"]]), ("open", ["LIN-5"]))
+
+    def test_issues_record_where_a_goal_is_worked_on(self):
+        g = self.goal("Ship search", issues=["https://linear.app/acme/issue/LIN-40/search"])
+        self.assertEqual(g["issues"], [{"url": "https://linear.app/acme/issue/LIN-40/search", "key": "LIN-40"}])
+        gid = g["id"]
+        for status in ("achieved", "active", "abandoned"):
+            self.call("PATCH", f"/api/goals/{gid}", {"status": status})
+            urls = [*[i["url"] for i in g["issues"]], f"https://github.com/o/r/issues/{len(g['issues'])}"]
+            g = self.call("PATCH", f"/api/goals/{gid}", {"issues": urls})
+            self.assertEqual(g["status"], status)
+        self.assertEqual([i["key"] for i in g["issues"]], ["LIN-40", "r#1", "r#2", "r#3"])
+        g = self.call("PATCH", f"/api/goals/{gid}", {"issues": [{"url": "https://tracker.example/t/1", "key": "T1"}]})
+        self.assertEqual(g["issues"], [{"url": "https://tracker.example/t/1", "key": "T1"}])
+        for bad in (["javascript:alert(1)"], [{"key": "LIN-1"}], "https://linear.app/x"):
+            self.call("PATCH", f"/api/goals/{gid}", {"issues": bad}, expect=400)
+        self.call("POST", "/api/goals", {"title": "x", "issues": ["nope"]}, expect=400)
+        # Each change is a logged `goal.updated`; setting the same list again is not.
+        self.call("PATCH", f"/api/goals/{gid}", {"issues": g["issues"]})
+        changes = [e["data"]["changes"] for e in self.call("GET", f"/api/goals/{gid}/events")["events"]
+                   if e["type"] == "goal.updated"]
+        self.assertEqual(len(changes), 4)
+        self.assertEqual(changes[-1]["issues"][1], g["issues"])
+        listed = {x["id"]: x for x in self.call("GET", "/api/goals?status=all")["goals"]}
+        self.assertEqual(listed[gid]["issues"], g["issues"])
+
+    def test_cli_goal_issue(self):
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT}
+        run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,
+                                        capture_output=True, text=True)
+        gid = run("goal", "create", "Ship it", "--issue", "https://linear.app/a/issue/LIN-1", "-q").stdout.strip()
+        out = run("goal", "issue", gid, "https://github.com/o/r/issues/4", "--key", "GH-4")
+        self.assertEqual(out.stdout.split("\n")[:2], ["LIN-1  https://linear.app/a/issue/LIN-1",
+                                                      "GH-4  https://github.com/o/r/issues/4"], out.stderr)
+        self.assertIn("acted on in GH-4: https://github.com/o/r/issues/4", run("goal", "get", gid).stdout)
+        run("goal", "issue", gid, "LIN-1", "--remove")
+        self.assertEqual([i["key"] for i in self.call("GET", f"/api/goals/{gid}")["issues"]], ["GH-4"])
+        self.assertNotEqual(run("goal", "issue", gid, "LIN-1", "--remove").returncode, 0)
+
 
 class RemoteTest(unittest.TestCase):
     """The server on one machine, agents on others: token auth, installing from the server, connect."""

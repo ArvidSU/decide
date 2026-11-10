@@ -272,8 +272,10 @@ def cmd_get(args):
 
 
 def cmd_issue(args):
+    """Link or unlink an issue on a decision (`decide issue`) or a goal (`decide goal issue`)."""
     c = Client()
-    issues = c.call("GET", f"/api/decisions/{args.id}")["issues"]
+    path = f"/api/{args.kind}/{args.id}"
+    issues = c.call("GET", path)["issues"]
     if args.remove:
         keep = [i for i in issues if args.url not in (i["url"], i["key"])]
         if len(keep) == len(issues):
@@ -281,8 +283,8 @@ def cmd_issue(args):
         issues = keep
     else:
         issues = [*issues, {"url": args.url, **({"key": args.key} if args.key else {})}]
-    d = c.call("PATCH", f"/api/decisions/{args.id}", {"issues": issues})
-    for i in d["issues"]:
+    x = c.call("PATCH", path, {"issues": issues})
+    for i in x["issues"]:
         print(f"{i['key']}  {i['url']}")
 
 
@@ -325,7 +327,7 @@ def cmd_goal_list(args):
 
 
 def cmd_goal_create(args):
-    body = {"title": args.title, "serves": args.serves or [], "tags": args.tag or []}
+    body = {"title": args.title, "serves": args.serves or [], "tags": args.tag or [], "issues": args.issue or []}
     if args.description:
         body["description"] = args.description
     if args.space or os.environ.get("DECISIONS_SPACE"):
@@ -344,6 +346,8 @@ def cmd_goal_get(args):
     print(f"{g['id']}  [{g['status']}]  {g['title']}\n  {g['url']}")
     if g["status_note"]:
         print(f"  {g['status']}: {g['status_note']}")
+    for i in g["issues"]:
+        print(f"  acted on in {i['key']}: {i['url']}")
     for x in g["serves"]:
         print(f"  serves {x['goal']} [{x['status']}] {x['title']}")
     for x in g["subgoals"]:
@@ -1220,7 +1224,7 @@ def main(argv=None):
     s.add_argument("url", help="the issue's URL (with --remove: its URL or key)")
     s.add_argument("--key", help="what to call it, e.g. LIN-42 (default: read off the URL)")
     s.add_argument("--remove", action="store_true", help="unlink it instead")
-    s.set_defaults(fn=cmd_issue)
+    s.set_defaults(fn=cmd_issue, kind="decisions")
 
     s = sub.add_parser("list", help="list decisions")
     s.add_argument("--status", default="open")
@@ -1240,6 +1244,8 @@ def main(argv=None):
     r.add_argument("--serves", action="append", metavar="G-N", help="a larger goal this one is a step toward (repeatable)")
     r.add_argument("--description")
     r.add_argument("--tag", action="append", help="e.g. business, product, tech (repeatable); its decisions share them")
+    r.add_argument("--issue", action="append", metavar="URL",
+                   help="an issue (Linear, Jira, GitHub, …) where it's being worked on (repeatable)")
     r.add_argument("--space", help="space to create it in (default: the token's space, or DECISIONS_SPACE)")
     r.add_argument("--quiet", "-q", action="store_true", help="print only the goal id")
     r.set_defaults(fn=cmd_goal_create)
@@ -1256,6 +1262,12 @@ def main(argv=None):
     r.add_argument("--serves", nargs="*", metavar="G-N", help="replace the goals it serves (none: a top-level goal)")
     r.add_argument("--tags", nargs="*", help="replace its tags")
     r.set_defaults(fn=cmd_goal_set)
+    r = gsub.add_parser("issue", help="link a goal to the issue where it's being worked on (Linear, Jira, GitHub, …)")
+    r.add_argument("id")
+    r.add_argument("url", help="the issue's URL (with --remove: its URL or key)")
+    r.add_argument("--key", help="what to call it, e.g. LIN-42 (default: read off the URL)")
+    r.add_argument("--remove", action="store_true", help="unlink it instead")
+    r.set_defaults(fn=cmd_issue, kind="goals")
     r = gsub.add_parser("proof", help="propose (or change) how a goal is proved achieved: a command the resumer "
                                       "runs here, in this directory, when the user asks for it")
     r.add_argument("id")

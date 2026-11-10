@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS goals (
   description TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'active',
   status_note TEXT NOT NULL DEFAULT '',
+  issues TEXT NOT NULL DEFAULT '[]',
   tags TEXT NOT NULL DEFAULT '[]',
   proof TEXT,
   created_at TEXT NOT NULL,
@@ -385,7 +386,7 @@ def _issue_key(url: str) -> str:
 
 
 def _issues(value) -> list:
-    """`issues`: where the decision is being acted on. URLs or {url, key?}; key defaults to one read off the URL."""
+    """`issues`: where a decision or goal is being acted on. URLs or {url, key?}; key defaults to one read off the URL."""
     if not isinstance(value, list):
         raise ApiError(400, "issues must be a list of URLs or {url, key?} objects")
     out = {}
@@ -1250,6 +1251,7 @@ class Store:
             "description": row["description"],
             "status": row["status"],
             "status_note": row["status_note"],
+            "issues": json.loads(row["issues"]),
             "tags": json.loads(row["tags"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -1271,10 +1273,11 @@ class Store:
             gid, ts = f"G-{num}", now_iso()
             serves = self._check_serves(gid, space, _goal_ids(body.get("serves", []), "serves"))
             self.conn.execute(
-                """INSERT INTO goals (id, num, space, title, description, status, status_note, tags, created_at,
-                   updated_at, closed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO goals (id, num, space, title, description, status, status_note, issues, tags,
+                   created_at, updated_at, closed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (gid, num, space, title, _opt_type(body, "description", str, ""), status,
-                 _opt_type(body, "note", str, ""), canonical(_opt_type(body, "tags", list, [])), ts, ts,
+                 _opt_type(body, "note", str, ""), canonical(_issues(body.get("issues") or [])),
+                 canonical(_opt_type(body, "tags", list, [])), ts, ts,
                  None if status == "active" else ts))
             self._write_serves(gid, serves)
             out = self._goal_dict(gid)
@@ -1309,6 +1312,7 @@ class Store:
                 out.append({k: row[k] for k in ("id", "space", "title", "status", "status_note", "created_at",
                                                 "updated_at", "closed_at")} | {
                     "url": f"{self.cfg.public_url}/g/{row['id']}", "tags": json.loads(row["tags"]),
+                    "issues": json.loads(row["issues"]),
                     "serves": self._serves_ids(row["id"]),
                     "proof": (p := self._proof_view(row["id"], row)) and {
                         "agreed": bool(p["agreed"]), "ready": bool(p["ready"]), "run": p["run"] and p["run"]["status"]},
@@ -1333,6 +1337,10 @@ class Store:
                 val, old = _opt_type(body, "tags", list, []), json.loads(row["tags"])
                 if val != old:
                     changes["tags"], sets["tags"] = [old, val], canonical(val)
+            if "issues" in body:
+                val, old = _issues(body["issues"] or []), json.loads(row["issues"])
+                if val != old:
+                    changes["issues"], sets["issues"] = [old, val], canonical(val)
             if "serves" in body:
                 old = self._serves_ids(gid)
                 val = self._check_serves(gid, row["space"], _goal_ids(body["serves"], "serves"))

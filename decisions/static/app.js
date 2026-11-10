@@ -917,7 +917,7 @@ function renderClosed(d) {
     <h1 class="d-title">${esc(d.title)}</h1>
     <div class="d-sub">${subHtml(d)}</div>
     ${towardHtml(d)}
-    ${issuesHtml(d)}
+    ${issuesHtml("decision", d)}
     ${outcomeHtml(d)}
     ${outdatedHtml(d)}
     <div id="resume-card">${resumeHtml(d)}</div>
@@ -926,7 +926,6 @@ function renderClosed(d) {
       <button class="btn" data-action="copy-md" title="Copy a markdown summary with the options table">Copy summary</button>
       <button class="btn ${r ? "ghost" : "primary"}" data-action="reopen">${icon("rotate", 15)}Reopen</button>
       ${d.goals.length ? "" : `<button class="btn ghost" data-action="add-goal" title="Link it to the goal it was a step toward">${icon("target", 15)}Goal…</button>`}
-      ${d.status === "resolved" && !d.issues.length ? `<button class="btn ghost" data-action="add-issue" title="Link the issue where it's being acted on, in Linear, Jira, GitHub or any tracker">${icon("ticket", 15)}Issue…</button>` : ""}
       <span class="spacer"></span>
       ${others.length ? `<a class="btn ghost" href="/d/${esc(others[0].id)}" data-nav title="${esc(others[0].title)}">Next open: ${esc(others[0].id)}${icon("arrow-right", 15)}</a>` : ""}
     </div>
@@ -1063,7 +1062,7 @@ function headerHtml(d) {
         <h1 class="d-title">${esc(d.title)}</h1>
         <div class="d-sub">${subHtml(d)}</div>
         ${towardHtml(d)}
-        ${issuesHtml(d)}
+        ${issuesHtml("decision", d)}
       </div>
       <div class="d-actions">
         <button class="btn small" data-action="copy-md" title="Copy a markdown summary with the options table">${icon("copy", 14)}Copy summary</button>
@@ -1480,16 +1479,12 @@ function eventText(e) {
       const deps = x.changes.depends_on && x.changes.depends_on[1].map((y) => y.decision);
       const [was, now] = x.changes.goals || [[], []];
       const linked = now.filter((g) => !was.includes(g)), unlinked = was.filter((g) => !now.includes(g));
-      const [hadIssues, hasIssues] = x.changes.issues || [[], []];
-      const issueKeys = (from, to) => from.filter((i) => !to.some((j) => j.url === i.url)).map((i) => i.key);
-      const tracked = issueKeys(hasIssues, hadIssues), untracked = issueKeys(hadIssues, hasIssues);
       const other = rest.filter((k) => !["depends_on", "goals", "issues"].includes(k));
       return [due ? `moved the deadline to <strong title="${esc(fullTime(due))}">${esc(whenTime(due))}</strong>` : "",
               deps ? (deps.length ? `made it depend on <strong>${esc(deps.join(", "))}</strong>` : "removed its dependencies") : "",
               linked.length ? `linked it to <strong>${esc(linked.map(goalLabel).join(", "))}</strong>` : "",
               unlinked.length ? `unlinked it from <strong>${esc(unlinked.join(", "))}</strong>` : "",
-              tracked.length ? `linked the issue <strong>${esc(tracked.join(", "))}</strong>` : "",
-              untracked.length ? `unlinked the issue <strong>${esc(untracked.join(", "))}</strong>` : "",
+              issueChangeText(x.changes.issues),
               other.length ? `edited the ${esc(other.join(", "))}` : ""].filter(Boolean).join(" and ");
     }
     case "decision.resolved": return `${x.previous_status !== "resolved" ? "decided" : String(x.previous_resolution?.selected) === String(x.resolution.selected) ? "confirmed" : "changed the decision to"} <strong>${esc(x.resolution.selected.map(label).join(", "))}</strong>${x.resolution.note ? quote(x.resolution.note) : ""}${x.resolution.filters ? `<div class="sub">Filters: ${esc(x.resolution.filters)}</div>` : ""}${x.silenced ? `<div class="sub">Didn't notify ${esc(x.silenced.join(", "))}</div>` : ""}`;
@@ -1798,6 +1793,14 @@ async function loadGoal(id) {
   renderSidebar();
 }
 
+// "linked the issue LIN-42 and unlinked the issue OPS-7", from an `issues` change [was, now].
+function issueChangeText([was, now] = [[], []]) {
+  const keys = (from, to) => from.filter((i) => !to.some((j) => j.url === i.url)).map((i) => i.key);
+  const linked = keys(now, was), unlinked = keys(was, now);
+  return [linked.length ? `linked the issue <strong>${esc(linked.join(", "))}</strong>` : "",
+          unlinked.length ? `unlinked the issue <strong>${esc(unlinked.join(", "))}</strong>` : ""].filter(Boolean).join(" and ");
+}
+
 function goalEventText(e) {
   const x = e.data;
   const quote = (t) => (t ? `<div class="sub">“${esc(t)}”</div>` : "");
@@ -1806,8 +1809,8 @@ function goalEventText(e) {
     case "goal.updated": {
       const c = x.changes;
       const serves = c.serves && (c.serves[1].length ? `made it serve <strong>${esc(c.serves[1].join(", "))}</strong>` : "made it a top-level goal");
-      const rest = Object.keys(c).filter((k) => k !== "serves");
-      return [serves, rest.length ? `edited the ${esc(rest.join(", "))}` : ""].filter(Boolean).join(" and ");
+      const rest = Object.keys(c).filter((k) => k !== "serves" && k !== "issues");
+      return [serves, issueChangeText(c.issues), rest.length ? `edited the ${esc(rest.join(", "))}` : ""].filter(Boolean).join(" and ");
     }
     case "goal.achieved": return `marked it achieved${quote(x.note)}`;
     case "goal.abandoned": return `abandoned it${quote(x.note)}`;
@@ -1904,7 +1907,8 @@ function renderGoal() {
         <div class="d-sub"><button class="chip id" data-action="copy-goal-ref" title="Copy a markdown link">${esc(g.id)}${icon("copy", 12)}</button>
           <span class="chip status ${esc(g.status)}">${goalIcon(g, 12)}${esc(g.status)}</span>${spaceChip(g)}
           <span title="${esc(fullTime(g.created_at))}">created ${ago(g.created_at)}</span>
-          ${tagsHtml("goal", g.tags, "Topics like business, product or tech: the map filters on them, and decisions toward it share them")}</div></div>
+          ${tagsHtml("goal", g.tags, "Topics like business, product or tech: the map filters on them, and decisions toward it share them")}</div>
+        ${issuesHtml("goal", g)}</div>
       <div class="d-actions">
         <button class="btn small ghost" data-action="edit-goal">${icon("pencil", 14)}Edit</button>
         ${active ? `<button class="btn small ghost" data-action="goal-status" data-status="achieved" title="It's done">${icon("check", 14)}Achieved</button>
@@ -1985,13 +1989,18 @@ function towardHtml(d) {
     <a class="btn small ghost" href="/map?focus=${esc(d.id)}" data-nav>${icon("map", 14)}Trace on the map</a></div>`;
 }
 
-// Where the decision is being acted on: links to issues in Linear, Jira, GitHub… Only links for now.
-function issuesHtml(d) {
-  if (!d.issues.length) return "";
-  return `<div class="toward">${icon("ticket", 14)}<span>Acted on in</span>
-    ${d.issues.map((i) => `<span class="chip issue"><a href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(i.url)}">${esc(i.key)}${icon("external", 12)}</a>
-      <button class="chip-x" data-action="remove-issue" data-url="${esc(i.url)}" aria-label="Unlink ${esc(i.key)}" title="Unlink">${icon("x", 12)}</button></span>`).join("")}
-    <button class="btn small ghost" data-action="add-issue">${icon("plus", 14)}Issue</button></div>`;
+// Where a decision or goal is being acted on: links to issues in Linear, Jira, GitHub… Only links for now.
+// Always shown, at any status, as the one place to add and remove them.
+function issuesHtml(kind, x) {
+  return `<div class="toward">${icon("ticket", 14)}<span>${x.issues.length ? "Acted on in" : "Not tracked in an issue"}</span>
+    ${x.issues.map((i) => `<span class="chip issue"><a href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(i.url)}">${esc(i.key)}${icon("external", 12)}</a>
+      <button class="chip-x" data-action="remove-issue" data-kind="${kind}" data-url="${esc(i.url)}" aria-label="Unlink ${esc(i.key)}" title="Unlink">${icon("x", 12)}</button></span>`).join("")}
+    <button class="btn small ghost" data-action="add-issue" data-kind="${kind}" title="Link the issue where it's being acted on, in Linear, Jira, GitHub or any tracker">${icon("plus", 14)}Issue</button></div>`;
+}
+
+const issued = (kind) => kind === "goal"
+  ? { x: S.goal, save: (issues, okMsg) => goalAct(() => api("PATCH", `/api/goals/${S.goal.id}`, { issues }), okMsg) }
+  : { x: S.d, save: (issues, okMsg) => act(() => api("PATCH", `/api/decisions/${S.d.id}`, { issues }), okMsg) };
 }
 
 // An open decision whose every goal was abandoned may not be worth deciding.
@@ -2333,13 +2342,15 @@ document.addEventListener("click", async (e) => {
       return v && setGoals(d, [...d.goals.map((g) => g.goal), v], `Linked to ${v}`);
     }
     case "add-issue": {
-      const url = await ask({ title: `Where is ${d.id} being acted on?`, body: `<p>Paste the link to the issue in Linear, Jira, GitHub or any tracker. It's the record that the decision was carried out.</p>`,
+      const { x, save } = issued(a.dataset.kind);
+      const url = await ask({ title: `Where is ${x.id} being acted on?`, body: `<p>Paste the link to the issue in Linear, Jira, GitHub or any tracker. It's the record that the ${a.dataset.kind} is being carried out.</p>`,
         field: "Issue link", type: "url", placeholder: "https://linear.app/…/issue/LIN-42", ok: "Link" });
-      return url && act(() => api("PATCH", `/api/decisions/${d.id}`, { issues: [...d.issues, { url }] }), "Issue linked");
+      return url && save([...x.issues, { url }], "Issue linked");
     }
     case "remove-issue": {
-      const gone = d.issues.find((i) => i.url === a.dataset.url);
-      return act(() => api("PATCH", `/api/decisions/${d.id}`, { issues: d.issues.filter((i) => i !== gone) }), `Unlinked ${gone.key}`);
+      const { x, save } = issued(a.dataset.kind);
+      const gone = x.issues.find((i) => i.url === a.dataset.url);
+      return save(x.issues.filter((i) => i !== gone), `Unlinked ${gone.key}`);
     }
     case "remove-goal": return setGoals(d, d.goals.map((g) => g.goal).filter((g) => g !== id), `Unlinked from ${id}`);
     case "new-goal": return newGoal(a.dataset.serves);
