@@ -58,7 +58,24 @@ Every decision is a step toward a goal, and goals serve larger goals, from the b
 2. **Create a goal only when none fits** and the goal is clear from the task: `decide goal create "Self-serve data import" --serves G-2 -q`. Always say which larger goal it `--serves`, and tag it with its topic the way the existing goals are tagged (e.g. `--tag tech`, `--tag product`, `--tag business`), so people can filter the map to what concerns them. Don't invent visions or strategy; if you don't know why the work matters, leave the decision unlinked and say so in `context`.
 3. **Learn from the history.** Run `decide insights` and check whether any option you're about to propose was a dead end before (picked and later reversed, picked for a goal that was then abandoned, or ruled out repeatedly). Still include it if it's genuinely right this time, but say in `context` what happened last time and why this time is different. `decide map --focus D-12` shows what led to a decision and what it led to; add `--tag tech` to either command to stay within a topic.
 
-To revisit an earlier decision, **reopen and re-decide it** rather than creating a new one, so the change of mind is recorded where the analysis can see it. When you finish the work a goal describes, don't mark it achieved yourself; tell the user it may be done.
+To revisit an earlier decision, **reopen and re-decide it** rather than creating a new one, so the change of mind is recorded where the analysis can see it. When you finish the work a goal describes, don't mark it achieved yourself: prove it (below), or tell the user it may be done.
+
+### Proving a goal is achieved
+
+When you take on a goal whose outcome can be checked by a command, agree with the user up front on what success looks like, then let them verify it with one click:
+
+1. **Propose the proof early**, before doing the work, from the project directory on the machine where it should run:
+   ```sh
+   decide goal proof G-7 --command "./scripts/prove-upgrade.sh" --script scripts/prove-upgrade.sh \
+     --success "A fresh EC2 instance runs the new version within 10 minutes of the release images being available" --timeout 1800
+   ```
+   The command must exit 0 only if the goal is really achieved, and test the outcome end to end (start the instance, trigger the release, watch it upgrade), not that your code ran. Make it safe to run more than once, clean up after itself, and print what it checked: the user sees the output. Pass every file it runs as `--script`, so the user can read it. `--success` says in plain words what passing means.
+2. **Tell the user to agree** on the goal's page (the link is printed). You can't agree yourself. Wait with `decide goal wait G-7 --on proof.agreed,proof.removed` (in the background, like `decide wait`).
+3. **Do the work.** If you have to change the command or a script, run `decide goal proof G-7` again (it rereads the scripts; give only what changes) and say why. The change is logged, and the user has to agree again: a script that differs from what was agreed on is not run.
+4. **When you believe the goal is achieved**, run the command yourself first. If it passes: `decide goal ready G-7 --note "what you did"`. That turns on the user's **Prove it** button; never ask for the proof yourself. Then `decide goal wait G-7 --on proof.passed,proof.failed`.
+5. `event: proof.passed` → the goal is marked achieved; you're done. `event: proof.failed` → the output is printed: fix the work (not the proof, unless it was wrong, and then say so), and flag it ready again.
+
+The proof runs on this machine through the user's resumer, so check `decide resumer status`. Don't weaken a proof to make it pass.
 
 ### Decisions that depend on each other
 

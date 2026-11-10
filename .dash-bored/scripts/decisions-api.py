@@ -206,6 +206,11 @@ def goals_list():
             bits.append("serves " + ", ".join(g["serves"]))
         if g["status"] != "active":
             bits.append("%s %s" % (g["status"], ago(g.get("closed_at"))))
+        if g.get("proof"):
+            p = g["proof"]
+            bits.append("proof " + (p["run"] if p["run"] in ("passed", "failed") else "running" if p["run"]
+                                    else "ready" if p["agreed"] and p["ready"] else "agreed" if p["agreed"]
+                                    else "to agree on"))
         if g.get("status_note"):
             bits.append("“%s”" % g["status_note"][:80])
         items.append({"id": g["id"], "title": "%s · %s" % (g["id"], g["title"]), "detail": " · ".join(bits),

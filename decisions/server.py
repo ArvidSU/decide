@@ -336,6 +336,30 @@ class Handler(BaseHTTPRequestHandler):
         return {"events": self.store.events(int(self.qs.get("after", [0])[0]), goal_id=gid,
                                             limit=int(self.qs.get("limit", [1000])[0]), scope=self.scope)}
 
+    @route("PATCH", "/api/goals/([^/]+)/proof")  # PUT is served as PATCH
+    def set_proof(self, gid):
+        return self.store.set_proof(gid, self._body(), self.actor, self.scope)
+
+    @route("DELETE", "/api/goals/([^/]+)/proof")
+    def remove_proof(self, gid):
+        return self.store.remove_proof(gid, self.actor, self.scope)
+
+    @route("POST", "/api/goals/([^/]+)/proof/agree")
+    def agree_proof(self, gid):
+        return self.store.agree_proof(gid, self._body(), self.actor, self.scope)
+
+    @route("POST", "/api/goals/([^/]+)/proof/ready")
+    def ready_proof(self, gid):
+        return self.store.ready_proof(gid, self._body(), self.actor, self.scope)
+
+    @route("POST", "/api/goals/([^/]+)/proof/run")
+    def request_proof(self, gid):
+        return 201, self.store.request_proof(gid, self.actor, self.scope)
+
+    @route("POST", "/api/goals/([^/]+)/proof/events")
+    def proof_event(self, gid):
+        return 201, self.store.proof_event(gid, self._body(), self.actor, self.scope)
+
     @route("GET", "/api/graph")
     def graph(self):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
@@ -398,7 +422,7 @@ class Handler(BaseHTTPRequestHandler):
         g = lambda k, d=None: self.qs.get(k, [d])[0]
         evs = self.store.wait_events(
             int(g("after", 0)), g("decision"), _types(self.qs, None),
-            min(float(g("wait", 0)), MAX_WAIT), int(g("limit", 200)), self.scope)
+            min(float(g("wait", 0)), MAX_WAIT), int(g("limit", 200)), self.scope, g("goal"))
         return {"events": evs, "cursor": evs[-1]["seq"] if evs else max(int(g("after", 0)), 0)}
 
     @route("GET", "/api/events/verify")

@@ -933,6 +933,131 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/insights?tags=tech")["reversals"], [])
         self.assertEqual(len(self.call("GET", "/api/insights?tags=business")["reversals"]), 1)
 
+    def test_proof_is_agreed_on_flagged_ready_and_asked_for(self):
+        rx = Receiver()
+        self.call("POST", "/api/webhooks", {"url": rx.url, "events": ["proof.requested"]}, expect=201)
+        gid = self.goal("Fleet upgrades itself")["id"]
+        spec = {"success": "An EC2 upgrades within 10 minutes of a release", "command": "./prove.sh", "machine": "mb",
+                "cwd": "/work", "scripts": [{"path": "prove.sh", "content": "exit 0\n"}]}
+        self.call("PUT", f"/api/goals/{gid}/proof", {"command": "x", "machine": "mb"}, expect=400)
+        self.call("POST", f"/api/goals/{gid}/proof/ready", {}, expect=404)
+        p = self.call("PUT", f"/api/goals/{gid}/proof", spec, expect=200)["proof"]
+        self.assertEqual((p["proposed_by"], p["agreed"], p["ready"], p["run"], p["timeout"]), ("agent", None, None, None, 3600))
+        first = p["hash"]
+        # The same again changes nothing, and logs nothing.
+        self.assertEqual(self.call("PUT", f"/api/goals/{gid}/proof", spec)["proof"]["hash"], first)
+        run = lambda actor="me", expect=None: self.call("POST", f"/api/goals/{gid}/proof/run", actor=actor, expect=expect)
+        run(expect=409)  # not agreed on
+        # Whoever proposed it can't agree to it, and you agree to the version you looked at.
+        self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": first}, expect=403)
+        self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": "0" * 64}, actor="me", expect=409)
+        p = self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": first}, actor="me", expect=200)["proof"]
+        self.assertEqual(p["agreed"]["by"], "me")
+        run(expect=409)  # the agent hasn't flagged it ready
+
+        # A changed script is logged with both hashes, and has to be agreed on again.
+        changed = spec | {"scripts": [{"path": "prove.sh", "content": "exit 1\n"}]}
+        p = self.call("PUT", f"/api/goals/{gid}/proof", changed, expect=200)["proof"]
+        self.assertIsNone(p["agreed"])
+        ev = self.call("GET", f"/api/goals/{gid}/events")["events"][-1]
+        self.assertEqual((ev["type"], ev["data"]["previous_hash"], ev["data"]["hash"], ev["data"]["changed"],
+                          ev["data"]["was_agreed"]), ("proof.changed", first, p["hash"], ["script prove.sh"], True))
+        self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": first}, actor="me", expect=409)
+        self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": p["hash"]}, actor="me", expect=200)
+        p = self.call("POST", f"/api/goals/{gid}/proof/ready", {"note": "released 1.4"}, expect=200)["proof"]
+        self.assertEqual((p["ready"]["by"], p["ready"]["note"]), ("agent", "released 1.4"))
+        self.assertEqual(self.call("GET", "/api/goals?status=all")["goals"][0]["proof"],
+                         {"agreed": True, "ready": True, "run": None})
+
+        run(actor="agent", expect=403)
+        p = run(expect=201)["proof"]
+        self.assertEqual((p["run"]["status"], p["run"]["requested_by"], p["busy"]), ("requested", "me", True))
+        seq = p["run"]["seq"]
+        run(expect=409)  # already running
+        self.call("PUT", f"/api/goals/{gid}/proof", spec, expect=409)
+        self.assertTrue(rx.wait_for(1))
+        payload = json.loads(rx.received[0][1])
+        self.assertEqual((payload["event"]["type"], payload["goal"]["id"], payload["goal"]["proof"]["command"]),
+                         ("proof.requested", gid, "./prove.sh"))
+
+        report = lambda body, expect: self.call("POST", f"/api/goals/{gid}/proof/events", body, actor="resumer", expect=expect)
+        report({"status": "passed", "request_seq": seq - 1}, 409)
+        report({"status": "started", "request_seq": seq, "pid": 1}, 201)
+        # Failing takes back the claim that it's ready, so the button is off until the agent flags it again.
+        g = report({"status": "failed", "request_seq": seq, "exit_code": 1, "output_tail": "still on 1.3"}, 201)
+        self.assertEqual((g["status"], g["proof"]["ready"], g["proof"]["busy"], g["proof"]["run"]["status"]),
+                         ("active", None, False, "failed"))
+        report({"status": "passed", "request_seq": seq}, 409)
+        run(expect=409)
+        self.call("POST", f"/api/goals/{gid}/proof/ready", {}, expect=200)
+        seq = run(expect=201)["proof"]["run"]["seq"]
+        g = report({"status": "passed", "request_seq": seq, "exit_code": 0}, 201)
+        self.assertEqual((g["status"], g["status_note"]), ("achieved", "Proved: An EC2 upgrades within 10 minutes of a release"))
+        types = [e["type"] for e in self.call("GET", f"/api/goals/{gid}/events")["events"]]
+        self.assertEqual(types[-3:], ["proof.requested", "proof.passed", "goal.achieved"])
+        g = self.call("DELETE", f"/api/goals/{gid}/proof", actor="me", expect=200)
+        self.assertIsNone(g["proof"])
+        self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
+
+    def test_resumer_runs_a_goals_proof_only_while_its_script_is_what_was_agreed_on(self):
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(work)
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT, "DECISIONS_MACHINE": "mb",
+                            "DECISIONS_STATE_DIR": os.path.join(self.tmp, "state"), "DECISIONS_ACTOR": "claude-code"}
+        decide = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=work,
+                                           capture_output=True, text=True)
+        script = os.path.join(work, "prove.sh")
+        def write(body):
+            with open(script, "w") as fh:
+                fh.write(body)
+        write('echo "checking $GOAL_ID"; test -f released\n')
+        gid = decide("goal", "create", "Ship it", "-q").stdout.strip()
+        out = decide("goal", "proof", gid, "--command", "sh prove.sh", "--success", "`released` exists", "--script", "prove.sh")
+        self.assertIn("waiting for the user to agree", out.stdout, out.stderr)
+        proof = lambda: self.call("GET", f"/api/goals/{gid}")["proof"]
+        self.assertEqual((proof()["machine"], os.path.realpath(proof()["cwd"]), proof()["scripts"][0]["path"]),
+                         ("mb", os.path.realpath(work), "prove.sh"))
+        agree = lambda: self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": proof()["hash"]}, actor="me", expect=200)
+        agree()
+        self.assertIn("agreed and ready", decide("goal", "ready", gid, "--note", "done").stdout)
+
+        resumer = subprocess.Popen([sys.executable, "-m", "decisions", "resumer", "run"], env=env | {"DECISIONS_ACTOR": "resumer"},
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: (resumer.terminate(), resumer.wait(), resumer.stdout.close()))
+        self.assertEqual(resumer.stdout.readline()[:10], "[resumer] ")
+        time.sleep(0.3)
+
+        def prove(want):
+            waiter = subprocess.Popen([sys.executable, "-m", "decisions", "goal", "wait", gid, "--timeout", "20"],
+                                      env=env, cwd=work, stdout=subprocess.PIPE, text=True)
+            time.sleep(0.5)
+            self.call("POST", f"/api/goals/{gid}/proof/run", actor="me", expect=201)
+            heard = waiter.communicate(timeout=30)[0]
+            self.assertTrue(heard.startswith(f"event: proof.{want} by resumer"), heard)
+            return heard, self.call("GET", f"/api/goals/{gid}")
+
+        # Not achieved yet: the command fails, the agent hears why, and the goal stays active.
+        heard, g = prove("failed")
+        self.assertIn(f"checking {gid}", heard)
+        self.assertEqual((g["status"], g["proof"]["run"]["detail"]["exit_code"], g["proof"]["ready"]), ("active", 1, None))
+
+        # The script was edited after it was agreed on: it isn't run at all.
+        write("exit 0\n")
+        decide("goal", "ready", gid)
+        heard, g = prove("failed")
+        self.assertIn("changed since it was agreed on", g["proof"]["run"]["detail"]["error"])
+        self.assertNotIn("exit_code", g["proof"]["run"]["detail"])
+
+        # Recording the change (nothing else to repeat) means agreeing again; then it runs and achieves the goal.
+        write('echo "checking $GOAL_ID"; test -f released\n# v2\n')
+        self.assertIn("waiting for the user to agree", decide("goal", "proof", gid).stdout)
+        agree()
+        open(os.path.join(work, "released"), "w").close()
+        decide("goal", "ready", gid)
+        heard, g = prove("passed")
+        self.assertEqual((g["status"], g["proof"]["run"]["status"]), ("achieved", "passed"))
+        self.assertIn("passed", decide("goal", "get", gid).stdout)
+
     def test_cli_goals_map_and_insights(self):
         env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT}
         run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,

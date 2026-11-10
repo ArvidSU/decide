@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS goals (
   status TEXT NOT NULL DEFAULT 'active',
   status_note TEXT NOT NULL DEFAULT '',
   tags TEXT NOT NULL DEFAULT '[]',
+  proof TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   closed_at TEXT
@@ -233,6 +234,13 @@ SETTLING_EVENTS = ("decision.resolved", "decision.reopened", "decision.cancelled
 GOAL_STATUSES = ("active", "achieved", "abandoned")
 # The event a goal's status change is logged as.
 GOAL_EVENTS = {"active": "goal.reactivated", "achieved": "goal.achieved", "abandoned": "goal.abandoned"}
+# How a goal is proved achieved: a command the resumer runs on the agent's machine when the user asks for it.
+# These events report on a run, and put it in that state.
+PROOF_RUN_EVENTS = ("started", "passed", "failed")
+PROOF_TIMEOUT = 3600
+# A run that hasn't reported back this long (seconds) after its timeout is given up on, so it can be asked for again.
+PROOF_GRACE = 300
+MAX_PROOF_SCRIPT = 256 * 1024
 GENESIS = "0" * 64
 DEFAULT_SPACE = "default"
 SPACE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
@@ -412,6 +420,37 @@ def _dependencies(value) -> list[dict]:
         out[did] = {"decision": did, "when": [str(w) for w in dict.fromkeys(when)] if when else None,
                     "note": _opt_type(item, "note", str, "")}
     return list(out.values())
+
+
+def script_hash(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def proof_hash(proof: dict) -> str:
+    """Identifies what was agreed on: what success looks like, the command, its scripts and where it runs."""
+    return hashlib.sha256(canonical(
+        {k: proof[k] for k in ("success", "command", "cwd", "machine", "timeout")}
+        | {"scripts": [{"path": s["path"], "sha256": s["sha256"]} for s in proof["scripts"]]}).encode()).hexdigest()
+
+
+def _proof(body: dict) -> dict:
+    """`proof`: {success, command, machine, cwd?, timeout?, scripts?: [{path, content}]}."""
+    timeout = _opt_type(body, "timeout", (int, float), PROOF_TIMEOUT)
+    if isinstance(timeout, bool) or timeout <= 0:
+        raise ApiError(400, "timeout must be a positive number of seconds")
+    scripts = {}
+    for item in _opt_type(body, "scripts", list, []):
+        if not isinstance(item, dict) or not all(isinstance(item.get(k), str) for k in ("path", "content")) \
+                or not item["path"].strip():
+            raise ApiError(400, "scripts must be a list of {path, content} objects")
+        if len(item["content"].encode()) > MAX_PROOF_SCRIPT:
+            raise ApiError(400, f"{item['path']} is larger than {MAX_PROOF_SCRIPT // 1024} KB")
+        scripts[item["path"]] = {"path": item["path"], "sha256": script_hash(item["content"].encode()),
+                                 "content": item["content"]}
+    proof = {"success": _req_str(body, "success"), "command": _req_str(body, "command"),
+             "machine": _req_str(body, "machine"), "cwd": _opt_type(body, "cwd", str, ""), "timeout": timeout,
+             "scripts": list(scripts.values())}
+    return proof | {"hash": proof_hash(proof)}
 
 
 def _resume(value) -> dict | None:
@@ -1215,6 +1254,7 @@ class Store:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "closed_at": row["closed_at"],
+            "proof": self._proof_view(gid, row),
             "serves": [self._goal_ref(up) for up in self._serves_ids(gid)],
             "subgoals": subgoals,
             "decisions": decisions,
@@ -1270,6 +1310,8 @@ class Store:
                                                 "updated_at", "closed_at")} | {
                     "url": f"{self.cfg.public_url}/g/{row['id']}", "tags": json.loads(row["tags"]),
                     "serves": self._serves_ids(row["id"]),
+                    "proof": (p := self._proof_view(row["id"], row)) and {
+                        "agreed": bool(p["agreed"]), "ready": bool(p["ready"]), "run": p["run"] and p["run"]["status"]},
                     "decisions": {"total": n["total"], "open": n["open"], "resolved": n["resolved"]}})
         return out
 
@@ -1313,6 +1355,153 @@ class Store:
             if status != row["status"]:
                 self._event(None, GOAL_EVENTS[status], actor, {"note": note, "previous_status": row["status"]},
                             goal_id=gid)
+            return self._goal_dict(gid)
+
+    # ------------------------------------------------------------------ proof: showing a goal was achieved
+
+    def _proof_run(self, gid: str) -> dict | None:
+        """The latest time the proof was asked for, and how far it got."""
+        req = self.conn.execute(
+            "SELECT * FROM events WHERE goal_id=? AND type='proof.requested' ORDER BY seq DESC LIMIT 1", (gid,)).fetchone()
+        if not req:
+            return None
+        run = {"status": "requested", "seq": req["seq"], "hash": json.loads(req["data"])["hash"],
+               "requested_by": req["actor"], "requested_at": req["ts"], "since": req["ts"], "detail": {}}
+        ev = self.conn.execute(
+            f"SELECT * FROM events WHERE goal_id=? AND seq>? AND type IN ({','.join('?' * len(PROOF_RUN_EVENTS))}) "
+            "ORDER BY seq DESC LIMIT 1", (gid, req["seq"], *(f"proof.{k}" for k in PROOF_RUN_EVENTS))).fetchone()
+        if ev:
+            run |= {"status": ev["type"].split(".", 1)[1], "since": ev["ts"], "detail": json.loads(ev["data"])}
+        return run
+
+    def _proof_view(self, gid: str, row) -> dict | None:
+        if not row["proof"]:
+            return None
+        proof = json.loads(row["proof"])
+        run = self._proof_run(gid)
+        waited = run and (datetime.now(timezone.utc) - parse_ts(run["since"])).total_seconds()
+        # Asked for and not reported back yet. Past its timeout it's given up on: the resumer died or is offline.
+        busy = bool(run and run["status"] in ("requested", "started") and waited <= proof["timeout"] + PROOF_GRACE)
+        return proof | {"run": run, "busy": busy}
+
+    def _proof_row(self, gid: str, scope: Scope) -> tuple:
+        row = self._goal_row(gid, scope)
+        view = self._proof_view(gid, row)
+        if not view:
+            raise ApiError(404, f"{gid} has no proof; propose one with `decide goal proof {gid} --command … --success …`")
+        return row, view
+
+    def _write_proof(self, gid: str, proof: dict | None):
+        stored = proof and {k: v for k, v in proof.items() if k not in ("run", "busy")}
+        self.conn.execute("UPDATE goals SET proof=?, updated_at=? WHERE id=?",
+                          (canonical(stored) if stored else None, now_iso(), gid))
+
+    def set_proof(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """Propose how the goal is proved achieved, or change it. A change is logged with both hashes and
+        has to be agreed on again."""
+        gid = norm_goal_id(raw_id)
+        proof = _proof(body)
+        with self.tx():
+            row = self._goal_row(gid, scope)
+            old = self._proof_view(gid, row)
+            if old and old["hash"] == proof["hash"]:
+                return self._goal_dict(gid)
+            if old and old["busy"]:
+                raise ApiError(409, f"{gid}'s proof is running; change it when it has finished")
+            # Whether the goal is ready to be proved is the agent's claim about the work, not about the script.
+            self._write_proof(gid, proof | {"proposed_by": actor, "proposed_at": now_iso(), "agreed": None,
+                                            "ready": old["ready"] if old else None})
+            if old:
+                changed = [k for k in ("success", "command", "cwd", "machine", "timeout") if old[k] != proof[k]]
+                was, now = ({s["path"]: s["sha256"] for s in p["scripts"]} for p in (old, proof))
+                changed += [f"script {path}" for path in dict.fromkeys([*was, *now]) if was.get(path) != now.get(path)]
+                self._event(None, "proof.changed", actor, {
+                    "previous_hash": old["hash"], "hash": proof["hash"], "changed": changed,
+                    "was_agreed": bool(old["agreed"]), "proof": proof}, goal_id=gid)
+            else:
+                self._event(None, "proof.proposed", actor, {"hash": proof["hash"], "proof": proof}, goal_id=gid)
+            return self._goal_dict(gid)
+
+    def remove_proof(self, raw_id: str, actor: str, scope: Scope = ALL) -> dict:
+        gid = norm_goal_id(raw_id)
+        with self.tx():
+            _, proof = self._proof_row(gid, scope)
+            if proof["busy"]:
+                raise ApiError(409, f"{gid}'s proof is running; remove it when it has finished")
+            self._write_proof(gid, None)
+            self._event(None, "proof.removed", actor, {"hash": proof["hash"]}, goal_id=gid)
+            return self._goal_dict(gid)
+
+    @staticmethod
+    def _not_proposer(proof: dict, actor: str, what: str):
+        if actor == proof["proposed_by"]:
+            raise ApiError(403, f"{actor} proposed this proof, so someone else has to {what}")
+
+    def agree_proof(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """Commit to the proof as it stands. `hash` is the one the caller looked at, so nobody agrees to a
+        version that changed underneath them."""
+        gid = norm_goal_id(raw_id)
+        with self.tx():
+            _, proof = self._proof_row(gid, scope)
+            if body.get("hash") != proof["hash"]:
+                raise ApiError(409, f"{gid}'s proof changed (now {proof['hash'][:12]}); look at it again before agreeing")
+            self._not_proposer(proof, actor, "agree to it")
+            if not proof["agreed"]:
+                self._write_proof(gid, proof | {"agreed": {"by": actor, "at": now_iso()}})
+                self._event(None, "proof.agreed", actor, {"hash": proof["hash"]}, goal_id=gid)
+            return self._goal_dict(gid)
+
+    def ready_proof(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """The agent's claim that the goal is achieved (or, `ready: false`, that it isn't after all). It's what
+        lets the user ask for the proof."""
+        gid = norm_goal_id(raw_id)
+        ready = _opt_type(body, "ready", bool, True)
+        note = _opt_type(body, "note", str, "")
+        with self.tx():
+            _, proof = self._proof_row(gid, scope)
+            if ready or proof["ready"]:
+                self._write_proof(gid, proof | {"ready": {"by": actor, "at": now_iso(), "note": note} if ready else None})
+                self._event(None, "proof.ready" if ready else "proof.not_ready", actor, {"note": note}, goal_id=gid)
+            return self._goal_dict(gid)
+
+    def request_proof(self, raw_id: str, actor: str, scope: Scope = ALL) -> dict:
+        """The user asks for the proof. The resumer on the proof's machine hears `proof.requested` and runs it."""
+        gid = norm_goal_id(raw_id)
+        with self.tx():
+            _, proof = self._proof_row(gid, scope)
+            self._not_proposer(proof, actor, "ask for it")
+            if not proof["agreed"]:
+                raise ApiError(409, f"{gid}'s proof hasn't been agreed on")
+            if not proof["ready"]:
+                raise ApiError(409, f"{gid} hasn't been flagged as ready to prove")
+            if proof["busy"]:
+                raise ApiError(409, f"{gid}'s proof is already running")
+            self._event(None, "proof.requested", actor, {"hash": proof["hash"], "machine": proof["machine"]},
+                        goal_id=gid)
+            return self._goal_dict(gid)
+
+    def proof_event(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """The resumer reports on a run: `started`, then `passed` or `failed`. Passing achieves the goal;
+        failing takes back the claim that it's ready."""
+        gid = norm_goal_id(raw_id)
+        kind = body.get("status")
+        if kind not in PROOF_RUN_EVENTS:
+            raise ApiError(400, f"status must be one of {', '.join(PROOF_RUN_EVENTS)}")
+        with self.tx():
+            row, proof = self._proof_row(gid, scope)
+            run = proof["run"]
+            if not run or run["seq"] != body.get("request_seq") or run["status"] not in ("requested", "started"):
+                raise ApiError(409, f"{gid} has no run in progress for request {body.get('request_seq')!r}")
+            self._event(None, f"proof.{kind}", actor, {k: v for k, v in body.items() if k != "status"}, goal_id=gid)
+            if kind == "failed":
+                self._write_proof(gid, proof | {"ready": None})
+            # A run of a version that was since replaced proves nothing about what's agreed on now.
+            elif kind == "passed" and row["status"] == "active" and run["hash"] == proof["hash"]:
+                ts, note = now_iso(), f"Proved: {proof['success'].splitlines()[0]}"
+                self.conn.execute("UPDATE goals SET status='achieved', status_note=?, closed_at=?, updated_at=? "
+                                  "WHERE id=?", (note, ts, ts, gid))
+                self._event(None, GOAL_EVENTS["achieved"], actor,
+                            {"note": note, "previous_status": row["status"], "proof": proof["hash"]}, goal_id=gid)
             return self._goal_dict(gid)
 
     # ------------------------------------------------------------------ the map: goals and decisions as a graph
@@ -1953,11 +2142,11 @@ class Store:
         return self.q1("SELECT COALESCE(MAX(seq), 0) FROM events")[0]
 
     def wait_events(self, after=0, decision_id=None, types=None, timeout=0.0, limit=200,
-                    scope: Scope = ALL) -> list[dict]:
+                    scope: Scope = ALL, goal_id=None) -> list[dict]:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
-                evs = self.events(after, decision_id, types, limit, scope)
+                evs = self.events(after, decision_id, types, limit, scope, goal_id)
                 remaining = deadline - time.monotonic()
                 if evs or remaining <= 0:
                     return evs

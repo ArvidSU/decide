@@ -34,6 +34,7 @@ const S = {
   goal: null,         // current goal page, with its events and its part of the map
   goalEvents: [],
   goalGraph: null,
+  goalResumer: null,  // the resumer on the machine that runs the goal's proof
   editingGoal: false,
   addingTag: false,
 };
@@ -655,6 +656,7 @@ const HOOK_EVENTS = {
   "Options": { "options.added": "Options added", "options.suggested": "Options suggested", "options.updated": "Options updated", "options.excluded": "Options ruled out" },
   "Dependencies": { "decision.unblocked": "Unlocked: what it waited on is settled", "dependency.changed": "Something it depends on changed" },
   "Goals": { "goal.created": "Goal created", "goal.updated": "Goal edited", "goal.achieved": "Goal achieved", "goal.abandoned": "Goal abandoned", "goal.reactivated": "Goal active again" },
+  "Proof": { "proof.proposed": "Proof proposed", "proof.changed": "Proof changed", "proof.agreed": "Proof agreed on", "proof.ready": "Flagged ready to prove", "proof.requested": "Proof asked for", "proof.passed": "Proof passed", "proof.failed": "Proof failed" },
 };
 
 async function renderSettings() {
@@ -1784,9 +1786,12 @@ async function loadGoal(id) {
     api("GET", `/api/goals/${id}/events`),
     api("GET", `/api/graph?focus=${encodeURIComponent(id)}`),
   ]);
+  let resumer = null;
+  if (g.proof) try { resumer = await api("GET", `/api/resumer?machine=${encodeURIComponent(g.proof.machine)}`); } catch {}
   if (seq !== loadSeq) return;
   if (S.goal?.id !== g.id) S.editingGoal = S.addingTag = false;
   S.goal = g;
+  S.goalResumer = resumer;
   S.goalEvents = ev.events;
   S.goalGraph = graph;
   renderGoal();
@@ -1807,6 +1812,16 @@ function goalEventText(e) {
     case "goal.achieved": return `marked it achieved${quote(x.note)}`;
     case "goal.abandoned": return `abandoned it${quote(x.note)}`;
     case "goal.reactivated": return `made it active again${quote(x.note)}`;
+    case "proof.proposed": return `proposed how to prove it: <code>${esc(x.proof.command)}</code>`;
+    case "proof.changed": return `changed the proof (${esc(x.changed.join(", "))})${x.was_agreed ? ", so it has to be agreed on again" : ""}`;
+    case "proof.agreed": return `agreed to the proof <code>${esc(x.hash.slice(0, 12))}</code>`;
+    case "proof.ready": return `flagged it as achieved and ready to prove${quote(x.note)}`;
+    case "proof.not_ready": return `took back that it's ready to prove${quote(x.note)}`;
+    case "proof.requested": return "asked for the proof";
+    case "proof.started": return "started running the proof";
+    case "proof.passed": return "ran the proof, and it passed";
+    case "proof.failed": return `${x.exit_code == null ? "couldn't run the proof" : "ran the proof, and it failed"}${quote(x.error || `exit ${x.exit_code}`)}`;
+    case "proof.removed": return "removed the proof";
     default: return esc(e.type);
   }
 }
@@ -1819,6 +1834,59 @@ function goalStatusHtml(g) {
     <div class="o-pick">${g.status_note ? esc(g.status_note) : achieved ? "Done" : "No longer pursued"}</div>
     <div class="note" title="${esc(fullTime(g.closed_at))}">${ago(g.closed_at)}</div></div>
     <button class="btn small" data-action="goal-status" data-status="active">${icon("rotate", 14)}Reactivate</button></div>`;
+}
+
+// How the goal is proved achieved: what was agreed on, where it stands, and the button that asks for it.
+// The button is always there, and only works once the proof is agreed on and the agent flagged the goal ready.
+function proofHtml(g) {
+  const p = g.proof;
+  if (!p) return g.status === "active" ? `<section class="block"><div class="block-head"><h2>Proof</h2></div>
+    <p class="section-note">No way to prove it's achieved yet. An agent proposes a command and what success looks like with <code>decide goal proof ${esc(g.id)} --command … --success …</code>, and you agree on it here.</p></section>` : "";
+  const rs = S.goalResumer || {};
+  // A run of an earlier version says nothing about this one.
+  const run = p.run && p.run.hash === p.hash ? p.run : null;
+  const last = [...S.goalEvents].reverse().find((e) => e.type === "proof.proposed" || e.type === "proof.changed");
+  const offline = rs.online ? "" : ` The resumer on ${esc(p.machine)} is offline, so it runs when that's back.`;
+  let cls = "", ic = "shield", title, text, why = "", action = "";
+  if (p.busy) {
+    ic = "play"; why = "It's running";
+    if (run.status === "requested") { title = "Asking for the proof…"; text = `Waiting for ${esc(p.machine)} to start it.${offline}`; cls = rs.online ? "" : "warn"; }
+    else { title = "Proving…"; text = `Running on ${esc(p.machine)} since ${ago(run.since)}.`; }
+  } else if (!p.agreed) {
+    cls = "waiting"; title = "Agree on what success looks like"; why = "Agree on it first";
+    text = last?.data.was_agreed ? `${esc(p.proposed_by)} changed it after you agreed (${esc(last.data.changed.join(", "))}). Read it again: it can't run before you agree.`
+      : `${esc(p.proposed_by)} proposed this ${ago(p.proposed_at)}. Read it, then agree: it can't run before you do.`;
+    action = `<button class="btn small primary" data-action="proof-agree">${icon("check", 14)}Agree</button>`;
+  } else if (run?.status === "passed") {
+    cls = "ok"; ic = "check-circle"; title = "Proved"; text = `Passed ${ago(run.since)}${run.detail.duration_s != null ? ` in ${run.detail.duration_s}s` : ""}.`;
+    why = p.ready ? "" : "It passed";
+  } else if (!p.ready) {
+    why = "The agent hasn't flagged the goal as achieved";
+    if (run?.status === "failed") { cls = "bad"; ic = "ban"; title = "Proof failed"; text = `${ago(run.since)}: ${esc(run.detail.error || `exit ${run.detail.exit_code}`)}. The button turns back on when the agent flags the goal as achieved again.`; }
+    else if (run) { cls = "warn"; ic = "help"; title = "No answer"; text = `Asked ${ago(run.requested_at)}, and ${esc(p.machine)} never reported back.${offline}`; }
+    else { title = "Agreed"; text = `By ${esc(p.agreed.by)} ${ago(p.agreed.at)}. The button turns on when the agent flags the goal as achieved.`; }
+  } else {
+    title = "Ready to prove"; text = `${esc(p.ready.by)} flagged it as achieved ${ago(p.ready.at)}${p.ready.note ? `: “${esc(p.ready.note)}”` : "."}${offline}`;
+    if (run && run.status !== "failed") { cls = "warn"; ic = "help"; title = "No answer"; text = `Asked ${ago(run.requested_at)}, and ${esc(p.machine)} never reported back.${offline} You can ask again.`; }
+  }
+  const can = p.agreed && p.ready && !p.busy;
+  action += `<button class="btn small ${can ? "primary" : ""}" data-action="proof-run" ${can ? "" : `disabled title="${esc(why)}"`}>${icon("play", 14)}${run?.status === "passed" ? "Prove again" : "Prove it"}</button>`;
+  const online = rs.online ? `<span class="live on" style="display:inline-block"></span> resumer online` : `<span class="live off" style="display:inline-block"></span> resumer offline${rs.last_seen ? `, last seen ${ago(rs.last_seen)}` : ""}`;
+  return `<section class="block proof"><div class="block-head"><h2>Proof</h2><span class="count" title="${esc(p.hash)}: identifies exactly what was agreed on">sha256 ${esc(p.hash.slice(0, 12))}</span><span class="spacer"></span>
+      <button class="btn small ghost danger" data-action="proof-remove" ${p.busy ? "disabled" : ""}>Remove</button></div>
+    <div class="callout ${cls}" style="margin-top:0">${icon(ic, 18)}
+      <div class="callout-main"><div><strong class="c-title">${title}</strong> <span class="muted">· ${text}</span></div>
+        ${run?.detail.output_tail ? `<details ${run.status === "failed" ? "open" : ""}><summary>Output</summary><pre class="small">${esc(run.detail.output_tail)}</pre></details>` : ""}</div>
+      <div class="callout-actions">${action}</div></div>
+    <div class="context">${md(p.success)}</div>
+    <dl class="kv">
+      <dt>Command</dt><dd><code>${esc(p.command)}</code></dd>
+      <dt>Runs on</dt><dd>${esc(p.machine)} · ${online}</dd>
+      ${p.cwd ? `<dt>Directory</dt><dd><code>${esc(p.cwd.replace(/^\/(Users|home)\/[^/]+/, "~"))}</code></dd>` : ""}
+      <dt>Gives up after</dt><dd>${p.timeout >= 120 ? `${Math.round(p.timeout / 60)} minutes` : `${p.timeout} seconds`}</dd>
+      <dt>Agreed</dt><dd>${p.agreed ? `by ${esc(p.agreed.by)} ${ago(p.agreed.at)}` : "not yet"}</dd></dl>
+    ${p.scripts.map((f) => `<details class="proof-script"><summary><code>${esc(f.path)}</code> <span class="muted">· sha256 ${esc(f.sha256.slice(0, 12))} · only runs while unchanged</span></summary><pre>${esc(f.content)}</pre></details>`).join("")}
+  </section>`;
 }
 
 function renderGoal() {
@@ -1853,6 +1921,7 @@ function renderGoal() {
     <nav class="crumbs" aria-label="Breadcrumb"><a href="/map" data-nav class="muted">Map</a>${icon("chevron", 14)}<span>${esc(g.id)}</span></nav>
     ${head}
     ${goalStatusHtml(g)}
+    ${proofHtml(g)}
     <div class="cols goal-cols">
       <section class="block"><div class="block-head"><h2>Serves</h2><span class="spacer"></span>
           <button class="btn small ghost" data-action="add-serves">${icon("plus", 14)}Larger goal…</button></div>
@@ -1874,7 +1943,7 @@ function renderGoal() {
         <a class="btn small ghost" href="/map?focus=${esc(g.id)}" data-nav>${icon("map", 14)}Open in the map</a></div>${mapHtml(S.goalGraph, { focus: g.id })}</section>` : ""}
     <section class="block"><div class="block-head"><h2>Activity</h2><span class="count">${S.goalEvents.length} event${S.goalEvents.length === 1 ? "" : "s"} · tamper-evident</span></div>
       <ul class="timeline">${[...S.goalEvents].reverse().map((e) => `<li>
-        <span class="ic ${e.type === "goal.achieved" ? "resolved" : e.type === "goal.abandoned" ? "bad" : ""}">${icon({ "goal.created": "sparkle", "goal.updated": "pencil", "goal.achieved": "check", "goal.abandoned": "ban", "goal.reactivated": "rotate" }[e.type] || "sparkle", 14)}</span>
+        <span class="ic ${["goal.achieved", "proof.passed"].includes(e.type) ? "resolved" : ["goal.abandoned", "proof.failed"].includes(e.type) ? "bad" : ""}">${icon({ "goal.created": "sparkle", "goal.updated": "pencil", "goal.achieved": "check", "goal.abandoned": "ban", "goal.reactivated": "rotate", "proof.requested": "play", "proof.started": "play", "proof.passed": "check", "proof.failed": "ban" }[e.type] || (e.type.startsWith("proof.") ? "shield" : "sparkle"), 14)}</span>
         <div class="ev"><span class="who">${esc(e.actor)}</span> <span class="what">${goalEventText(e)}</span><span class="when" title="${esc(fullTime(e.ts))}">${ago(e.ts)}</span>
           <details><summary>Technical details</summary><div class="tech">#${e.seq} · ${esc(e.type)} · hash ${esc(e.hash.slice(0, 16))}…</div><pre>${esc(JSON.stringify(e.data, null, 2))}</pre></details></div></li>`).join("")}</ul></section>
   </div>`;
@@ -2300,6 +2369,18 @@ document.addEventListener("click", async (e) => {
         field: to === "abandoned" ? "Why? (recorded in the log)" : "Note (optional)", ok: { achieved: "Mark achieved", abandoned: "Abandon goal", active: "Reactivate" }[to], danger: to === "abandoned" });
       if (note === null) return;
       return goalAct(() => api("PATCH", `/api/goals/${g.id}`, { status: to, note }), `${g.id} ${{ achieved: "achieved", abandoned: "abandoned", active: "is active again" }[to]}`);
+    }
+    case "proof-agree": {
+      const g = S.goal, p = g.proof;
+      const ok = await ask({ title: `Agree on how ${g.id} is proved?`, body: `<p>You're committing to this as what success looks like: if <code>${esc(p.command)}</code> exits 0 on ${esc(p.machine)}, ${esc(g.id)} is achieved. Any change to it is logged and has to be agreed on again.</p>`, ok: "Agree" });
+      if (ok === null) return;
+      return goalAct(() => api("POST", `/api/goals/${g.id}/proof/agree`, { hash: p.hash }), "Agreed");
+    }
+    case "proof-run": return goalAct(() => api("POST", `/api/goals/${S.goal.id}/proof/run`), "Asked for the proof");
+    case "proof-remove": {
+      const ok = await ask({ title: `Remove ${S.goal.id}'s proof?`, body: `<p>The log keeps what was agreed on and every run.</p>`, ok: "Remove proof", danger: true });
+      if (ok === null) return;
+      return goalAct(() => api("DELETE", `/api/goals/${S.goal.id}/proof`), "Proof removed");
     }
     case "add-serves": {
       const g = S.goal;

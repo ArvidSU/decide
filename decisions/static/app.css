@@ -226,6 +226,11 @@ a.chip:hover { border-color: var(--border-strong); color: var(--text); text-deco
 .callout details { margin-top: 4px; }
 .callout details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; width: fit-content; }
 .callout details pre { background: var(--panel); border: 1px solid var(--border); padding: 8px; border-radius: 6px; max-height: 200px; overflow: auto; white-space: pre-wrap; margin: 6px 0 0; }
+.proof .context { margin-top: 14px; }
+.proof .kv { margin-top: 12px; }
+.proof-script { margin-top: 10px; }
+.proof-script summary { cursor: pointer; font-size: 12.5px; width: fit-content; }
+.proof-script pre { background: var(--sunken); border: 1px solid var(--border); padding: 10px; border-radius: 6px; max-height: 360px; overflow: auto; margin: 6px 0 0; font-size: 12.5px; }
 .callout.slim { padding: 4px 6px 4px 12px; min-height: 42px; margin-top: 20px; }
 .callout.slim .btn.small { height: 28px; }
 .callout.slim .callout-main { flex-direction: row; flex-wrap: wrap; gap: 0 8px; align-items: baseline; }

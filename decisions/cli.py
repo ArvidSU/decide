@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import agents
 from .config import load_config
-from .store import FILL_TRIGGERS, event_matches
+from .store import FILL_TRIGGERS, event_matches, script_hash
 from .webhooks import verify
 
 EXIT_TIMEOUT = 124
@@ -351,8 +351,86 @@ def cmd_goal_get(args):
     for x in g["decisions"]:
         picked = f": {', '.join(x['outcome'])}" if x["outcome"] else ""
         print(f"  decision {x['decision']} [{x['status']}] {x['title']}{picked}")
+    if g["proof"]:
+        print("  " + _proof_line(g["proof"]))
     if g["description"]:
         print("\n" + g["description"])
+
+
+def _proof_line(p: dict) -> str:
+    """Where a goal's proof stands, and who has to do what next."""
+    run = p["run"] if p["run"] and p["run"]["hash"] == p["hash"] else None
+    if p["busy"]:
+        state = "running"
+    elif run and run["status"] == "passed":
+        state = f"passed {run['since']}"
+    elif not p["agreed"]:
+        state = "waiting for the user to agree"
+    elif not p["ready"]:
+        failed = run and run["status"] == "failed"
+        state = (f"failed {run['since']} ({run['detail'].get('error') or 'exit %s' % run['detail'].get('exit_code')}); "
+                 if failed else "agreed; ") + "not flagged ready"
+    else:
+        state = "agreed and ready: waiting for the user to ask for it"
+    return f"proof {p['hash'][:12]} [{state}] `{p['command']}` on {p['machine']}"
+
+
+def cmd_goal_proof(args):
+    """Propose how a goal is proved achieved, or change it. What's left out stays as it was, and scripts are
+    read again, so after editing one, `decide goal proof G-3` alone records the change."""
+    c = Client()
+    if args.remove:
+        return _print(c.call("DELETE", f"/api/goals/{args.id}/proof"))
+    old = c.call("GET", f"/api/goals/{args.id}")["proof"] or {}
+    command, success = args.command or old.get("command"), args.success or old.get("success")
+    if not command or not success:
+        sys.exit("error: a proof needs --command (what to run) and --success (what success looks like)")
+    cwd = os.getcwd()
+    scripts = []
+    for path in args.script if args.script is not None else [s["path"] for s in old.get("scripts", [])]:
+        try:
+            with open(path, "rb") as fh:
+                scripts.append({"path": os.path.relpath(path, cwd), "content": fh.read().decode()})
+        except (OSError, UnicodeDecodeError) as exc:
+            sys.exit(f"error: can't read script {path}: {exc}")
+    body = {"command": command, "success": success, "scripts": scripts, "cwd": cwd, "machine": machine_name(),
+            "timeout": args.timeout or old.get("timeout")}
+    g = c.call("PUT", f"/api/goals/{args.id}/proof", {k: v for k, v in body.items() if v is not None})
+    if args.json:
+        return _print(g)
+    print(f"{g['id']}  {_proof_line(g['proof'])}\n  {g['url']}")
+
+
+def cmd_goal_ready(args):
+    g = Client().call("POST", f"/api/goals/{args.id}/proof/ready", {"ready": not args.no, "note": args.note or ""})
+    print(f"{g['id']}  {_proof_line(g['proof'])}\n  {g['url']}")
+
+
+def cmd_goal_wait(args):
+    """Block until something happens to a goal's proof. Exit 0 when a watched event happened (the first output
+    line names it), 124 on timeout, 1 on error."""
+    c = Client()
+    after = args.after if args.after is not None else c.call("GET", "/api/config")["cursor"]
+    deadline = time.monotonic() + args.timeout if args.timeout else None
+    while True:
+        chunk = 60.0 if deadline is None else max(0.0, min(60.0, deadline - time.monotonic()))
+        res = c.call("GET", f"/api/events?goal={args.id}&types={args.on}&after={after}&wait={chunk}&limit=1",
+                     timeout=chunk + 30)
+        if res["events"]:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            print(f"timed out waiting for {args.id}", file=sys.stderr)
+            sys.exit(EXIT_TIMEOUT)
+    ev = res["events"][0]
+    g = c.call("GET", f"/api/goals/{args.id}")
+    print(f"event: {ev['type']} by {ev['actor']}")
+    print(f"{g['id']}  [{g['status']}]  {g['title']}")
+    if g["proof"]:
+        print("  " + _proof_line(g["proof"]))
+    tail = ev["data"].get("output_tail") if ev["type"] == "proof.failed" else None
+    if tail:
+        print("\n" + tail.rstrip())
+    print(f"\nto keep waiting: decide goal wait {g['id']} --on {args.on} --after {ev['seq']}")
 
 
 def cmd_goal_set(args):
@@ -707,6 +785,49 @@ def _resume_one(client: Client, d: dict, command: str | None, log_dir: str):
     print(f"[resumer] {d['id']}: exited {code}", flush=True)
 
 
+def _prove_one(client: Client, g: dict, seq: int, log_dir: str):
+    """Run a goal's proof and report whether it passed. Scripts must still be what was agreed on."""
+    p = g["proof"]
+    report = lambda status, **detail: client.call(
+        "POST", f"/api/goals/{g['id']}/proof/events", {"status": status, "request_seq": seq, **detail})
+    cwd = p["cwd"] or os.path.expanduser("~")
+    error = None if os.path.isdir(cwd) else f"cwd does not exist: {cwd}"
+    for s in [] if error else p["scripts"]:
+        try:
+            with open(os.path.join(cwd, s["path"]), "rb") as fh:
+                actual = script_hash(fh.read())
+        except OSError as exc:
+            error = f"can't read {s['path']}: {exc.strerror}"
+            break
+        if actual != s["sha256"]:
+            error = (f"{s['path']} changed since it was agreed on (sha256 {actual[:12]}, agreed {s['sha256'][:12]}). "
+                     f"Record the change with `decide goal proof {g['id']}` and agree on it again.")
+            break
+    if error:
+        report("failed", error=error)
+        print(f"[resumer] {g['id']}: proof not run: {error}", flush=True)
+        return
+    log = os.path.join(log_dir, f"{g['id']}-proof-{seq}.log")
+    env = os.environ | {"GOAL_ID": g["id"], "GOAL_TITLE": g["title"], "GOAL_URL": g["url"], "PROOF_HASH": p["hash"]}
+    began = time.monotonic()
+    with open(log, "w") as fh:
+        proc = subprocess.Popen(p["command"], shell=True, cwd=cwd, env=env, stdout=fh, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+        report("started", pid=proc.pid, log=log)
+        print(f"[resumer] {g['id']}: proving with `{p['command']}` (pid {proc.pid}, log {log})", flush=True)
+        try:
+            code = proc.wait(timeout=p["timeout"])
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)  # the whole group: the command may have started others
+            proc.wait()
+            code, error = None, f"timed out after {p['timeout']:g}s"
+    with open(log, errors="replace") as fh:
+        tail = fh.read()[-4000:]
+    report("passed" if code == 0 else "failed", exit_code=code, log=log, output_tail=tail,
+           duration_s=round(time.monotonic() - began, 1), **({"error": error} if error else {}))
+    print(f"[resumer] {g['id']}: proof {'passed' if code == 0 else 'failed'} ({error or f'exit {code}'})", flush=True)
+
+
 def _skip_fill(client: Client, d: dict) -> str | None:
     """Why not to resume a session to fill values in: a session still waiting on the decision is alive, and
     resuming it as well would run it twice. Long-pollers stay listed for a while after they wake up."""
@@ -720,7 +841,7 @@ def _skip_fill(client: Client, d: dict) -> str | None:
 def cmd_resumer_run(args):
     """Long-running: resume the requesting agent session whenever a decision with a resume target
     is resolved, or expires undecided (unless --no-expired), and while it's open, when the user asks it to fill
-    values in (unless --no-fill). Pulls the event feed with a persisted cursor, so nothing is missed while it (or the
+    values in (unless --no-fill). Also runs a goal's proof when the user asks for it (unless --no-proofs). Pulls the event feed with a persisted cursor, so nothing is missed while it (or the
     machine) is down; heartbeats so the GUI can warn you when it isn't running."""
     client = Client(actor=os.environ.get("DECISIONS_ACTOR") or "resumer")
     me = machine_name()
@@ -739,7 +860,7 @@ def cmd_resumer_run(args):
     described = args.command or "; ".join(f"{a}: {agents.resume_command(a, overrides)}"
                                           for a in dict.fromkeys([*agents.AGENTS, *overrides]))
     types = ",".join(["decision.resolved", *([] if args.no_expired else ["decision.expired"]),
-                      *([] if args.no_fill else FILL_TRIGGERS)])
+                      *([] if args.no_fill else FILL_TRIGGERS), *([] if args.no_proofs else ["proof.requested"])])
     print(f"[resumer] {me}: watching {client.url} from event {cursor} for {types}; commands: {described}", flush=True)
     last_beat = 0.0
     while True:
@@ -759,12 +880,22 @@ def cmd_resumer_run(args):
             time.sleep(10)
             continue
         for ev in res["events"]:
-            d = client.call("GET", f"/api/decisions/{ev['decision_id']}")
-            state = d.get("resume_state") or {}
-            target = d.get("resume") or {}
+            age = time.time() - datetime.fromisoformat(ev["ts"].replace("Z", "+00:00")).timestamp()
+            if ev["type"] == "proof.requested":
+                g = client.call("GET", f"/api/goals/{ev['goal_id']}")
+                p = g["proof"] or {}
+                # Only the latest request, and only where the proof's scripts live. An old request isn't
+                # caught up on: by then nobody is waiting for the answer, and it would act on a stale world.
+                if p.get("machine") == me and p["busy"] and p["run"]["status"] == "requested" \
+                        and p["run"]["seq"] == ev["seq"]:
+                    threading.Thread(target=_prove_one, args=(client, g, ev["seq"], log_dir), daemon=True).start()
+                d = None
+            else:
+                d = client.call("GET", f"/api/decisions/{ev['decision_id']}")
+            state = d and d.get("resume_state") or {}
+            target = d and d.get("resume") or {}
             # Sessions live on one machine; leave other machines' decisions to their own resumer.
             mine = target.get("machine") == me
-            age = time.time() - datetime.fromisoformat(ev["ts"].replace("Z", "+00:00")).timestamp()
             # Only the latest resolution, only if nobody (e.g. you, manually) already resumed it.
             if mine and state.get("status") == "pending" and state.get("trigger_seq") == ev["seq"]:
                 skip = _skip_fill(client, d) if ev["type"] in FILL_TRIGGERS else None
@@ -885,7 +1016,8 @@ def cmd_resumer_install(args):
     Client().call("GET", "/api/config")  # fail now, not in the background, if the server is unreachable
     os.makedirs(STATE_DIR, exist_ok=True)
     argv = [decide, "resumer", "run", *(["--command", args.command] if args.command else []),
-            *(["--no-expired"] if args.no_expired else []), *(["--no-fill"] if args.no_fill else [])]
+            *(["--no-expired"] if args.no_expired else []), *(["--no-fill"] if args.no_fill else []),
+            *(["--no-proofs"] if args.no_proofs else [])]
     for item in args.agent_command or []:
         argv += ["--agent-command", item]
     _install_service(RESUMER_SERVICE, argv, _service_env(decide, *found.values()),
@@ -1124,6 +1256,30 @@ def main(argv=None):
     r.add_argument("--serves", nargs="*", metavar="G-N", help="replace the goals it serves (none: a top-level goal)")
     r.add_argument("--tags", nargs="*", help="replace its tags")
     r.set_defaults(fn=cmd_goal_set)
+    r = gsub.add_parser("proof", help="propose (or change) how a goal is proved achieved: a command the resumer "
+                                      "runs here, in this directory, when the user asks for it")
+    r.add_argument("id")
+    r.add_argument("--command", help="shell command: exit 0 = the goal is achieved")
+    r.add_argument("--success", help="what success looks like, in words the user agrees to (markdown)")
+    r.add_argument("--script", action="append", metavar="PATH",
+                   help="a file the command runs: shown to the user, and the proof only runs while it's unchanged "
+                        "(repeatable)")
+    r.add_argument("--timeout", type=float, help="seconds before the run counts as failed (default 3600)")
+    r.add_argument("--remove", action="store_true", help="remove the proof")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(fn=cmd_goal_proof)
+    r = gsub.add_parser("ready", help="flag a goal as achieved and ready to prove: enables the user's Prove button")
+    r.add_argument("id")
+    r.add_argument("--note", help="what was done, for the user")
+    r.add_argument("--no", action="store_true", help="take it back: not ready after all")
+    r.set_defaults(fn=cmd_goal_ready)
+    r = gsub.add_parser("wait", help="block until something happens to a goal's proof")
+    r.add_argument("id")
+    r.add_argument("--on", default="proof.agreed,proof.passed,proof.failed,proof.removed",
+                   help="comma-separated event types to wake on")
+    r.add_argument("--after", type=int, help="only events after this sequence number (default: from now)")
+    r.add_argument("--timeout", type=float, default=0, help="seconds (default: no limit)")
+    r.set_defaults(fn=cmd_goal_wait)
 
     s = sub.add_parser("map", help="goals and decisions as a graph: what serves what")
     s.add_argument("--focus", metavar="G-N|D-N", help="only what leads to it and what it leads to")
@@ -1189,15 +1345,19 @@ def main(argv=None):
     expired_help = "don't resume sessions whose decision expired undecided (default: resume them, saying so)"
     fill_help = ("don't resume sessions to fill in an option the user added or an attribute they asked for "
                  "(default: resume them unless they're waiting on it live)")
+    proofs_help = ("don't run goals' proofs on this machine (default: run a goal's agreed command when the user "
+                   "asks for its proof)")
     r.add_argument("--max-age-days", type=float, default=14, help="don't resume decisions resolved longer ago")
     r.add_argument("--no-expired", action="store_true", help=expired_help)
     r.add_argument("--no-fill", action="store_true", help=fill_help)
+    r.add_argument("--no-proofs", action="store_true", help=proofs_help)
     r.set_defaults(fn=cmd_resumer_run)
     r = rsub.add_parser("install", help="install as a background service (launchd / systemd --user)")
     r.add_argument("--command", help=resume_help)
     r.add_argument("--agent-command", action="append", help=agent_help)
     r.add_argument("--no-expired", action="store_true", help=expired_help)
     r.add_argument("--no-fill", action="store_true", help=fill_help)
+    r.add_argument("--no-proofs", action="store_true", help=proofs_help)
     r.set_defaults(fn=cmd_resumer_install)
     r = rsub.add_parser("uninstall", help="remove the background service")
     r.set_defaults(fn=cmd_resumer_uninstall)
