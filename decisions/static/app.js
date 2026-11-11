@@ -701,6 +701,11 @@ async function renderSettings() {
                  : `<span>Fails verification at event #${c.broken_at}</span>`}</div>`).join("") || `<span class="muted">No events yet.</span>`}</div>
     </section>
   </div>`;
+  $("#main").querySelectorAll("details.omenu").forEach((el) => el.addEventListener("toggle", () => {
+    if (!el.open) return;
+    placeMenu(el);
+    el.querySelector(".menu button")?.focus();
+  }));
   $("#add-space")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -761,16 +766,12 @@ function machinesSetting(cfg, tokens, resumers) {
   return `<section class="setting">
     <header><h2>Machines</h2><p>Each machine gets its own token for one space. Its install command sets up the <code>decide</code> CLI, the agent skill and the resumer, so agent sessions pick back up when you decide.</p></header>
     <div>
-      <div class="panel">${tokens.length ? `<div class="table-scroll"><table class="plain"><tr><th>Machine</th>${multiSpace() ? "<th>Space</th>" : ""}<th class="nowrap">Last used</th><th>Resumer</th></tr>
-        ${tokens.map((t) => `<tr class="has-actions"><td><strong>${esc(t.name)}</strong><div class="muted small mono">${esc(t.id)}</div></td>
+      <div class="panel">${tokens.length ? `<div class="table-scroll"><table class="plain"><tr><th>Machine</th>${multiSpace() ? "<th>Space</th>" : ""}<th class="nowrap">Last used</th><th>Resumer</th><th><span class="sr-only">Actions</span></th></tr>
+        ${tokens.map((t) => `<tr><td><strong>${esc(t.name)}</strong><div class="muted small mono">${esc(t.id)}</div></td>
           ${multiSpace() ? `<td>${esc(t.space)}</td>` : ""}
           <td class="nowrap">${t.last_used_at ? `<span title="${esc(fullTime(t.last_used_at))}">${ago(t.last_used_at)}</span>` : `<span class="muted">Never</span>`}${t.rolled_at ? `<div class="muted small">rolled ${ago(t.rolled_at)}</div>` : ""}</td>
-          <td class="nowrap">${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span> ${esc(t.resumer.machine)}</span>` : `<span class="muted">Not seen</span>`}</td></tr>
-          <tr><td colspan="${multiSpace() ? 4 : 3}"><div class="row-actions">
-            <button class="btn small ghost" data-action="connect-token" data-id="${t.id}" data-name="${esc(t.name)}" data-in="${esc(t.space)}">Connect</button>
-            ${spaces.length > 1 ? `<button class="btn small ghost" data-action="move-token" data-id="${t.id}" data-name="${esc(t.name)}" data-in="${esc(t.space)}">Move</button>` : ""}
-            <button class="btn small ghost" data-action="roll-token" data-id="${t.id}" data-name="${esc(t.name)}">${icon("rotate", 14)}Roll</button>
-            <button class="btn small ghost danger" data-action="revoke-token" data-id="${t.id}" data-name="${esc(t.name)}">Delete</button></div></td></tr>`).join("")}</table></div>`
+          <td>${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span><span class="host">${esc(t.resumer.machine)}</span></span>` : `<span class="muted">Not seen</span>`}</td>
+          <td style="text-align:right;width:1%">${machineMenuHtml(t, spaces.length > 1)}</td></tr>`).join("")}</table></div>`
         : `<div class="muted small">No machine tokens yet. Connect one below.</div>`}
         <form class="form-row" id="add-token" style="margin-top:14px">
           <label class="lf grow">Connect a machine<input class="input" name="name" required maxlength="60" placeholder="e.g. work laptop"></label>
@@ -784,6 +785,18 @@ function machinesSetting(cfg, tokens, resumers) {
         : `<p class="hint">Auth is off: anyone who can reach the server sees everything, and a token only picks the space new decisions go to. To accept other machines safely, run the server with <code>host = "0.0.0.0"</code> and a <code>token</code>; <code>decide server install --host 0.0.0.0</code> sets both.</p>`}
     </div>
   </section>`;
+}
+
+function machineMenuHtml(t, canMove) {
+  const data = `data-id="${t.id}" data-name="${esc(t.name)}" data-in="${esc(t.space)}"`;
+  return `<details class="omenu">
+    <summary class="omenu-btn icon-only" aria-label="Actions for ${esc(t.name)}" title="Actions">${icon("more", 16)}</summary>
+    <div class="menu">
+      <button data-action="connect-token" ${data}>${icon("terminal", 15)}Connect command…</button>
+      ${canMove ? `<button data-action="move-token" ${data}>${icon("arrow-right", 15)}Move to another space…</button>` : ""}
+      <button data-action="roll-token" ${data}>${icon("rotate", 15)}Roll token…</button>
+      <button class="danger" data-action="revoke-token" ${data}>${icon("x", 15)}Delete…</button>
+    </div></details>`;
 }
 
 // A browser signed in with a machine token can't manage tokens; it can only pass its own on.
@@ -2275,6 +2288,7 @@ document.addEventListener("click", async (e) => {
   }
   e.stopPropagation();
   const id = a.dataset.id;
+  if (a.dataset.action.endsWith("-token")) a.closest("details.omenu")?.removeAttribute("open");
   switch (a.dataset.action) {
     case "drawer": return drawer();
     case "close-pop": return closePops(true);

@@ -377,6 +377,7 @@ table.opts { width: 100%; border-collapse: collapse; font-size: 14px; }
 .menu button, .menu a { display: flex; align-items: center; gap: 9px; height: 34px; padding: 0 10px; border: 0; border-radius: 6px; background: none; cursor: pointer; font-size: 13.5px; color: var(--text); white-space: nowrap; text-decoration: none !important; }
 .menu button:hover, .menu a:hover, .menu button:focus-visible, .menu a:focus-visible { background: var(--hover); box-shadow: none; }
 .menu .i { color: var(--muted); }
+.menu button.danger, .menu button.danger .i { color: var(--bad); }
 .menu .kbd { margin-left: auto; }
 .ruleout { opacity: 0; }
 tr.opt:hover .ruleout, tr.opt:focus-within .ruleout, .ruleout:focus-visible, .ruleout[open] { opacity: 1; }
@@ -538,9 +539,6 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 .setting:last-child { border-bottom: 0; }
 .setting > header h2 { font-size: 15px; font-weight: 650; }
 .setting > header p { color: var(--muted); font-size: 14px; line-height: 20px; margin: 6px 0 0; }
-/* A table row's buttons on a line of their own below it, so they never push the table wider than its panel. */
-.plain tr.has-actions td { border-bottom: 0; padding-bottom: 0; }
-.row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
 .status-row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 13.5px; margin-top: 12px; }
 .status-row .item { display: inline-flex; gap: 8px; align-items: center; }
 .event-picks { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 4px 12px; margin-top: 2px; }
@@ -696,6 +694,9 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
   .pal-foot { display: none; }
 }
 .plain .item { display: inline-flex; gap: 8px; align-items: center; }
+/* A long hostname wraps rather than push the row's menu out of the panel. */
+.plain .host { overflow-wrap: anywhere; min-width: 0; }
+.plain .item .live { flex: none; }
 .nowrap { white-space: nowrap; }
 .table-scroll { overflow-x: auto; }
 
