@@ -538,6 +538,9 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 .setting:last-child { border-bottom: 0; }
 .setting > header h2 { font-size: 15px; font-weight: 650; }
 .setting > header p { color: var(--muted); font-size: 14px; line-height: 20px; margin: 6px 0 0; }
+/* A table row's buttons on a line of their own below it, so they never push the table wider than its panel. */
+.plain tr.has-actions td { border-bottom: 0; padding-bottom: 0; }
+.row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; }
 .status-row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 13.5px; margin-top: 12px; }
 .status-row .item { display: inline-flex; gap: 8px; align-items: center; }
 .event-picks { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 4px 12px; margin-top: 2px; }
