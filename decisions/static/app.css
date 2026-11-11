@@ -282,7 +282,10 @@ section.block { margin-top: 36px; }
 .fpop > summary { list-style: none; }
 .fpop > summary::-webkit-details-marker { display: none; }
 .fbtn { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 8px 0 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); cursor: pointer; font-size: 13.5px; color: var(--text); white-space: nowrap; box-shadow: var(--shadow-sm); }
-.fbtn .i { color: var(--faint); }
+.fbtn .i { color: var(--faint); flex: none; }
+.fpop { max-width: 100%; }
+.fbtn { max-width: min(100%, 300px); }
+.fbtn .flabel { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .fbtn:hover { border-color: var(--border-strong); }
 .fpop[open] > .fbtn { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .fpop.on > .fbtn { border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 550; box-shadow: none; }
@@ -321,9 +324,12 @@ input[type="checkbox"]:not(.pick) { accent-color: var(--accent-fill); width: 15p
 /* ---------------------------------------------------------------- options: table */
 .table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); margin-top: 12px; box-shadow: var(--shadow-sm); }
 table.opts { width: 100%; border-collapse: collapse; font-size: 14px; }
-.opts th { text-align: left; font-size: 13px; color: var(--text); font-weight: 600; padding: 0 12px; height: 38px; border-bottom: 1px solid var(--border); white-space: nowrap; background: var(--panel); position: sticky; top: 0; }
+.opts th { text-align: left; font-size: 13px; color: var(--text); font-weight: 600; padding: 6px 12px; height: 38px; border-bottom: 1px solid var(--border); vertical-align: bottom; background: var(--panel); position: sticky; top: 0; }
 .opts th.num { text-align: right; }
-.opts th .sortb { display: inline-flex; align-items: center; gap: 4px; border: 0; background: none; padding: 4px 6px; margin: 0 -6px; border-radius: 6px; color: inherit; font: inherit; cursor: pointer; }
+/* Long attribute names wrap in their header, so they never squeeze the option's own column. */
+.opts th.label, .opts td.label { min-width: 220px; width: 40%; }
+.opts th.label { white-space: nowrap; }
+.opts th .sortb { display: inline-flex; align-items: center; text-align: left; gap: 4px; border: 0; background: none; padding: 4px 6px; margin: 0 -6px; border-radius: 6px; color: inherit; font: inherit; cursor: pointer; }
 .opts th .sortb:hover { background: var(--hover); color: var(--text); }
 .opts th .sortb .i { color: var(--faint); }
 .opts th .sortb:hover .i { color: var(--muted); }
@@ -387,9 +393,9 @@ tr.opt:hover .ruleout, tr.opt:focus-within .ruleout, .ruleout:focus-visible, .ru
 .card .body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
 .card .top { display: flex; gap: 10px; align-items: flex-start; }
 .card .top .opt-label { flex: 1; line-height: 1.35; }
-.card dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 0; font-size: 14px; }
+.card dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; margin: 0; font-size: 14px; }
 .card dt { color: var(--muted); }
-.card dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.card dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: break-word; max-width: 14em; }
 .card .foot { display: flex; justify-content: flex-end; margin-top: auto; padding-top: 2px; }
 
 .subtle-list { margin-top: 16px; }

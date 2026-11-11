@@ -1034,11 +1034,11 @@ function closedOptionsHtml(d) {
     </div>`).join("")}</div>`;
   return `${head}
     <div class="table-wrap"><table class="opts readonly">
-      <thead><tr><th class="check"><span class="sr-only">Picked</span></th><th>Option</th>${metas.map((m) => `<th class="${m.type === "number" ? "num" : ""}" title="${esc(m.def.description || "")}">${esc(m.label)}</th>`).join("")}</tr></thead>
+      <thead><tr><th class="check"><span class="sr-only">Picked</span></th><th class="label">Option</th>${metas.map((m) => `<th class="${m.type === "number" ? "num" : ""}" title="${esc(m.def.description || "")}">${esc(m.label)}</th>`).join("")}</tr></thead>
       <tbody>${opts.map((o) => `
         <tr class="${chosen.has(o.id) ? "selected" : ""} ${o.excluded ? "excluded" : ""}">
           <td class="check">${chosen.has(o.id) ? `<span class="picked" title="Picked">${icon("check-circle", 18)}</span>` : ""}</td>
-          <td>${o.image ? `<img class="thumb" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
+          <td class="label">${o.image ? `<img class="thumb" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
             <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}${suggestedTag(o)}${chosen.has(o.id) ? `<span class="sr-only"> (picked)</span>` : ""}</div>
             ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}
             ${o.excluded ? `<div class="opt-desc">Ruled out${o.exclude_reason ? `: ${esc(o.exclude_reason)}` : ""}</div>` : ""}</td>
@@ -1254,7 +1254,7 @@ function filtersHtml({ metas, filtered }) {
       body = `<label class="lf">Contains<input class="field" type="text" data-filter="${k}" data-part="text" value="${esc(f.text ?? "")}"></label>`;
     }
     return `<details class="fpop ${on ? "on" : ""}" data-pop="${k}" ${S.pop === m.key ? "open" : ""}>
-      <summary class="fbtn" title="${esc(m.def.description || `Filter by ${m.label}`)}" aria-haspopup="dialog">${esc(m.label)}${on ? `: <span class="val">${esc(filterSummary(m, f))}</span>` : ""}${m.requested ? ` <span class="dot" title="Requested from the agent"></span>` : ""}${icon("chevron-down", 14)}</summary>
+      <summary class="fbtn" title="${esc(m.def.description || `Filter by ${m.label}`)}" aria-haspopup="dialog"><span class="flabel">${esc(m.label)}${on ? `: <span class="val">${esc(filterSummary(m, f))}</span>` : ""}</span>${m.requested ? ` <span class="dot" title="Requested from the agent"></span>` : ""}${icon("chevron-down", 14)}</summary>
       <div class="pop-scrim" data-action="close-pop"></div>
       <div class="pop" role="dialog" aria-label="Filter by ${esc(m.label)}"><div class="pop-title"><span>${esc(m.label)}${m.unit ? ` (${esc(m.unit)})` : ""}</span>${on ? `<button class="btn small ghost" data-action="clear-filter" data-key="${k}">Clear</button>` : ""}<button class="icon-btn" data-action="close-pop" aria-label="Close">${icon("x", 16)}</button></div>${body}
         <button class="btn primary pop-done" data-action="close-pop">Done</button></div>
@@ -1294,14 +1294,14 @@ function tableHtml({ metas, visible, best }, single) {
   if (!visible.length) return S.d.options.length ? `<div class="panel muted" style="margin-top:12px">No options match the filters. <button class="btn small ghost" data-action="clear-all-filters">Reset filters</button></div>` : "";
   const cols = metas.filter((m) => m.type !== "image");
   return `<div class="table-wrap"><table class="opts">
-    <thead><tr><th class="check"><span class="sr-only">Select</span></th><th aria-sort="${sortState("__label")}">${sortHead("__label", "Option")}</th>
+    <thead><tr><th class="check"><span class="sr-only">Select</span></th><th class="label" aria-sort="${sortState("__label")}">${sortHead("__label", "Option")}</th>
       ${cols.map((m) => `<th class="${m.type === "number" ? "num" : ""}" aria-sort="${sortState(m.key)}" title="${esc([m.def.description, m.requested && "Requested from the agent"].filter(Boolean).join(" · "))}">${sortHead(m.key, esc(m.label),
         (m.requested ? ` <span class="req" aria-label="requested"></span>` : "") + (m.better ? ` <span class="better">${m.better} better</span>` : ""))}</th>`).join("")}
       <th><span class="sr-only">Actions</span></th></tr></thead>
     <tbody>${visible.map((o, i) => `
       <tr class="opt ${S.selection.has(o.id) ? "selected" : ""} ${S.focus === i ? "focus" : ""}" data-option="${esc(o.id)}">
         <td class="check"><span class="pick-hit"><input class="pick" type="${single ? "radio" : "checkbox"}" name="pick" data-pick="${esc(o.id)}" ${S.selection.has(o.id) ? "checked" : ""} aria-label="Select ${esc(o.label)}"></span></td>
-        <td>${o.image ? `<img class="thumb" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
+        <td class="label">${o.image ? `<img class="thumb" src="${esc(o.image)}" alt="" loading="lazy">` : ""}
           <div class="opt-label">${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.label)}</a>` : esc(o.label)}${suggestedTag(o)}</div>
           ${o.description ? `<div class="opt-desc">${esc(o.description)}</div>` : ""}</td>
         ${cols.map((m) => {
