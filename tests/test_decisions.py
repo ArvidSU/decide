@@ -1662,5 +1662,115 @@ class SpacesTest(unittest.TestCase):
         self.assertEqual((store.scope_for(t["token"]).default, store.scope_for(t["token"]).token), ("work", t["id"]))
 
 
+class SchemaTest(unittest.TestCase):
+    """Upgrading the code keeps the data: databases are versioned and migrated when they're opened."""
+
+    def setUp(self):
+        self.db = os.path.join(tempfile.mkdtemp(), "t.db")
+
+    def open(self):
+        from decisions.store import Store
+        return Store(Config(db=self.db))
+
+    def version(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+
+    def upgraded(self, schema, migration):
+        """Patch the store to a version 2 with `schema` appended to SCHEMA and reached by `migration`."""
+        from unittest import mock
+        from decisions import store
+        return mock.patch.multiple(store, SCHEMA=store.SCHEMA + schema, SCHEMA_VERSION=2, MIGRATIONS={2: migration})
+
+    def test_every_version_after_the_first_has_a_migration(self):
+        from decisions.store import MIGRATIONS, SCHEMA_VERSION
+        self.assertEqual(sorted(MIGRATIONS), list(range(2, SCHEMA_VERSION + 1)))
+
+    def test_a_new_database_is_at_the_current_version(self):
+        from decisions.store import SCHEMA_VERSION
+        self.assertIsNone(self.open().schema_was)
+        self.assertEqual(self.version(), SCHEMA_VERSION)
+        self.assertEqual(self.open().schema_was, SCHEMA_VERSION)
+
+    def test_a_database_from_before_versions_is_adopted_with_its_data(self):
+        store = self.open()
+        goal = store.create_goal({"title": "Keep me"}, "me")
+        store.conn.execute("PRAGMA user_version=0")
+        store.conn.close()
+        store = self.open()
+        self.assertEqual((store.schema_was, self.version()), (0, 1))
+        self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
+
+    def test_a_migration_carries_the_data_over(self):
+        store = self.open()
+        goal = store.create_goal({"title": "Keep me"}, "me")
+        store.conn.close()
+
+        def migrate(conn):
+            conn.execute("ALTER TABLE goals ADD COLUMN shouted TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE goals SET shouted = upper(title)")
+            conn.execute("CREATE INDEX goals_by_shouted ON goals(shouted)")
+
+        with self.upgraded("ALTER TABLE goals ADD COLUMN shouted TEXT NOT NULL DEFAULT '';"
+                           "CREATE INDEX goals_by_shouted ON goals(shouted);", migrate):
+            store = self.open()
+            self.assertEqual((store.schema_was, self.version()), (1, 2))
+            self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
+            self.assertEqual(store.conn.execute("SELECT shouted FROM goals").fetchone()[0], "KEEP ME")
+            self.assertTrue(store.verify_chain()["ok"])
+            store.create_goal({"title": "Still works"}, "me")
+            store.conn.close()
+            self.assertEqual(self.open().schema_was, 2)
+
+    def test_a_migration_that_misses_the_schema_changes_nothing(self):
+        from decisions.store import SchemaError
+        store = self.open()
+        goal = store.create_goal({"title": "Keep me"}, "me")
+        store.conn.close()
+
+        def migrate(conn):
+            conn.execute("ALTER TABLE goals ADD COLUMN shouted TEXT")
+            conn.execute("DELETE FROM goals")
+
+        with self.upgraded("ALTER TABLE goals ADD COLUMN shouted TEXT NOT NULL DEFAULT '';", migrate):
+            with self.assertRaisesRegex(SchemaError, "goals"):
+                self.open()
+        self.assertEqual(self.version(), 1)
+        store = self.open()
+        self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
+
+    def test_a_schema_change_without_a_migration_is_refused(self):
+        from unittest import mock
+        from decisions import store
+        self.open().conn.close()
+        with mock.patch.object(store, "SCHEMA", store.SCHEMA + "CREATE TABLE extra (id TEXT);"):
+            with self.assertRaisesRegex(store.SchemaError, "no table extra"):
+                self.open()
+
+    def test_a_database_from_newer_code_is_refused(self):
+        from decisions.store import SCHEMA_VERSION, SchemaError
+        store = self.open()
+        store.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+        store.conn.close()
+        with self.assertRaisesRegex(SchemaError, "newer version"):
+            self.open()
+        self.assertEqual(self.version(), SCHEMA_VERSION + 1)
+
+    def test_decide_migrate_upgrades_without_serving(self):
+        run = lambda: subprocess.run([sys.executable, "-m", "decisions.cli", "migrate", "--db", self.db],
+                                     capture_output=True, text=True, cwd=ROOT)
+        self.assertIn("created at schema version", run().stdout)
+        self.assertIn("already at schema version", run().stdout)
+        conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE extra (id TEXT)")
+        conn.close()
+        res = run()
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("unknown table extra", res.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

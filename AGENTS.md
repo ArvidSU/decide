@@ -4,11 +4,11 @@
 
 The dogfood server holds real data. Upgrading the code must keep every space, goal, decision, token and event. Never fix a problem by deleting or resetting a database.
 
-- Every change to `SCHEMA` in `decisions/store.py` comes with a migration in the same commit. The database records its schema version in `PRAGMA user_version`. On startup, `Store` runs each migration the database hasn't had yet, in order, each in its own transaction. `SCHEMA` always describes the latest version, so a new database and a migrated one end up identical. If this runner doesn't exist yet when you change the schema, building it is part of your change.
+- Every change to `SCHEMA` in `decisions/store.py` comes with a migration in the same commit: add one to `SCHEMA_VERSION` and a function to `MIGRATIONS`. The database records its version in `PRAGMA user_version`. When `Store` opens it, it runs the migrations the database hasn't had, in order, in one transaction. `SCHEMA` always describes the latest version. `Store` checks that the migrated database has exactly what `SCHEMA` creates, and otherwise rolls back and refuses to start.
 - A migration carries the data over: backfill new columns, move rows when a table is reshaped. Once committed, a migration is never edited. Fix a mistake with a new one.
 - The event log is never rewritten, by migrations either: that would break the hash chain. Code that reads events must keep understanding every event type and payload shape ever written. When you rename or reshape an event, old events keep the old form, and readers handle both.
 - Test each migration: build a database at the previous version with rows in the affected tables, open it with `Store`, and check that the data is there, the schema equals a fresh database's, and the event chain still verifies.
-- Deploying upgrades the database in place, after backing it up. A deploy never needs a reset.
+- Deploying (`.dash-bored/scripts/remote.py deploy`) backs the database up, upgrades a copy of the backup with `decide migrate`, and only then restarts the server, which upgrades the real one. A deploy never resets a database.
 
 The API, CLI flags and GUI can still change freely, because the server, `decide`, the skill and the resumer are deployed together. Don't keep deprecated aliases or fallbacks for old clients. Rename things when a better name appears, and update every caller. When a change makes something obsolete, delete it rather than keeping it around.
 

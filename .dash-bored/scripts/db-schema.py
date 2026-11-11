@@ -1,22 +1,20 @@
-"""Does the local Decisions database match this checkout's schema, and delete it when it doesn't.
+"""Is the local Decisions database at this checkout's schema version?
 
-Usage: python3 .dash-bored/scripts/db-schema.py <status|delete>
+Usage: python3 .dash-bored/scripts/db-schema.py status
 
-status  status JSON: compares every table, index and trigger in the database with what
-        SCHEMA in decisions/store.py creates. Read-only.
-delete  interactive: shows what's out of date, refuses while a process has the file open
-        (stop the server first), asks for confirmation, then removes the db and its -wal/-shm.
+status  status JSON: compares the database's `PRAGMA user_version` with SCHEMA_VERSION in
+        decisions/store.py. Read-only.
 
-The project is greenfield: schema changes come without migrations, so an old database is
-deleted, not upgraded (AGENTS.md). The database is found the way `decide serve` finds it:
-DECISIONS_DB, else `db` in DECISIONS_CONFIG / ./decisions.toml / ~/.config/decisions/config.toml,
-else ~/.local/share/decisions/decisions.db. Stdlib only; runs on the macOS system python3 (3.9).
+The server upgrades an older database when it starts, keeping its data (MIGRATIONS in
+decisions/store.py), so the fix for an old one is a restart. The database is found the way
+`decide serve` finds it: DECISIONS_DB, else `db` in DECISIONS_CONFIG / ./decisions.toml /
+~/.config/decisions/config.toml, else ~/.local/share/decisions/decisions.db. Stdlib only; runs on
+the macOS system python3 (3.9).
 """
 import json
 import os
 import re
 import sqlite3
-import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,49 +44,20 @@ def db_path():
     return os.path.expanduser(DEFAULT_DB)
 
 
-def objects(conn):
-    """{(type, name): normalized sql} for every table, index and trigger."""
-    rows = conn.execute("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL "
-                        "AND name NOT LIKE 'sqlite_%'").fetchall()
-    return {(t, n): " ".join(sql.split()) for t, n, sql in rows}
-
-
 def expected():
     with open(STORE) as fh:
-        m = re.search(r'^SCHEMA = """(.*?)"""', fh.read(), re.S | re.M)
+        m = re.search(r"^SCHEMA_VERSION = (\d+)$", fh.read(), re.M)
     if not m:
-        sys.exit("SCHEMA not found in decisions/store.py")
-    mem = sqlite3.connect(":memory:")
-    mem.executescript(m.group(1))
-    return objects(mem)
+        sys.exit("SCHEMA_VERSION not found in decisions/store.py")
+    return int(m.group(1))
 
 
-def differences(path):
-    """Human-readable differences between the database and the checkout's schema ([] = current)."""
+def version(path):
     conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
     try:
-        have = objects(conn)
+        return conn.execute("PRAGMA user_version").fetchone()[0]
     finally:
         conn.close()
-    want = expected()
-    diffs = []
-    for kind, name in sorted(set(want) - set(have)):
-        diffs.append("missing %s %s" % (kind, name))
-    for kind, name in sorted(set(have) - set(want)):
-        diffs.append("obsolete %s %s" % (kind, name))
-    for kind, name in sorted(set(want) & set(have)):
-        if want[(kind, name)] == have[(kind, name)]:
-            continue
-        if kind != "table":
-            diffs.append("%s %s is defined differently" % (kind, name))
-            continue
-        cols = lambda sql: set(re.findall(r"[(,]\s*([a-z_]+) [A-Z]", sql))
-        missing = cols(want[(kind, name)]) - cols(have[(kind, name)])
-        extra = cols(have[(kind, name)]) - cols(want[(kind, name)])
-        diffs.append("%s: %s" % (name, ", ".join(["no %s column" % c for c in sorted(missing)] +
-                                                 ["obsolete %s column" % c for c in sorted(extra)])
-                                  or "constraints changed"))
-    return diffs
 
 
 def counts(path):
@@ -106,62 +75,25 @@ def status():
     if not os.path.exists(path):
         out("unknown", "No database at %s yet; the server creates it when it starts." % short(path))
         return
+    want = expected()
     try:
-        diffs = differences(path)
+        have = version(path)
     except sqlite3.Error as exc:
         out("error", "%s is unreadable: %s" % (short(path), exc))
         return
-    if diffs:
-        out("warning", "%s predates this checkout's schema (%s). There are no migrations: Kill server, "
-            "Delete old database, then Restart server." % (short(path), "; ".join(diffs[:4])
-                                                                    + ("; …" if len(diffs) > 4 else "")))
-        return
-    n = counts(path)
-    out("healthy", "%s matches the schema%s." % (short(path), " · %d decisions, %d events" % tuple(n) if n else ""))
-
-
-def side_files(path):
-    return [p for p in (path, path + "-wal", path + "-shm") if os.path.exists(p)]
-
-
-def delete():
-    path = db_path()
-    if not os.path.exists(path):
-        print("Nothing to delete: no database at %s." % short(path))
-        return
-    try:
-        diffs = differences(path)
-        print("Schema: " + ("; ".join(diffs) if diffs else "matches this checkout (it is not out of date)"))
-    except sqlite3.Error as exc:
-        print("Schema: unreadable (%s)" % exc)
-    n = counts(path)
-    if n:
-        print("Contains %d decisions and %d events." % tuple(n))
-    # Listed after reading it: opening a WAL database creates its -wal and -shm files.
-    files = side_files(path)
-    holders = subprocess.run(["lsof", "-t"] + files, capture_output=True, text=True).stdout.split()
-    if holders:
-        ps = subprocess.run(["ps", "-o", "pid=,command=", "-p", ",".join(holders)], capture_output=True, text=True)
-        sys.exit("Refusing: the database is open in\n%s\nStop the server first (Kill server), then run this again."
-                 % ps.stdout.rstrip())
-    print("This permanently deletes:\n  " + "\n  ".join(short(p) for p in files))
-    print("Machine tokens live in it too: connected machines need new ones afterwards (Settings → Machines).")
-    try:
-        answer = input("Type delete to confirm: ").strip()
-    except EOFError:
-        answer = ""
-    if answer != "delete":
-        sys.exit("Not deleted.")
-    for p in side_files(path):
-        os.remove(p)
-    print("Deleted. Start the server (Serve / restart) to create a fresh database.")
+    if have > want:
+        out("error", "%s is at schema version %d, written by newer code: this checkout only knows up to %d."
+            % (short(path), have, want))
+    elif have < want:
+        out("warning", "%s is at schema version %s; this checkout is at %d. Restart server: it upgrades the "
+            "database when it starts, keeping its data." % (short(path), have or "unrecorded", want))
+    else:
+        n = counts(path)
+        out("healthy", "%s is at schema version %d%s."
+            % (short(path), want, " · %d decisions, %d events" % tuple(n) if n else ""))
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "status":
-        status()
-    elif cmd == "delete":
-        delete()
-    else:
-        sys.exit("usage: db-schema.py <status|delete>")
+    if sys.argv[1:] != ["status"]:
+        sys.exit("usage: db-schema.py status")
+    status()

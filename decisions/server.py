@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from . import __version__, dist
 from .config import Config, is_loopback
 from .markdown import decision_markdown
-from .store import ALL, DEFAULT_WEBHOOK_EVENTS, ApiError, Scope, Store
+from .store import ALL, DEFAULT_WEBHOOK_EVENTS, SCHEMA_VERSION, ApiError, Scope, Store
 from .webhooks import Dispatcher
 
 STATIC = Path(__file__).parent / "static"
@@ -494,6 +494,8 @@ def serve(cfg: Config, insecure: bool = False):
     httpd, store, dispatcher = make_server(cfg)
     dispatcher.start()
     print(f"decisions: GUI + API on {cfg.public_url}  (db: {cfg.db_path}, auth: {'on' if cfg.token else 'off'})")
+    if store.schema_was not in (None, SCHEMA_VERSION):
+        print(f"  upgraded the database from schema version {store.schema_was or 'unrecorded'} to {SCHEMA_VERSION}")
     if cfg.host in ("0.0.0.0", "::", "") and not cfg.base_url:
         print(f"  warning: base_url is not set, so decision links use {cfg.public_url}. "
               "Set base_url (DECISIONS_BASE_URL) to the URL other machines use.")

@@ -210,6 +210,8 @@ Flags: `--no-resumer`, `--no-skill`. The pieces are also served on their own: `/
 
 **Resuming happens on the machine where the session ran.** `decide create` records the machine (hostname, or `DECISIONS_MACHINE`) in the resume target. Each machine's resumer heartbeats under its own name and only resumes its own sessions. The decision page shows the status of the resumer on that decision's machine, and Settings lists every machine's resumer.
 
+**Upgrading:** install the new version and restart the server (with Docker: `docker compose build && docker compose up -d`). The database records its schema version, and the server upgrades an older database when it starts, keeping all of its data. If it can't, it leaves the database as it was and refuses to start, saying why. `decide migrate` does the upgrade without starting the server, e.g. to try it on a copy first: `decide migrate --db /path/to/copy.db`. Back the database file up before upgrading.
+
 **What needs which direction:** `decide wait`, the resumer and the GUI only make outbound connections to the server. Webhooks (`decide watch`/`listen`, your own) need the server to reach the receiver. `decide watch` against a remote server listens on all interfaces and registers the local address it uses to reach the server; override with `--callback-url`.
 
 ## Configuration

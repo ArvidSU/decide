@@ -211,6 +211,17 @@ CREATE TRIGGER IF NOT EXISTS attempts_no_delete BEFORE DELETE ON delivery_attemp
   BEGIN SELECT RAISE(ABORT, 'delivery attempts are immutable'); END;
 """
 
+# The version of SCHEMA. Each database records the version it's at in `PRAGMA user_version`.
+# Changing SCHEMA means adding one to this and a migration below.
+SCHEMA_VERSION = 1
+
+# version -> a function taking the connection, that brings a database at the version before to it.
+# `Store` runs the ones a database hasn't had, in order, in one transaction with foreign keys off, and
+# rolls all of it back unless the result is exactly what SCHEMA creates. Use conn.execute (executescript
+# would commit), carry the data over, and leave the rows of `events` as they are: rewriting them breaks
+# the hash chain. A migration that has been committed is never edited.
+MIGRATIONS: dict = {}
+
 DEFAULT_WEBHOOK_EVENTS = [
     "decision.resolved",
     "decision.reopened",
@@ -279,6 +290,49 @@ class Scope:
 
 
 ALL = Scope()
+
+
+class SchemaError(Exception):
+    """The database can't be brought to this code's schema. It is left as it was."""
+
+
+def schema_structure(conn) -> dict:
+    """{(kind, name): shape} for every table, index and trigger: what a schema amounts to, whether
+    CREATE or ALTER made it."""
+    def rows(pragma, name):
+        return [tuple(r) for r in conn.execute('PRAGMA %s("%s")' % (pragma, name.replace('"', '""')))]
+
+    shapes: dict = {}
+    for kind, name, sql in conn.execute("SELECT type, name, sql FROM sqlite_master "
+                                        "WHERE name NOT LIKE 'sqlite_%'").fetchall():
+        if kind == "table":
+            constraints = []
+            for _, index, unique, origin, partial in rows("index_list", name):
+                columns = tuple(r[2] for r in rows("index_info", index))
+                if origin == "c":
+                    shapes[("index", index)] = (name, unique, partial, columns)
+                else:  # from a PRIMARY KEY or UNIQUE constraint; its name is generated
+                    constraints.append((origin, columns))
+            shapes[(kind, name)] = (sorted(r[1:] for r in rows("table_xinfo", name)),
+                                    sorted(r[2:] for r in rows("foreign_key_list", name)), sorted(constraints))
+        elif kind != "index":
+            shapes[(kind, name)] = " ".join(sql.replace("IF NOT EXISTS ", "").split())
+    return shapes
+
+
+def schema_differences(have: dict, want: dict) -> list[str]:
+    """How the schema `have` differs from `want`, in words ([] = they're the same)."""
+    diffs = [f"no {kind} {name}" for kind, name in sorted(want.keys() - have.keys())]
+    diffs += [f"unknown {kind} {name}" for kind, name in sorted(have.keys() - want.keys())]
+    for kind, name in sorted(k for k in want.keys() & have.keys() if want[k] != have[k]):
+        if kind != "table":
+            diffs.append(f"{kind} {name} is defined differently")
+            continue
+        wanted, found = ({c[0] for c in shape[0]} for shape in (want[kind, name], have[kind, name]))
+        diffs.append(f"{name}: " + (", ".join([f"no {c} column" for c in sorted(wanted - found)]
+                                              + [f"unknown {c} column" for c in sorted(found - wanted)])
+                                    or "columns or constraints are defined differently"))
+    return diffs
 
 
 class ApiError(Exception):
@@ -483,13 +537,57 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # The schema version the database was at: None = it's new, 0 = from before versions were recorded.
+        self.schema_was = self._upgrade()
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(SCHEMA)
         self.conn.execute("INSERT OR IGNORE INTO spaces (name, created_at) VALUES (?, ?)", (DEFAULT_SPACE, now_iso()))
         # Last heartbeat per machine from resumer daemons (`decide resumer run`). In memory only.
         self.resumers: dict[str, dict] = {}
         # Who is long-polling which decision right now: (decision, actor, types) -> info. In memory only.
         self.waiters: dict[tuple, dict] = {}
+
+    # ------------------------------------------------------------------ schema
+
+    def _upgrade(self) -> int | None:
+        """Bring the database to SCHEMA_VERSION, keeping its data, or raise SchemaError and leave it
+        untouched. Returns the version it was at (None = it's new)."""
+        conn = self.conn
+        was = conn.execute("PRAGMA user_version").fetchone()[0]
+        if not conn.execute("SELECT 1 FROM sqlite_master").fetchone():
+            conn.executescript(f"BEGIN; {SCHEMA} PRAGMA user_version={SCHEMA_VERSION}; COMMIT;")
+            return None
+        if was > SCHEMA_VERSION:
+            raise SchemaError(f"the database is at schema version {was}, and this code only knows up to "
+                              f"{SCHEMA_VERSION}: it was written by a newer version. Upgrade the code.")
+        fresh = sqlite3.connect(":memory:")
+        fresh.executescript(SCHEMA)
+        want = schema_structure(fresh)
+        fresh.close()
+        conn.execute("PRAGMA foreign_keys=OFF")  # so a migration can rebuild a table; checked below instead
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # A database from before versions were recorded has the first versioned schema.
+            for version in range((was or 1) + 1, SCHEMA_VERSION + 1):
+                MIGRATIONS[version](conn)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            diffs = schema_differences(schema_structure(conn), want)
+            if diffs:
+                raise SchemaError(
+                    f"the database (schema version {was or 'unrecorded'}) doesn't have the schema of version "
+                    f"{SCHEMA_VERSION}{' after migrating' if (was or 1) < SCHEMA_VERSION else ''}: "
+                    f"{'; '.join(diffs)}. It was left as it was. A change to SCHEMA needs a migration that "
+                    "ends up with exactly what SCHEMA creates.")
+            migrated = (was or 1) < SCHEMA_VERSION
+            broken = conn.execute("PRAGMA foreign_key_check").fetchall() if migrated else []
+            if broken:
+                raise SchemaError(f"migrating to schema version {SCHEMA_VERSION} left {len(broken)} rows pointing "
+                                  f"at rows that don't exist (in {', '.join(sorted({r[0] for r in broken}))}). "
+                                  "The database was left as it was.")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        return was
 
     # ------------------------------------------------------------------ plumbing
 

@@ -142,8 +142,33 @@ def _summary(d: dict) -> str:
 
 def cmd_serve(args):
     from .server import serve
-    serve(load_config(args.config, {"host": args.host, "port": args.port, "db": args.db, "token": args.token}),
-          insecure=args.insecure)
+    from .store import SchemaError
+    try:
+        serve(load_config(args.config, {"host": args.host, "port": args.port, "db": args.db, "token": args.token}),
+              insecure=args.insecure)
+    except SchemaError as exc:
+        raise SystemExit(f"error: {exc}")
+
+
+def _schema_change(store) -> str:
+    """What opening the database did to its schema, in words."""
+    from .store import SCHEMA_VERSION
+    if store.schema_was is None:
+        return f"created at schema version {SCHEMA_VERSION}"
+    if store.schema_was == SCHEMA_VERSION:
+        return f"already at schema version {SCHEMA_VERSION}"
+    return f"upgraded from schema version {store.schema_was or 'unrecorded'} to {SCHEMA_VERSION}"
+
+
+def cmd_migrate(args):
+    """Upgrade the database without starting the server (`decide serve` does the same on startup)."""
+    from .store import SchemaError, Store
+    cfg = load_config(args.config, {"db": args.db})
+    try:
+        store = Store(cfg)
+    except SchemaError as exc:
+        raise SystemExit(f"error: {cfg.db_path}: {exc}")
+    print(f"{cfg.db_path}: {_schema_change(store)}")
 
 
 def cmd_connect(args):
@@ -1247,6 +1272,12 @@ def main(argv=None):
     s.add_argument("--config")
     s.add_argument("--insecure", action="store_true", help="allow listening on the network without a token")
     s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("migrate", help="upgrade the database to this version's schema, keeping its data "
+                                       "(the server does this when it starts)")
+    s.add_argument("--db")
+    s.add_argument("--config")
+    s.set_defaults(fn=cmd_migrate)
 
     s = sub.add_parser("server", help="run the server as a background service (launchd / systemd --user)")
     ssub = s.add_subparsers(dest="server_cmd", required=True)
