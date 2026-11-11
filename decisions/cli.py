@@ -1245,6 +1245,14 @@ def cmd_token_roll(args):
     _print_new_token(c, c.call("POST", f"/api/tokens/{args.id}/roll"))
 
 
+def cmd_token_set(args):
+    body = {k: v for k, v in (("name", args.name), ("space", args.space)) if v is not None}
+    if not body:
+        sys.exit("error: give --space and/or --name")
+    t = Client().call("PATCH", f"/api/tokens/{args.id}", body)
+    print(f"{t['id']} is {t['name']!r} in space {t['space']}")
+
+
 def cmd_token_revoke(args):
     _print(Client().call("DELETE", f"/api/tokens/{args.id}"))
 
@@ -1529,6 +1537,11 @@ def main(argv=None):
     r = tsub.add_parser("roll", help="replace a token's secret; the old one stops working at once")
     r.add_argument("id")
     r.set_defaults(fn=cmd_token_roll)
+    r = tsub.add_parser("set", help="move a token to another space (same secret, no reinstall), or rename it")
+    r.add_argument("id")
+    r.add_argument("--space", help="the space it sees from now on")
+    r.add_argument("--name")
+    r.set_defaults(fn=cmd_token_set)
     r = tsub.add_parser("revoke", help="delete a token")
     r.add_argument("id")
     r.set_defaults(fn=cmd_token_revoke)

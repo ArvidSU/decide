@@ -767,8 +767,10 @@ function machinesSetting(cfg, tokens, resumers) {
           <td class="nowrap">${t.last_used_at ? `<span title="${esc(fullTime(t.last_used_at))}">${ago(t.last_used_at)}</span>` : `<span class="muted">Never</span>`}${t.rolled_at ? `<div class="muted small">rolled ${ago(t.rolled_at)}</div>` : ""}</td>
           <td class="nowrap">${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span> ${esc(t.resumer.machine)}</span>` : `<span class="muted">Not seen</span>`}</td>
           <td style="text-align:right;white-space:nowrap">
+            <button class="btn small ghost" data-action="connect-token" data-id="${t.id}" data-name="${esc(t.name)}" data-space="${esc(t.space)}">Connect</button>
+            ${spaces.length > 1 ? `<button class="btn small ghost" data-action="move-token" data-id="${t.id}" data-name="${esc(t.name)}" data-space="${esc(t.space)}">Move</button>` : ""}
             <button class="btn small ghost" data-action="roll-token" data-id="${t.id}" data-name="${esc(t.name)}">${icon("rotate", 14)}Roll</button>
-            <button class="btn small ghost danger" data-action="revoke-token" data-id="${t.id}" data-name="${esc(t.name)}">Revoke</button></td></tr>`).join("")}</table></div>`
+            <button class="btn small ghost danger" data-action="revoke-token" data-id="${t.id}" data-name="${esc(t.name)}">Delete</button></td></tr>`).join("")}</table></div>`
         : `<div class="muted small">No machine tokens yet. Connect one below.</div>`}
         <form class="form-row" id="add-token" style="margin-top:14px">
           <label class="lf grow">Connect a machine<input class="input" name="name" required maxlength="60" placeholder="e.g. work laptop"></label>
@@ -776,7 +778,7 @@ function machinesSetting(cfg, tokens, resumers) {
           <button class="btn primary">${icon("plus", 15)}Create token</button></form>
       </div>
       ${others.length ? `<div class="status-row"><span class="muted">Other resumers</span>
-        ${others.map((r) => `<span class="item"><span class="live ${r.online ? "on" : "off"}"></span>${esc(r.machine)} <span class="muted">${r.token ? "" : "admin token · "}${r.online ? "online" : "offline"}</span></span>`).join("")}</div>` : ""}
+        ${others.map((r) => `<span class="item"><span class="live ${r.online ? "on" : "off"}"></span>${esc(r.machine)} <span class="muted">${r.token ? "" : "admin token · "}${r.online ? "online" : "offline"}</span>${r.online ? "" : `<button class="icon-btn" data-action="forget-resumer" data-id="${esc(r.machine)}" title="Remove ${esc(r.machine)} from this list" aria-label="Remove ${esc(r.machine)}">${icon("x", 13)}</button>`}</span>`).join("")}</div>` : ""}
       ${cfg.auth ? `<div class="form-row" style="margin-top:12px"><button class="btn small ghost" data-action="copy-gui-link">${icon("link", 14)}Copy GUI sign-in link</button></div>
         <p class="hint">The sign-in link holds the admin token, which sees and manages every space. Give machines their own token instead.</p>`
         : `<p class="hint">Auth is off: anyone who can reach the server sees everything, and a token only picks the space new decisions go to. To accept other machines safely, run the server with <code>host = "0.0.0.0"</code> and a <code>token</code>; <code>decide server install --host 0.0.0.0</code> sets both.</p>`}
@@ -2338,11 +2340,32 @@ document.addEventListener("click", async (e) => {
       return;
     }
     case "revoke-token": {
-      const ok = await ask({ title: `Revoke the token for ${a.dataset.name}?`, body: `<p>That machine's <code>decide</code>, agents and resumer lose access at once. Its decisions stay.</p>`, ok: "Revoke", danger: true });
+      const ok = await ask({ title: `Delete ${a.dataset.name}?`, body: `<p>Its token is revoked, so that machine's <code>decide</code>, agents and resumer lose access at once. Its decisions stay.</p>`, ok: "Delete machine", danger: true });
       if (ok === null) return;
-      try { await api("DELETE", `/api/tokens/${id}`); toast(`Revoked ${a.dataset.name}`); renderSettings(); } catch (err) { fail(err); }
+      try { await api("DELETE", `/api/tokens/${id}`); toast(`Deleted ${a.dataset.name}`); await spacesChanged(); } catch (err) { fail(err); }
       return;
     }
+    case "connect-token": {
+      // Only a hash of the token is stored, so the full command can only be shown with a new secret.
+      const ok = await ask({ title: `Connect ${a.dataset.name}`, body: `<p>This installs <code>decide</code>, the agent skill and the resumer, connected to the <strong>${esc(a.dataset.space)}</strong> space:</p>
+        <pre class="install-cmd">${esc(installCommand(S.config, "<token>"))}</pre>
+        <p class="hint">Already installed there? <code>decide connect ${esc(S.config.base_url)} --token &lt;token&gt;</code></p>
+        <p>The token was shown only when it was created or last rolled; the server keeps just a hash of it. Roll it to get the command with a new token filled in. The old one stops working at once.</p>`, ok: "Roll and show command", cancel: "Close", danger: true });
+      if (ok === null) return;
+      try { showToken(await api("POST", `/api/tokens/${id}/roll`), "rolled"); renderSettings(); } catch (err) { fail(err); }
+      return;
+    }
+    case "move-token": {
+      const from = a.dataset.space;
+      const to = await ask({ title: `Move ${a.dataset.name} to another space`, body: `<p>Its token stays the same, so nothing has to be reinstalled: <code>decide</code>, the agents and the resumer there see the new space from their next request, and no longer see <strong>${esc(from)}</strong>. What it created in ${esc(from)} stays there, and sessions on it waiting for those decisions aren't resumed.</p>`,
+        field: "Space", value: from, choices: S.config.spaces.map((s) => ({ value: s.name, label: s.name })), ok: "Move" });
+      if (to === null || to === from) return;
+      try { await api("PATCH", `/api/tokens/${id}`, { space: to }); toast(`Moved ${a.dataset.name} to ${to}`); await spacesChanged(); } catch (err) { fail(err); }
+      return;
+    }
+    case "forget-resumer":
+      try { await api("DELETE", `/api/resumer?machine=${encodeURIComponent(id)}`); renderSettings(); } catch (err) { fail(err); }
+      return;
     case "space-deadline": {
       const v = await ask({ title: `Default deadline in ${id}`, body: `<p>New decisions in this space expire this many days after they're created unless they set their own. 0 means no default deadline. Leave it empty to use the server's ${esc(S.config.deadline_days)} days.</p>`,
         field: "Days", type: "number", value: a.dataset.days, ok: "Save" });

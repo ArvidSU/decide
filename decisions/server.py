@@ -237,6 +237,10 @@ class Handler(BaseHTTPRequestHandler):
     def roll_token(self, tid):
         return self.store.roll_token(tid, self.actor, self.scope)
 
+    @route("PATCH", "/api/tokens/([^/]+)")
+    def update_token(self, tid):
+        return self.store.update_token(tid, self._body(), self.actor, self.scope)
+
     @route("DELETE", "/api/tokens/([^/]+)")
     def revoke_token(self, tid):
         return self.store.revoke_token(tid, self.actor, self.scope)
@@ -303,6 +307,10 @@ class Handler(BaseHTTPRequestHandler):
     @route("GET", "/api/resumer")
     def resumer(self):
         return self.store.resumer_status(self.qs.get("machine", [None])[0])
+
+    @route("DELETE", "/api/resumer")
+    def forget_resumer(self):
+        return self.store.forget_resumer(self.qs.get("machine", [""])[0], self.scope)
 
     @route("GET", "/api/decisions/([^/]+)/listeners")
     def listeners(self, did):

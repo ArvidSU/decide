@@ -1920,6 +1920,14 @@ class Store:
                         {"online": False, "last_seen": None})
         return main | {"resumers": everyone}
 
+    def forget_resumer(self, machine: str, scope: Scope = ALL) -> dict:
+        """Drop a machine from the resumers seen. One that's still running is back at its next heartbeat."""
+        self._admin(scope)
+        with self.lock:
+            if not self.resumers.pop(machine, None):
+                raise ApiError(404, f"no resumer seen on {machine!r}")
+        return {"forgotten": machine}
+
     # ------------------------------------------------------------------ spaces and machine tokens
 
     @staticmethod
@@ -2020,6 +2028,7 @@ class Store:
             self.conn.execute("DELETE FROM tokens WHERE space=?", (name,))
             self.conn.execute("DELETE FROM spaces WHERE name=?", (name,))
             self._event(None, "space.deleted", actor, {"revoked_tokens": revoked}, name)
+            self._forget_resumers_of([t["id"] for t in revoked])
             return {"deleted": name, "revoked_tokens": [t["id"] for t in revoked]}
 
     def _token_dict(self, row) -> dict:
@@ -2067,13 +2076,36 @@ class Store:
             self._event(None, "token.rolled", actor, {"token_id": tid, "name": row["name"]}, row["space"])
             return self._token_dict(self._token_row(tid)) | {"token": secret}
 
+    def update_token(self, tid: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """Rename a machine, or move it to another space: the same secret then sees that space instead.
+        A move is logged in both spaces' chains."""
+        self._admin(scope)
+        with self.tx():
+            row = self._token_row(tid)
+            new = {"name": (_req_str(body, "name")[:60] if "name" in body else row["name"]),
+                   "space": _opt_type(body, "space", str) or row["space"]}
+            self._space_row(new["space"])
+            changes = {k: [row[k], v] for k, v in new.items() if v != row[k]}
+            if changes:
+                self.conn.execute("UPDATE tokens SET name=?, space=? WHERE id=?", (new["name"], new["space"], tid))
+                for space in dict.fromkeys((row["space"], new["space"])):
+                    self._event(None, "token.updated", actor,
+                                {"token_id": tid, "name": new["name"], "changes": changes}, space)
+            return self._token_dict(self._token_row(tid))
+
     def revoke_token(self, tid: str, actor: str, scope: Scope = ALL) -> dict:
         self._admin(scope)
         with self.tx():
             row = self._token_row(tid)
             self.conn.execute("DELETE FROM tokens WHERE id=?", (tid,))
             self._event(None, "token.revoked", actor, {"token": self._token_dict(row)}, row["space"])
+            self._forget_resumers_of([tid])
             return {"revoked": tid}
+
+    def _forget_resumers_of(self, token_ids):
+        """A deleted token's machines can't heartbeat any more: don't keep listing them as offline."""
+        for machine in [m for m, r in self.resumers.items() if r.get("token") in token_ids]:
+            del self.resumers[machine]
 
     # ------------------------------------------------------------------ options
 

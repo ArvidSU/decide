@@ -1600,6 +1600,8 @@ class SpacesTest(unittest.TestCase):
         for method, path in (("GET", "/api/tokens"), ("POST", "/api/tokens"), ("POST", "/api/spaces"),
                              ("PATCH", "/api/spaces/work"), ("DELETE", "/api/spaces/work"),
                              ("POST", f"/api/tokens/{self.tokens['id-work']}/roll"),
+                             ("PATCH", f"/api/tokens/{self.tokens['id-work']}"),
+                             ("DELETE", "/api/resumer?machine=laptop"),
                              ("DELETE", f"/api/tokens/{self.tokens['id-private']}")):
             self.call(method, path, {"name": "x", "space": "work"}, token="tok-work", expect=403)
         # A machine token still sees its own space, and nothing else.
@@ -1633,6 +1635,43 @@ class SpacesTest(unittest.TestCase):
         self.assertEqual([t for t in types if t.startswith("token.")],
                          ["token.created", "token.created", "token.rolled", "token.revoked"])
         self.assertNotIn(rolled["token"], json.dumps(self.call("GET", "/api/events?limit=500")))
+
+    def test_moving_a_token_to_another_space(self):
+        tid = self.tokens["id-work"]
+        w = self.create("tok-work")
+        self.call("PATCH", f"/api/tokens/{tid}", {"space": "nope"}, expect=404)
+        self.call("PATCH", f"/api/tokens/{tid}", {"name": ""}, expect=400)
+        self.call("PATCH", "/api/tokens/tok_nope", {"space": "private"}, expect=404)
+        before = len(self.call("GET", "/api/events?limit=500")["events"])
+        self.assertEqual(self.call("PATCH", f"/api/tokens/{tid}", {"space": "work"}, expect=200)["space"], "work")
+        self.assertEqual(len(self.call("GET", "/api/events?limit=500")["events"]), before)  # nothing changed
+        moved = self.call("PATCH", f"/api/tokens/{tid}", {"space": "private", "name": "desk"}, expect=200)
+        self.assertEqual((moved["space"], moved["name"]), ("private", "desk"))
+        self.assertNotIn("token", moved)
+        # The same secret now sees private, and work no more.
+        self.assertEqual(self.call("GET", "/api/config", token="tok-work")["space"], "private")
+        self.call("GET", f"/api/decisions/{w['id']}", token="tok-work", expect=404)
+        self.assertEqual(self.create("tok-work")["space"], "private")
+        # Logged in both spaces' chains.
+        events = [e for e in self.call("GET", "/api/events?limit=500")["events"] if e["type"] == "token.updated"]
+        self.assertEqual([e["space"] for e in events], ["work", "private"])
+        self.assertEqual(events[0]["data"], {"token_id": tid, "name": "desk",
+                                             "changes": {"name": ["laptop", "desk"], "space": ["work", "private"]}})
+        self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
+        counts = {sp["name"]: sp["tokens"] for sp in self.call("GET", "/api/spaces")["spaces"]}
+        self.assertEqual((counts["work"], counts["private"]), (0, 2))
+
+    def test_forgetting_resumers(self):
+        seen = lambda: [r["machine"] for r in self.call("GET", "/api/resumer")["resumers"]]
+        self.call("POST", "/api/resumer/heartbeat", {"machine": "laptop"}, token="tok-work", expect=200)
+        self.call("POST", "/api/resumer/heartbeat", {"machine": "server"}, expect=200)
+        self.assertEqual(sorted(seen()), ["laptop", "server"])
+        self.call("DELETE", "/api/resumer?machine=server", expect=200)
+        self.call("DELETE", "/api/resumer?machine=server", expect=404)
+        self.assertEqual(seen(), ["laptop"])
+        # Deleting a machine's token takes its resumer off the list too.
+        self.call("DELETE", f"/api/tokens/{self.tokens['id-work']}", expect=200)
+        self.assertEqual(seen(), [])
 
     def test_space_lifecycle(self):
         self.call("POST", "/api/spaces", {"name": "work"}, expect=409)
