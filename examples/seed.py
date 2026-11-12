@@ -1,7 +1,8 @@
 """Fill a running server with demo data: python3 examples/seed.py
 
 Goals from a vision down to technical ones, decisions toward them in every state (waiting on you, waiting
-on another decision, decided, changed, expired), and goals with a proof to agree on or ask for.
+on another decision, decided, changed, expired), goals with a proof to agree on or ask for, and feedback from
+agents on Decisions itself, some of it asked for once a session was done.
 """
 import json
 import os
@@ -184,4 +185,57 @@ call("POST", f"/api/goals/{fast}/proof/ready", {"note": "Redis read-through is l
 proof(upgrades, "A fresh instance runs the new version **within 10 minutes** of the release images being available.",
       "python3 prove_upgrade.py", "prove_upgrade.py")
 
-print(f"seeded: {BASE}/map")
+# ---------------------------------------------------------------------------- feedback: what agents say about Decisions
+
+
+def seed_feedback(cache, sprint, tenancy):
+    """Feedback in every status, from sessions that were asked once they were done and from ones that weren't."""
+    def session(sid, agent=AGENT):
+        return {"session_id": sid, "agent": agent, "machine": MACHINE, "cwd": HERE}
+
+    def feedback(kind, title, body, actor=AGENT, sid=None, status=None, note=""):
+        fid = call("POST", "/api/feedback", {"kind": kind, "title": title, "body": body}
+                   | ({"session": session(sid, actor)} if sid else {}), actor)["id"]
+        if status:
+            call("PATCH", f"/api/feedback/{fid}", {"status": status, "note": note}, ME)
+
+    def asked(sid, about, agent=AGENT):
+        for status in ("started", "finished"):
+            call("POST", "/api/feedback/asks", {"status": status, "session_id": sid, "agent": agent,
+                                                "machine": MACHINE, "about": about}, "resumer")
+
+    # A session that was asked once its decision was settled, and had two things to say.
+    asked("demo-session-2", [cache])
+    feedback("bug", "decide wait says nothing when the decision is reopened",
+             f"I was waiting on {cache} with `decide wait --on decision.resolved,decision.cancelled,decision.expired`. "
+             f"It was decided, I started on HTTP caching, and then it was **reopened and decided again** while I "
+             f"worked. Nothing told me until I ran `decide get`.\n\n"
+             f"- Expected: the `to keep waiting:` line to include `decision.reopened`, or the skill to say so\n"
+             f"- Workaround: I check `decide get {cache} --json` before every commit", sid="demo-session-2")
+    feedback("improvement", "Put the reasons for ruled-out options in the resume prompt",
+             f"The prompt I was resumed with for {cache} named the pick and the note. Why *Materialized view* was "
+             f"ruled out (\"Refresh locks the table\") was only in `decide get --json`, under the option's "
+             f"`exclude_reason`. One line per ruled-out option in the prompt would have saved the lookup.",
+             sid="demo-session-2")
+    # One that was asked and had nothing to add.
+    asked("demo-session-3", [tenancy])
+    # Sent unprompted, while the session was still waiting.
+    feedback("feature", "Let me mark one option as my recommendation",
+             f"For {sprint} I had a clear favourite and could only say so in `context`, where it's easy to miss. An "
+             f"option-level `recommended: true` with a reason, shown as a badge, would make it one click to agree.",
+             sid="demo-session-1")
+    feedback("improvement", "decide fill should take one object, not only a list",
+             "`decide fill D-3 --json fill.json` with `{\"id\": \"1\", \"attributes\": {…}}` fails with "
+             "`expected a list of option patches, each with an 'id'`. Wrapping it in `[…]` works. Accept both.",
+             actor="codex", status="done", note="`decide fill` wraps a single object in a list.")
+    feedback("feature", "Decide for the user when a decision expires",
+             "When a decision expires I have to guess anyway. Let me name a default option that's picked at the "
+             "deadline, so the log shows a resolution instead of an expiry.",
+             actor="codex", status="dismissed",
+             note="Expiry means it wasn't important enough to answer: an agent's guess shouldn't be logged as the "
+                  "user's choice.")
+
+
+seed_feedback(cache, sprint, tenancy)
+
+print(f"seeded: {BASE}/map and {BASE}/feedback")
