@@ -28,6 +28,7 @@ const S = {
   focus: -1,
   editing: false,
   notes: {},          // unsent reason per decision id
+  optionDrafts: {},   // unsent own option per decision id
   stale: false,       // a live update arrived while you were typing; applied when you leave the field
   ui: {},             // per-decision UI state: filters, view, sort, keepUnknown, text
   goals: [],          // every goal this token sees, with what each serves
@@ -213,25 +214,45 @@ const fail = (e) => toast(e.message || String(e), { error: true });
 
 // In-page replacement for prompt()/confirm(). Resolves to the field's text ("" without a field),
 // or null when dismissed. `body` is HTML. With `choices` ([{value, label}]) the field is a select.
-function ask({ title, body = "", field, value = "", placeholder = "", type = "text", ok = "OK", cancel = "Cancel", danger = false, choices }) {
+// With `multiline` it is a textarea, where Enter starts a new line and ⌘↵ confirms. `fields`
+// ([{name, label, value, placeholder, type, multiline, required}]) asks for several, and resolves to {name: text};
+// `onDraft` then gets that on every edit, for a caller that keeps what was typed when the dialog is dismissed.
+function ask({ title, body = "", field, value = "", placeholder = "", type = "text", multiline = false, fields, onDraft, ok = "OK", cancel = "Cancel", danger = false, choices }) {
+  const single = !fields;
+  if (single) fields = field !== undefined ? [{ name: "v", label: field, value, placeholder, type, multiline, choices }] : [];
+  const long = fields.some((f) => f.multiline);
+  const control = (f) => {
+    const attrs = `class="input" name="${esc(f.name)}" placeholder="${esc(f.placeholder || "")}" ${f.required ? "required" : ""}`;
+    if (f.choices) return `<select class="input" name="${esc(f.name)}">${f.choices.map((c) => `<option value="${esc(c.value)}" ${c.value === f.value ? "selected" : ""}>${esc(c.label)}</option>`).join("")}</select>`;
+    if (f.multiline) return `<textarea ${attrs} rows="6">${esc(f.value || "")}</textarea>`;
+    return `<input ${attrs} type="${f.type || "text"}" value="${esc(f.value || "")}" autocomplete="off">`;
+  };
   return new Promise((done) => {
     const dlg = document.createElement("dialog");
-    dlg.className = "dialog";
+    dlg.className = `dialog ${long ? "wide" : ""}`;
     dlg.setAttribute("aria-labelledby", "dlg-title");
     dlg.innerHTML = `<form method="dialog">
       <h3 id="dlg-title">${esc(title)}</h3>
       ${body ? `<div class="dialog-body">${body}</div>` : ""}
-      ${field !== undefined ? `<label class="dialog-field">${esc(field)}
-        ${choices ? `<select class="input" name="v">${choices.map((c) => `<option value="${esc(c.value)}" ${c.value === value ? "selected" : ""}>${esc(c.label)}</option>`).join("")}</select>`
-          : `<input class="input" name="v" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off">`}</label>` : ""}
+      ${fields.map((f) => `<label class="dialog-field">${esc(f.label)}${control(f)}</label>`).join("")}
       <div class="dialog-actions">
         ${cancel ? `<button type="button" class="btn" data-close>${esc(cancel)}</button>` : ""}
-        <button class="btn ${danger ? "danger-fill" : "primary"}" value="ok">${esc(ok)}</button></div>
+        <button class="btn ${danger ? "danger-fill" : "primary"}" value="ok" ${long ? `aria-keyshortcuts="Meta+Enter Control+Enter"` : ""}>${esc(ok)}${long ? `<span class="kbd" aria-hidden="true">⌘↵</span>` : ""}</button></div>
     </form>`;
     document.body.append(dlg);
-    const input = dlg.querySelector("input, select");
+    const form = dlg.querySelector("form");
+    const text = (f) => form.elements[f.name].value.trim();
+    const values = () => Object.fromEntries(fields.map((f) => [f.name, text(f)]));
+    if (onDraft) form.addEventListener("input", () => onDraft(values()));
+    const input = dlg.querySelector("input, select, textarea");
     dlg.querySelector("[data-close]")?.addEventListener("click", () => dlg.close());
-    dlg.addEventListener("close", () => { done(dlg.returnValue === "ok" ? (input?.value.trim() ?? "") : null); dlg.remove(); });
+    if (long) dlg.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); form.requestSubmit(form.querySelector('[value="ok"]')); }
+    });
+    dlg.addEventListener("close", () => {
+      done(dlg.returnValue !== "ok" ? null : !single ? values() : fields.length ? text(fields[0]) : "");
+      dlg.remove();
+    });
     dlg.showModal();
     if (input) { input.focus(); input.select?.(); }
   });
@@ -457,7 +478,7 @@ async function loadDecision(id, { keepSelection = false } = {}) {
   S.deliveries = dl.deliveries;
   if (switched || !keepSelection) {
     S.selection = new Set(d.resolution ? d.resolution.selected : []);
-    if (switched) { S.focus = -1; S.editing = S.addingTag = S.suggesting = false; S.silenced = new Set(); }
+    if (switched) { S.focus = -1; S.editing = S.addingTag = false; S.silenced = new Set(); }
   }
   for (const s of [...S.selection]) if (!d.options.some((o) => o.id === s)) S.selection.delete(s);
   renderDecision();
@@ -1378,16 +1399,24 @@ function suggestedTag(o) {
 // None of the options fit: add your own. The requester is asked to fill in its attributes; its cells show
 // that they're on the way, and it can be picked right away.
 function suggestHtml(d) {
-  const who = esc(d.source || "the requester");
-  if (!S.suggesting) return `<button class="suggest-btn" data-action="suggest">${icon("plus", 15)}${d.options.length ? "None of these? Add your own option" : "Add an option"}</button>`;
-  return `<form class="suggest-form" id="suggest-form">
-    <div class="form-row">
-      <label class="lf grow">Option<input class="input" name="label" placeholder="What you have in mind" required autocomplete="off"></label>
-      <label class="lf grow">Details for ${who}<input class="input" name="details" placeholder="A link, model, or what makes it fit" autocomplete="off"></label>
-      <button class="btn primary">Add</button><button type="button" class="btn ghost" data-action="cancel-suggest">Cancel</button>
-    </div>
-    <p class="section-note">${who} is asked to fill in ${attrKeys(d).length ? "its attributes" : "the details"}. You can pick it right away.</p>
-  </form>`;
+  return `<button class="suggest-btn" data-action="suggest">${icon("plus", 15)}${d.options.length ? "None of these? Add your own option" : "Add an option"}</button>`;
+}
+
+// You write the option the way the requester writes theirs: for whoever decides, not as a message to the
+// requester. An unsent draft survives closing the dialog.
+async function suggestOption() {
+  const d = S.d, who = d.source || "the requester";
+  const draft = S.optionDrafts[d.id] || {};
+  const o = await ask({ title: "Add your own option",
+    body: `<p>Write it as you would put it to whoever decides. It's shown next to the other options. ${esc(who)} is asked to fill in ${attrKeys(d).length ? "its attributes" : "the rest"}, and you can pick it right away.</p>`,
+    fields: [
+      { name: "label", label: "Option", value: draft.label, placeholder: "A short name for it", required: true },
+      { name: "description", label: "Description (optional)", value: draft.description, placeholder: "What it is and why it's worth considering", multiline: true },
+      { name: "url", label: "Link (optional)", value: draft.url, placeholder: "https://…", type: "url" },
+    ], onDraft: (v) => (S.optionDrafts[d.id] = v), ok: "Add option" });
+  if (!o?.label) return;
+  const option = { label: o.label, description: o.description, url: o.url || null, suggested: true };
+  if (await act(() => api("POST", `/api/decisions/${d.id}/options`, option), `Added “${o.label}”, asked ${who} to fill it in`)) delete S.optionDrafts[d.id];
 }
 
 // "Rule out" offers both the quick action and one with a reason, so neither depends on a hidden modifier.
@@ -1426,13 +1455,13 @@ function decideBarHtml(d, single, { visible }) {
     : !valid && n > (max ?? Infinity) ? `<span class="need warn">${why}</span>`
     : single ? `<span class="names" title="${esc(labels[0])}">${esc(labels[0])}</span>`
     : `<span class="count">${n} selected</span>${limit ? `<span class="limit">· ${limit}</span>` : ""}<span class="names" title="${esc(labels.join(", "))}">${esc(labels.join(", "))}</span>`;
-  const showReason = S.notes[d.id] || S.showReason === d.id;
-  return `<div class="decide-bar ${showReason ? "with-reason" : ""}" role="region" aria-label="Decide">
+  const note = S.notes[d.id] || "";
+  return `<div class="decide-bar ${note ? "with-reason" : ""}" role="region" aria-label="Decide">
     <div class="sel" aria-live="polite">${sel}</div>
     ${hidden.length ? `<div class="hid" role="status" title="${esc(hidden.map((o) => o.label).join(", "))}">${icon("help", 14)}<span>${hidden.length} selected outside results</span>
       <button class="btn small ghost" data-action="clear-all-filters">Show</button><button class="btn small ghost" data-action="deselect-hidden">Deselect</button></div>` : ""}
-    <div class="reason-field"><label for="note">Reason</label><input id="note" placeholder="Optional, shown to ${esc(d.source || "the requester")}" value="${esc(S.notes[d.id] ?? "")}" autocomplete="off"></div>
-    <button class="btn ghost small add-reason-btn" data-action="show-reason">${icon("pencil", 14)}Reason</button>
+    <button class="reason-field" data-action="edit-reason" title="${note ? "Edit the reason" : "Write a reason"}"><span class="rl">Reason</span><span class="rv ${note ? "" : "empty"}">${esc(note || `Optional, shown to ${d.source || "the requester"}`)}</span></button>
+    <button class="btn ghost small add-reason-btn" data-action="edit-reason">${icon("pencil", 14)}Reason</button>
     <button class="btn primary" data-action="resolve" ${valid && !S.resolving ? "" : "disabled"} title="${esc(why || "Decide (⌘↵)")}" aria-keyshortcuts="Meta+Enter Control+Enter">${S.resolving ? "Deciding…" : `${icon("check", 15)}Decide`}<span class="kbd" aria-hidden="true">⌘↵</span></button>
     ${effectsNote(d)}
     ${S.resolveError?.id === d.id ? `<div class="bar-note bad" role="alert">${icon("ban", 15)}<span>Couldn't decide: ${esc(S.resolveError.message)}</span>
@@ -2193,30 +2222,6 @@ function bindDecision() {
     u.sort = !u.sort || u.sort.key !== k ? { key: k, dir: "asc" } : u.sort.dir === "asc" ? { key: k, dir: "desc" } : null;
     saveUi(); renderDecision();
   });
-  const note = $("#note");
-  if (note) note.addEventListener("input", () => {
-    S.notes[d.id] = note.value;
-    note.closest(".decide-bar").classList.toggle("with-reason", !!note.value);
-  });
-
-  const suggestForm = $("#suggest-form");
-  if (suggestForm) {
-    if (!suggestForm.contains(document.activeElement)) suggestForm.querySelector("input").focus();
-    suggestForm.onsubmit = async (e) => {
-      e.preventDefault();
-      const f = new FormData(suggestForm);
-      const label = f.get("label").trim(), details = f.get("details").trim();
-      if (!label) return;
-      const link = /^https?:\/\/\S+$/.test(details);
-      const option = { label, description: link ? "" : details, url: link ? details : null, suggested: true };
-      S.suggesting = false;
-      if (!await act(() => api("POST", `/api/decisions/${d.id}/options`, option), `Added “${label}”, asked ${d.source || "the requester"} to fill it in`)) {
-        S.suggesting = true; renderDecision();
-      }
-    };
-    suggestForm.onkeydown = (e) => { if (e.key === "Escape") { e.stopPropagation(); S.suggesting = false; renderDecision(); $('[data-action="suggest"]')?.focus(); } };
-  }
-
   const attrForm = $("#attr-form");
   if (attrForm) attrForm.onsubmit = (e) => {
     e.preventDefault();
@@ -2318,7 +2323,7 @@ document.addEventListener("click", async (e) => {
     case "drawer": return drawer();
     case "close-pop": return closePops(true);
     case "palette": return palette();
-    case "show-reason": S.showReason = d.id; renderDecision(); return $("#note")?.focus();
+    case "edit-reason": return editReason();
     case "retry": return route();
     case "reload": return location.reload();
     case "view": ui().view = a.dataset.view; saveUi(); return renderDecision();
@@ -2367,8 +2372,7 @@ document.addEventListener("click", async (e) => {
       const due = new Date(from + Number(a.dataset.days) * 86400000).toISOString();
       return act(() => api("PATCH", `/api/decisions/${d.id}`, { due_at: due }), `Deadline moved to ${whenTime(due)}`);
     }
-    case "suggest": S.suggesting = true; return renderDecision();
-    case "cancel-suggest": S.suggesting = false; renderDecision(); return $('[data-action="suggest"]')?.focus();
+    case "suggest": return suggestOption();
     case "edit": S.editing = true; return renderDecision();
     case "cancel-edit": S.editing = false; return renderDecision();
     case "copy-install": copy(installCommand(S.config, S.config.auth && S.token), "install command"); return;
@@ -2557,6 +2561,19 @@ function markResumed() {
 }
 
 // The note and listener choices survive a failed attempt; the button is disabled while it's in flight.
+// The reason is written in a dialog, so it has room for more than a line.
+async function editReason() {
+  const d = S.d;
+  const note = await ask({ title: "Why this choice?", body: `<p>Optional. Shown to ${esc(d.source || "the requester")} and kept in the decision record. Markdown works.</p>`,
+    field: "Reason", value: S.notes[d.id] || "", multiline: true, ok: "Done" });
+  if (note === null || S.d?.id !== d.id) return;
+  if (note) S.notes[d.id] = note; else delete S.notes[d.id];
+  renderDecision();
+  // On the Decide button when it's ready, so ⌘↵ or Enter decides from here.
+  const btn = $('[data-action="resolve"]');
+  (btn && !btn.disabled ? btn : [...document.querySelectorAll('[data-action="edit-reason"]')].find((el) => el.offsetParent))?.focus();
+}
+
 async function resolve() {
   const d = S.d;
   if (S.resolving) return;
