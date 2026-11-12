@@ -945,14 +945,98 @@ def _skip_proof_news(client: Client, g: dict, event_type: str) -> str | None:
     return f"{', '.join(polling)} is waiting on it live" if polling else None
 
 
+def _update(client: Client, server_build: str | None = None) -> str | None:
+    """Make this machine's `decide` and skill the server's: rerun the server's installer when it serves other code
+    than what's installed here. The resumer is left to restart itself (`_SelfUpdate`). Returns the build installed,
+    or None when this machine already had it."""
+    from . import dist
+    server_build = server_build or client.call("GET", "/api/config")["build"]
+    mine = dist.fingerprint()
+    if mine == server_build:
+        return None
+    if dist.installed_build() != mine:
+        sys.exit(f"error: {client.url} serves build {server_build} and this decide is {mine}, but it wasn't installed "
+                 f"from a server (it runs from a checkout): update it where it came from, or switch to the server's "
+                 f"with `curl -fsSL {client.url}/install.sh | sh`")
+    has_skill = any(os.path.lexists(os.path.join(os.path.expanduser(d), "SKILL.md"))
+                    for d in _skill_dirs(argparse.Namespace(dir=None, agent=None)))
+    # The token goes in the environment, never on a command line.
+    done = subprocess.run(["sh", "-s", "--", "--no-resumer", *([] if has_skill else ["--no-skill"])],
+                          input=client.call("GET", "/install.sh", raw=True), text=True,
+                          env=os.environ | ({"DECISIONS_TOKEN": client.token} if client.token else {}))
+    if done.returncode:
+        sys.exit(f"error: the installer from {client.url} failed (exit {done.returncode})")
+    if dist.fingerprint() != server_build:
+        sys.exit(f"error: the installer from {client.url} ran, but this decide is still {dist.fingerprint()}, "
+                 f"not {server_build}: is it installed somewhere the installer doesn't reach?")
+    return server_build
+
+
+def cmd_update(args):
+    """Update this machine's decide and skill to the code its server runs. A resumer does this by itself."""
+    from . import dist
+    client = Client()
+    server_build = client.call("GET", "/api/config")["build"]
+    if args.check:
+        mine = dist.fingerprint()
+        print(f"{'up to date' if mine == server_build else 'out of date'}: this decide is {mine}, "
+              f"{client.url} serves {server_build}")
+        sys.exit(0 if mine == server_build else 1)
+    if _update(client, server_build):
+        print(f"updated to {server_build}, the code {client.url} runs. A running resumer restarts with it "
+              f"when it has nothing in flight.")
+    else:
+        print(f"up to date: this decide is {server_build}, the code {client.url} runs")
+
+
+class _SelfUpdate:
+    """Keeps a resumer on its server's code. The server names its build in every heartbeat answer; when that's not
+    what is installed here, the resumer reruns the server's installer (`_update`), and once the code on disk isn't
+    the code it's running (it updated, or `decide update` or a deploy did), it restarts when nothing is in flight.
+    Only for a `decide` installed from a server: a checkout is its developer's to update."""
+    RETRY = 600  # seconds before trying an installer that failed again
+
+    def __init__(self, enabled: bool = True):
+        from . import dist
+        self.dist = dist
+        self.running = dist.fingerprint()
+        self.enabled = enabled and dist.installed_build() == self.running
+        self.failed = (None, 0.0)  # (build, when)
+
+    def restart_due(self, client: Client, server_build: str | None) -> bool:
+        """Install the server's build if it's another one. True when the code on disk has changed under us."""
+        if not self.enabled:
+            return False
+        if server_build and server_build != self.dist.fingerprint() and not (
+                self.failed[0] == server_build and time.monotonic() - self.failed[1] < self.RETRY):
+            print(f"[resumer] {client.url} runs build {server_build}; updating decide and the skill", flush=True)
+            try:
+                _update(client, server_build)
+            except SystemExit as exc:
+                self.failed = (server_build, time.monotonic())
+                print(f"[resumer] {exc}; trying again in {self.RETRY // 60} min", flush=True)
+        return self.dist.fingerprint() != self.running
+
+    def restart(self):
+        print(f"[resumer] restarting with build {self.dist.fingerprint()} (was {self.running})", flush=True)
+        os.execv(sys.executable, [sys.executable, "-m", "decisions", *sys.argv[1:]])
+
+
 def cmd_resumer_run(args):
     """Long-running: resume the requesting agent session whenever a decision with a resume target
     is resolved, or expires undecided (unless --no-expired), and while it's open, when the user asks it to fill
     values in (unless --no-fill). Also runs a goal's proof when the user asks for it (unless --no-proofs), and
     resumes the session that owns a goal when the user agrees to its proof, and when it has passed or failed. Pulls the event feed with a
     persisted cursor, so nothing is missed while it (or the machine) is down; heartbeats so the GUI can warn
-    you when it isn't running."""
+    you when it isn't running. Keeps itself, `decide` and the skill on the server's code (unless --no-update)."""
     client = Client(actor=os.environ.get("DECISIONS_ACTOR") or "resumer")
+    update = _SelfUpdate(not args.no_update)
+    work: list[threading.Thread] = []  # resumes and proofs in flight: a restart waits for them
+
+    def start(target, *a):
+        work.append(threading.Thread(target=target, args=a, daemon=True))
+        work[-1].start()
+
     me = machine_name()
     os.makedirs(STATE_DIR, exist_ok=True)
     log_dir = os.path.join(STATE_DIR, "resume-logs")
@@ -972,13 +1056,19 @@ def cmd_resumer_run(args):
                       *([] if args.no_fill else FILL_TRIGGERS), *([] if args.no_proofs else ["proof.requested"]),
                       *PROOF_RESUME_TRIGGERS])
     print(f"[resumer] {me}: watching {client.url} from event {cursor} for {types}; commands: {described}", flush=True)
-    last_beat = 0.0
+    last_beat, restart = 0.0, False
     while True:
+        work[:] = [t for t in work if t.is_alive()]
+        if restart and not work:
+            update.restart()
         if time.monotonic() - last_beat > 30:
             try:
-                client.call("POST", "/api/resumer/heartbeat",
-                            {"pid": os.getpid(), "machine": me, "command": described})
+                beat = client.call("POST", "/api/resumer/heartbeat",
+                                   {"pid": os.getpid(), "machine": me, "command": described, "build": update.running})
                 last_beat = time.monotonic()
+                restart = update.restart_due(client, beat.get("server_build"))
+                if restart:
+                    continue
             except SystemExit as exc:  # server down: keep trying
                 print(f"[resumer] {exc}", flush=True)
                 time.sleep(10)
@@ -999,7 +1089,7 @@ def cmd_resumer_run(args):
                 # caught up on: by then nobody is waiting for the answer, and it would act on a stale world.
                 if p.get("machine") == me and p["busy"] and p["run"]["status"] == "requested" \
                         and p["run"]["seq"] == ev["seq"]:
-                    threading.Thread(target=_prove_one, args=(client, g, ev["seq"], log_dir), daemon=True).start()
+                    start(_prove_one, client, g, ev["seq"], log_dir)
             elif ev["type"] in PROOF_RESUME_TRIGGERS:
                 # The proof ran wherever its scripts live; the session is woken where it lives, by that
                 # machine's resumer. The state is `capped` after too many failures in a row: leave it be. It's
@@ -1026,8 +1116,7 @@ def cmd_resumer_run(args):
                     print(f"[resumer] {wake['id']}: not resuming, {skip}", flush=True)
                 else:
                     command = args.command or agents.resume_command(wake["resume"]["agent"], overrides)
-                    threading.Thread(target=_resume_one, args=(client, wake, command, log_dir),
-                                     daemon=True).start()
+                    start(_resume_one, client, wake, command, log_dir)
             cursor = ev["seq"]
             with open(cursor_file, "w") as fh:
                 fh.write(str(cursor))
@@ -1136,7 +1225,7 @@ def cmd_resumer_install(args):
     os.makedirs(STATE_DIR, exist_ok=True)
     argv = [decide, "resumer", "run", *(["--command", args.command] if args.command else []),
             *(["--no-expired"] if args.no_expired else []), *(["--no-fill"] if args.no_fill else []),
-            *(["--no-proofs"] if args.no_proofs else [])]
+            *(["--no-proofs"] if args.no_proofs else []), *(["--no-update"] if args.no_update else [])]
     for item in args.agent_command or []:
         argv += ["--agent-command", item]
     _install_service(RESUMER_SERVICE, argv, _service_env(decide, *found.values()),
@@ -1317,6 +1406,11 @@ def main(argv=None):
     s.add_argument("url", help="e.g. http://homeserver:8787")
     s.add_argument("--token")
     s.set_defaults(fn=cmd_connect)
+
+    s = sub.add_parser("update", help="update this machine's decide and skill to the code its server runs "
+                                      "(a resumer does this by itself)")
+    s.add_argument("--check", action="store_true", help="only say whether it's up to date (exit 1 if not)")
+    s.set_defaults(fn=cmd_update)
 
     s = sub.add_parser("skill", help="install the agent skill (SKILL.md) that teaches agents to use decisions")
     ksub = s.add_subparsers(dest="skill_cmd", required=True)
@@ -1500,10 +1594,13 @@ def main(argv=None):
                  "(default: resume them unless they're waiting on it live)")
     proofs_help = ("don't run goals' proofs on this machine (default: run a goal's agreed command when the user "
                    "asks for its proof)")
+    update_help = ("don't update decide, the skill and this resumer when the server runs newer code (default: "
+                   "follow the server, if decide was installed from it)")
     r.add_argument("--max-age-days", type=float, default=14, help="don't resume decisions resolved longer ago")
     r.add_argument("--no-expired", action="store_true", help=expired_help)
     r.add_argument("--no-fill", action="store_true", help=fill_help)
     r.add_argument("--no-proofs", action="store_true", help=proofs_help)
+    r.add_argument("--no-update", action="store_true", help=update_help)
     r.set_defaults(fn=cmd_resumer_run)
     r = rsub.add_parser("install", help="install as a background service (launchd / systemd --user)")
     r.add_argument("--command", help=resume_help)
@@ -1511,6 +1608,7 @@ def main(argv=None):
     r.add_argument("--no-expired", action="store_true", help=expired_help)
     r.add_argument("--no-fill", action="store_true", help=fill_help)
     r.add_argument("--no-proofs", action="store_true", help=proofs_help)
+    r.add_argument("--no-update", action="store_true", help=update_help)
     r.set_defaults(fn=cmd_resumer_install)
     r = rsub.add_parser("uninstall", help="remove the background service")
     r.set_defaults(fn=cmd_resumer_uninstall)

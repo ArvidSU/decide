@@ -1,7 +1,8 @@
 """Install assets served by the server, so other machines can install `decide` and the skill from it.
 
-The wheel is built in memory from the running package. Its version carries a content hash, so
-re-running the installer after the server is updated always picks up the new code.
+The wheel is built in memory from the running package. Its version carries a content hash (the build), so
+re-running the installer after the server is updated always picks up the new code, and a machine can tell
+that it should: `decide update`, which its resumer does by itself.
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import hashlib
 import io
 import zipfile
 from functools import lru_cache
-from importlib.metadata import distribution
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
 from . import __version__
@@ -49,8 +50,8 @@ def _build(fingerprint: str, license_text: str) -> tuple[str, bytes]:
     return f"decisions-{version}-py3-none-any.whl", buf.getvalue()
 
 
-def wheel() -> tuple[str, bytes]:
-    """(filename, bytes) of a wheel of the code this server is running."""
+def _source() -> tuple[str, str]:
+    """(content hash of the package as it is on disk now, its license text)."""
     source_license = PACKAGE.parent / "LICENSE"
     license_text = (source_license.read_text() if source_license.is_file()
                     else distribution("decisions").read_text("licenses/LICENSE"))
@@ -59,7 +60,28 @@ def wheel() -> tuple[str, bytes]:
     h = hashlib.sha256(license_text.encode())
     for p in _package_files():
         h.update(p.relative_to(PACKAGE).as_posix().encode() + b"\0" + p.read_bytes())
-    return _build(h.hexdigest(), license_text)
+    return h.hexdigest(), license_text
+
+
+def wheel() -> tuple[str, bytes]:
+    """(filename, bytes) of a wheel of the code this server is running."""
+    return _build(*_source())
+
+
+def fingerprint() -> str:
+    """The build: 10 hex digits that name the package's code as it is on disk now. A server puts it in the
+    version of the wheel it serves, so an install from that wheel has the same one, and a machine can tell
+    whether its `decide` is the server's (`decide update`)."""
+    return _source()[0][:10]
+
+
+def installed_build() -> str | None:
+    """The build this `decide` was installed as from a server's wheel. None when it wasn't: a checkout, or an
+    install from one, which is updated where it came from."""
+    try:
+        return distribution("decisions").version.partition("+")[2] or None
+    except PackageNotFoundError:
+        return None
 
 
 INSTALL_SH = r'''#!/bin/sh
