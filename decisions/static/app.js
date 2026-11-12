@@ -704,7 +704,7 @@ async function renderSettings() {
   const global = hooks.webhooks.filter((w) => !w.decision_id);
   const w = cfg.webhook;
   const resumers = rsAll.resumers || [];
-  $("#main").innerHTML = `<div class="page narrow">
+  $("#main").innerHTML = `<div class="page narrow settings">
     <div class="settings-head"><h1 class="d-title">Settings</h1><p>Spaces, the machines that use them, where events go, and the audit log.</p></div>
     ${cfg.admin ? spacesSetting(spaces.spaces) + machinesSetting(cfg, tokens.tokens, resumers) : sharedTokenSetting(cfg, resumers)}
     <section class="setting">
@@ -787,14 +787,12 @@ function spacesSetting(spaces) {
           <td class="nowrap"><span class="swatches" role="group" aria-label="Color of ${esc(sp.name)}">${SPACE_COLORS.map((c) =>
             `<button class="swatch" data-accent="${c}" data-action="space-color" data-id="${esc(sp.name)}" data-color="${c}" aria-pressed="${sp.color === c}" aria-label="${c}" title="${c[0].toUpperCase()}${c.slice(1)}"></button>`).join("")}</span></td>
           <td class="nowrap">${sp.decisions}${sp.open ? ` <span class="muted">· ${sp.open} open</span>` : ""}</td>
-          <td class="nowrap" ${sp.deadline_days === null ? `title="The server's deadline_days"` : ""}>${sp.effective_deadline_days ? `${sp.effective_deadline_days} days` : "None"}${sp.deadline_days === null ? ` <span class="muted">· default</span>` : ""}</td>
+          <td class="nowrap"><button class="btn small ghost cell-edit" data-action="space-deadline" data-id="${esc(sp.name)}" data-days="${sp.deadline_days ?? ""}" title="Change the deadline${sp.deadline_days === null ? " (now the server's deadline_days)" : ""}">${sp.effective_deadline_days ? `${sp.effective_deadline_days} days` : "None"}${sp.deadline_days === null ? ` <span class="muted">· default</span>` : ""}${icon("pencil", 12)}</button></td>
           <td>${sp.tokens}</td>
-          <td style="text-align:right;white-space:nowrap">
-            <button class="btn small ghost" data-action="space-deadline" data-id="${esc(sp.name)}" data-days="${sp.deadline_days ?? ""}">Deadline</button>
-            ${spaces.length > 1 ? `<button class="btn small ghost danger" data-action="delete-space" data-id="${esc(sp.name)}" data-decisions="${sp.decisions}" data-tokens="${sp.tokens}">Delete</button>` : ""}</td></tr>`).join("")}</table></div>
+          <td style="text-align:right;width:1%">${spaces.length > 1 ? `<button class="icon-btn danger" data-action="delete-space" data-id="${esc(sp.name)}" data-decisions="${sp.decisions}" data-tokens="${sp.tokens}" title="Delete ${esc(sp.name)}" aria-label="Delete ${esc(sp.name)}">${icon("x", 14)}</button>` : ""}</td></tr>`).join("")}</table></div>
         <form class="form-row" id="add-space" style="margin-top:14px">
           <label class="lf grow">New space<input class="input" name="name" required pattern="[a-z0-9][a-z0-9_\-]{0,39}" placeholder="e.g. work" title="Lowercase letters, digits, - and _"></label>
-          <label class="lf">Deadline (days)<input class="input" name="days" type="number" min="0" step="any" placeholder="${esc(S.config.deadline_days)}" style="width:130px"></label>
+          <label class="lf">Deadline (days)<input class="input" name="days" type="number" min="0" step="any" placeholder="${esc(S.config.deadline_days)}"></label>
           <button class="btn">${icon("plus", 15)}Create space</button></form></div>
     </div>
   </section>`;
@@ -1028,8 +1026,7 @@ function subHtml(d) {
   return `<button class="chip id" data-action="copy-ref" title="Copy a markdown link for Slack or Linear">${esc(d.id)}${icon("copy", 12)}</button>
     <span class="chip status ${d.status} ${urgency(d)}">${statusIcon(d, 12)}${d.status}</span>
     ${spaceChip(d)}
-    ${d.source ? `<span>from <strong>${esc(d.source)}</strong></span>${sep}` : ""}
-    <span title="${esc(fullTime(d.created_at))}">created ${ago(d.created_at)}</span>
+    <span>${d.source ? `from <strong>${esc(d.source)}</strong> ${sep} ` : ""}<span title="${esc(fullTime(d.created_at))}">created ${ago(d.created_at)}</span></span>
     ${tagsHtml("decision", d.tags, "Topics like business, product or tech: the map filters on them, along with the tags of its goals")}`;
 }
 
@@ -1113,20 +1110,18 @@ function headerHtml(d) {
       <div class="form-row"><button class="btn primary">Save</button><button type="button" class="btn ghost" data-action="cancel-edit">Cancel</button></div>
     </form>`;
   }
-  return `<div class="d-head" style="display:flex;gap:16px;align-items:flex-start;justify-content:space-between">
-      <div style="min-width:0">
-        <h1 class="d-title">${esc(d.title)}</h1>
-        <div class="d-sub">${subHtml(d)}</div>
-        ${towardHtml(d)}
-        ${issuesHtml("decision", d)}
-      </div>
+  return `<div class="d-head">
+      <div class="d-top"><h1 class="d-title">${esc(d.title)}</h1>
       <div class="d-actions">
         <button class="btn small" data-action="copy-md" title="Copy a markdown summary with the options table">${icon("copy", 14)}Copy summary</button>
         <button class="btn small ghost" data-action="edit">${icon("pencil", 14)}Edit</button>
         ${d.goals.length ? "" : `<button class="btn small ghost" data-action="add-goal" title="Link it to the goal it's a step toward">${icon("target", 14)}Goal…</button>`}
         <button class="btn small ghost" data-action="add-dep" title="Lock this until another decision is made">${icon("link", 14)}Depends on…</button>
         <button class="btn small ghost danger" data-action="cancel-decision" title="Withdraw it without picking anything">${icon("ban", 14)}Cancel</button>
-      </div>
+      </div></div>
+      <div class="d-sub">${subHtml(d)}</div>
+      ${towardHtml(d)}
+      ${issuesHtml("decision", d)}
     </div>
     ${d.context ? `<div class="context">${md(d.context)}</div>` : ""}
     ${linksHtml(d)}`;
@@ -1140,8 +1135,8 @@ function deadlineHtml(d) {
   const days = S.config?.deadline_days || 4;
   const u = urgency(d);
   return `<div class="callout deadline ${u || "slim"}">${icon("clock", u ? 18 : 16)}
-    <div class="callout-main"><div><span class="deadline-left">${until(d.due_at)} left</span> <span class="muted">· until</span> <span title="${esc(fullTime(d.due_at))}">${esc(whenTime(d.due_at))}</span></div>
-      <div class="small">${u ? `If it's still undecided then, it expires and ${who} is notified.` : `· then it expires and ${who} is notified`}</div></div>
+    <div class="callout-main"><div><span class="deadline-left">${until(d.due_at)} left</span> <span class="muted">· until</span> <span title="${esc(fullTime(d.due_at))}">${esc(whenTime(d.due_at))}</span>${u ? "" : `<span class="muted">,</span>`}</div>
+      <div class="small">${u ? `If it's still undecided then, it expires and ${who} is notified.` : `then it expires and ${who} is notified`}</div></div>
     <div class="callout-actions">
       <button class="btn small" data-action="extend" data-days="1" title="Move the deadline a day later">${icon("plus", 14)}1 day</button>
       <button class="btn small" data-action="extend" data-days="${days}" title="Move the deadline ${days} days later">${icon("plus", 14)}${days} days</button></div>
@@ -1451,7 +1446,7 @@ function decideBarHtml(d, single, { visible }) {
   // Say which limit applies before the button refuses.
   const limit = single ? "" : n < min ? `${min - n} more needed` : max !== null ? (n >= max ? "limit reached" : `up to ${max}`) : "";
   const why = valid ? "" : n < min ? (min === 1 ? "Select an option first" : `Select at least ${min} options`) : `Select at most ${max} options`;
-  const sel = !n ? `<span class="need">${single ? "Select an option to decide" : need}</span>`
+  const sel = !n ? `<span class="need">${need}</span>`
     : !valid && n > (max ?? Infinity) ? `<span class="need warn">${why}</span>`
     : single ? `<span class="names" title="${esc(labels[0])}">${esc(labels[0])}</span>`
     : `<span class="count">${n} selected</span>${limit ? `<span class="limit">· ${limit}</span>` : ""}<span class="names" title="${esc(labels.join(", "))}">${esc(labels.join(", "))}</span>`;
@@ -1719,7 +1714,8 @@ function bindMaps(root = $("#main")) {
     map.addEventListener("focusout", () => trace(null));
     // Start with the focused node in view.
     const f = map.querySelector(".mnode.focus");
-    if (f) { const sc = map.parentElement; sc.scrollLeft = f.offsetLeft - sc.clientWidth / 2 + MAP.w / 2; }
+    const sc = map.parentElement;
+    sc.scrollLeft = f ? f.offsetLeft - sc.clientWidth / 2 + MAP.w / 2 : (sc.scrollWidth - sc.clientWidth) / 2;
   });
 }
 
@@ -1998,18 +1994,18 @@ function renderGoal() {
       <label class="lf">Title<input class="input" name="title" value="${esc(g.title)}" style="font-size:16px;font-weight:600;height:40px"></label>
       <label class="lf">Description <span style="font-weight:400">(markdown: what success looks like, and why it matters)</span><textarea class="input" name="description">${esc(g.description)}</textarea></label>
       <div class="form-row"><button class="btn primary">Save</button><button type="button" class="btn ghost" data-action="cancel-goal-edit">Cancel</button></div></form>`
-    : `<div class="d-head" style="display:flex;gap:16px;align-items:flex-start;justify-content:space-between">
-      <div style="min-width:0"><h1 class="d-title">${esc(g.title)}</h1>
-        <div class="d-sub"><button class="chip id" data-action="copy-goal-ref" title="Copy a markdown link">${esc(g.id)}${icon("copy", 12)}</button>
-          <span class="chip status ${esc(g.status)}">${goalIcon(g, 12)}${esc(g.status)}</span>${spaceChip(g)}
-          <span title="${esc(fullTime(g.created_at))}">created ${ago(g.created_at)}</span>
-          ${tagsHtml("goal", g.tags, "Topics like business, product or tech: the map filters on them, and decisions toward it share them")}</div>
-        ${issuesHtml("goal", g)}</div>
+    : `<div class="d-head">
+      <div class="d-top"><h1 class="d-title">${esc(g.title)}</h1>
       <div class="d-actions">
         <button class="btn small ghost" data-action="edit-goal">${icon("pencil", 14)}Edit</button>
         ${active ? `<button class="btn small ghost" data-action="goal-status" data-status="achieved" title="It's done">${icon("check", 14)}Achieved</button>
           <button class="btn small ghost danger" data-action="goal-status" data-status="abandoned" title="Stop pursuing it">${icon("ban", 14)}Abandon</button>` : ""}
       </div></div>
+        <div class="d-sub"><button class="chip id" data-action="copy-goal-ref" title="Copy a markdown link">${esc(g.id)}${icon("copy", 12)}</button>
+          <span class="chip status ${esc(g.status)}">${goalIcon(g, 12)}${esc(g.status)}</span>${spaceChip(g)}
+          <span title="${esc(fullTime(g.created_at))}">created ${ago(g.created_at)}</span>
+          ${tagsHtml("goal", g.tags, "Topics like business, product or tech: the map filters on them, and decisions toward it share them")}</div>
+        ${issuesHtml("goal", g)}</div>
     ${g.description ? `<div class="context">${md(g.description)}</div>` : ""}`;
   const row = (id, title, status, effect, remove, glyph) => `<div class="dep"><a href="/${id.startsWith("G") ? "g" : "d"}/${esc(id)}" data-nav class="dep-title">${glyph}<span class="dep-id">${esc(id)}</span><span class="dep-name">${esc(title)}</span></a>
       <span class="dep-effect ${effect[0]}">${esc(effect[1])}</span>${remove || ""}</div>`;
