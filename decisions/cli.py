@@ -1141,6 +1141,7 @@ class _SelfUpdate:
         from . import dist
         self.dist = dist
         self.running = dist.fingerprint()
+        self.commit = dist.commit()  # of the code this process runs, for Settings → Machines
         self.enabled = enabled and dist.installed_build() == self.running
         self.failed = (None, 0.0)  # (build, when)
 
@@ -1209,7 +1210,8 @@ def cmd_resumer_run(args):
         if time.monotonic() - last_beat > 30:
             try:
                 beat = client.call("POST", "/api/resumer/heartbeat",
-                                   {"pid": os.getpid(), "machine": me, "command": described, "build": update.running})
+                                   {"pid": os.getpid(), "machine": me, "command": described, "build": update.running,
+                                    "commit": update.commit})
                 last_beat = time.monotonic()
                 restart = update.restart_due(client, beat.get("server_build"))
                 if restart:

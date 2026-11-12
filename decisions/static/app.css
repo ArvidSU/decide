@@ -738,6 +738,10 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 /* A long hostname wraps rather than push the row's menu out of the panel. */
 .plain .host { overflow-wrap: anywhere; min-width: 0; }
 .plain .item .live { flex: none; }
+/* A machine's commit: its hash, then as much of its message as fits on the line. */
+.machine-commit { display: flex; flex-wrap: wrap; gap: 0 6px; margin-top: 2px; max-width: 220px; }
+.machine-commit .commit { display: inline-flex; gap: 6px; align-items: baseline; min-width: 0; max-width: 100%; }
+.machine-commit .subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .nowrap { white-space: nowrap; }
 /* Positioned, so a visually hidden header inside scrolls with the table and can't widen the page. */
 .table-scroll { overflow-x: auto; position: relative; }

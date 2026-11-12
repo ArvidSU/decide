@@ -1619,9 +1619,20 @@ class RemoteTest(unittest.TestCase):
         build = name.split("+")[1].split("-")[0]
         self.assertEqual(api("GET", "/api/config")["build"], build)
         self.assertEqual(dist.fingerprint(), build)
-        beat = api("POST", "/api/resumer/heartbeat", {"machine": "old-mb", "build": "0123456789"})
-        self.assertEqual((beat["build"], beat["server_build"]), ("0123456789", build))
-        self.assertEqual(api("GET", "/api/resumer?machine=old-mb")["build"], "0123456789")
+        # People get the commit as well: HEAD in a checkout, and whatever a machine's resumer says it is.
+        commit = api("GET", "/api/config")["commit"]
+        self.assertEqual(commit, dist.commit())
+        if os.path.exists(os.path.join(ROOT, ".git")):
+            head = subprocess.run(["git", "-C", ROOT, "log", "-1", "--format=%H%n%s"], capture_output=True, text=True,
+                                  check=True).stdout.splitlines()
+            self.assertEqual([commit["hash"], commit["subject"]], head)
+        old = {"hash": "0" * 40, "date": "2026-01-02T03:04:05+00:00", "subject": "An older one", "dirty": False}
+        beat = api("POST", "/api/resumer/heartbeat", {"machine": "old-mb", "build": "0123456789", "commit": old})
+        self.assertEqual((beat["build"], beat["server_build"], beat["commit"]), ("0123456789", build, old))
+        seen = api("GET", "/api/resumer?machine=old-mb")
+        self.assertEqual((seen["build"], seen["commit"]), ("0123456789", old))
+        api("POST", "/api/resumer/heartbeat", {"machine": "older-mb", "build": "0123456789"})  # a decide from before
+        self.assertIsNone(api("GET", "/api/resumer?machine=older-mb")["commit"])
 
         # A machine set up from the server: its decide is the wheel, which records the build it is.
         site, bin_dir, out = (os.path.join(self.tmp, d) for d in ("site", "bin", "out"))
@@ -1641,6 +1652,11 @@ class RemoteTest(unittest.TestCase):
             "HOME": os.path.join(self.tmp, "home"), "PATH": bin_dir + os.pathsep + os.environ["PATH"]}
         decide = lambda *a, **kw: subprocess.run([sys.executable, "-m", "decisions", *a], cwd=self.tmp,
                                                  capture_output=True, text=True, env=env | {"DECISIONS_TOKEN": "s3cret"} | kw)
+        # The wheel carries the server's commit, which isn't part of the build: there's no git history there.
+        said = subprocess.run([sys.executable, "-c", "import json; from decisions import dist; "
+                               "print(json.dumps([dist.commit(), dist.fingerprint()]))"],
+                              cwd=self.tmp, capture_output=True, text=True, env=env, check=True)
+        self.assertEqual(json.loads(said.stdout), [commit, build])
         same = decide("update")
         self.assertEqual(same.returncode, 0, same.stderr)
         self.assertIn(f"up to date: this decide is {build}", same.stdout)
@@ -1666,6 +1682,7 @@ class RemoteTest(unittest.TestCase):
                 while time.time() < deadline and not api("GET", "/api/resumer?machine=quiet-mb")["online"]:
                     time.sleep(0.1)
                 self.assertEqual(api("GET", "/api/resumer?machine=quiet-mb")["build"], build)
+                self.assertEqual(api("GET", "/api/resumer?machine=quiet-mb")["commit"], commit)
                 self.assertFalse(os.listdir(out))
             finally:
                 quiet.terminate()

@@ -9,6 +9,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
+import subprocess
 import zipfile
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, distribution
@@ -18,6 +20,9 @@ from . import __version__
 
 PACKAGE = Path(__file__).parent
 SKILL = PACKAGE / "skill" / "SKILL.md"
+# The commit this code is, where the code is without its git history: written by whatever shipped it (the
+# deploy, a server's wheel). Its name starts with a dot, so it isn't part of the build.
+COMMIT = PACKAGE / ".commit"
 
 
 def _package_files() -> list[Path]:
@@ -30,10 +35,12 @@ def _digest(data: bytes) -> str:
 
 
 @lru_cache(maxsize=4)
-def _build(fingerprint: str, license_text: str) -> tuple[str, bytes]:
+def _build(fingerprint: str, license_text: str, commit_json: str | None) -> tuple[str, bytes]:
     version = f"{__version__}+{fingerprint[:10]}"
     dist_info = f"decisions-{version}.dist-info"
     files = {f"decisions/{p.relative_to(PACKAGE).as_posix()}": p.read_bytes() for p in _package_files()}
+    if commit_json:
+        files[f"decisions/{COMMIT.name}"] = commit_json.encode()
     files[f"{dist_info}/METADATA"] = (
         f"Metadata-Version: 2.4\nName: decisions\nVersion: {version}\nRequires-Python: >=3.11\n"
         "License-Expression: MIT\nLicense-File: LICENSE\n"
@@ -65,7 +72,8 @@ def _source() -> tuple[str, str]:
 
 def wheel() -> tuple[str, bytes]:
     """(filename, bytes) of a wheel of the code this server is running."""
-    return _build(*_source())
+    c = commit()
+    return _build(*_source(), json.dumps(c) if c else None)
 
 
 def fingerprint() -> str:
@@ -81,6 +89,29 @@ def installed_build() -> str | None:
     try:
         return distribution("decisions").version.partition("+")[2] or None
     except PackageNotFoundError:
+        return None
+
+
+def commit() -> dict | None:
+    """The git commit this code is: {"hash", "date", "subject", "dirty"}. In a checkout, that's HEAD, and `dirty`
+    says whether the package has changes that aren't committed. Elsewhere it's what came with the code (COMMIT):
+    a server puts it in the wheel it serves, so an install from that wheel knows it too. None when nobody
+    recorded it, e.g. an image built by hand."""
+    root = PACKAGE.parent
+    if (root / ".git").exists():
+        try:
+            git = lambda *args: subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                                               check=True, timeout=10).stdout
+            sha, date, subject = git("log", "-1", "--format=%H%x00%cI%x00%s").rstrip("\n").split("\0", 2)
+            return {"hash": sha, "date": date, "subject": subject,
+                    "dirty": bool(git("status", "--porcelain", "--", PACKAGE.name, "LICENSE").strip())}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+    try:
+        c = json.loads(COMMIT.read_text())
+        return {"hash": str(c["hash"]), "date": str(c["date"]), "subject": str(c["subject"]),
+                "dirty": bool(c.get("dirty"))}
+    except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
