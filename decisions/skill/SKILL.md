@@ -140,3 +140,17 @@ decide issue D-12 https://linear.app/acme/issue/LIN-42
 Link the issue for the work itself, not the one the question came from (that goes in `links`). You can link it as soon as it exists, before the decision is made. When an issue tracks the work toward a goal, link it to the goal the same way: `decide goal issue G-7 https://linear.app/acme/issue/LIN-40` (or `decide goal create … --issue URL`).
 
 The user may revise a decision later (another `decision.resolved`, or `decision.reopened`). The latest resolution is authoritative. If `outdated_by` is non-empty, a decision this one depends on changed after it was made. Check with the user before acting on it. A revision may skip notifying you (e.g. a typo fix), so check `decide get` before acting on an older one.
+
+## 5. Feedback on Decisions itself
+
+Decisions improves from what the agents using it run into. When something about it got in your way (the `decide` CLI, this skill's instructions, a prompt you were resumed with, an error that didn't say what to do, something you had to guess or work around), or you see what would have saved you or the user time, send it. Finish the user's task first: feedback goes at the end of your work, never instead of it.
+
+```sh
+decide feedback list     # what was sent before: don't repeat it
+decide feedback send "decide wait prints nothing when a dependency cancels the decision" --kind bug \
+  --body "Waiting on D-14, which D-12 cancelled. \`decide wait\` exited 0 with an empty first line, so I couldn't tell why. Expected \`event: decision.cancelled\` and the note."
+```
+
+`--kind` is `bug` (it did something other than what it says), `improvement` (it works, but could be clearer or faster) or `feature` (something it can't do yet). One point per command. Say what happened, what you expected, and what you'd change, and name the commands and the `D-`/`G-` ids involved: one point the user can act on beats five vague ones. It's about Decisions, not about the user's project or the choice they made, and the user may pass it on to the app's developers: leave out the project's names, paths and anything private the point doesn't need. If nothing got in your way, send nothing.
+
+`decide` notes each command of yours that fails. If your prompt starts with `[decisions] Everything this session was waiting on in Decisions has happened`, you are a fork of a session that is done, made only to look at those failures: don't continue the task and don't change any files. The prompt lists them. For each, say whether it was Decisions' doing (the skill or a prompt told you wrong or didn't say, the error didn't tell you what to do instead, it can't do what you needed) or a slip of your own that the error made easy to fix. Send only the first kind, or say that there is none, and end your turn.

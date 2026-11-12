@@ -856,3 +856,24 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
   .tagb { height: 36px; }
   .tag-filter.side .tagb, .tag-filter.side .btn { height: 32px; }
 }
+
+/* Feedback from agents */
+.icon-btn.has-new { position: relative; }
+.icon-btn.has-new::after { content: ""; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent-fill); box-shadow: 0 0 0 2px var(--bg); }
+.fb-list { margin-top: 16px; }
+.fb header { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.fb header h2 { font-size: 15.5px; font-weight: 650; flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+.fb-id { color: var(--faint); font-variant-numeric: tabular-nums; font-weight: 600; }
+.fb-kind.bug { background: var(--bad-soft); color: var(--bad); }
+.fb-kind.feature { background: var(--accent-soft); color: var(--accent); }
+.fb-meta { color: var(--muted); font-size: 13px; margin-top: 4px; display: flex; flex-wrap: wrap; gap: 0 5px; align-items: center; }
+.fb .context { margin-top: 12px; overflow-wrap: anywhere; }
+.fb-outcome { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+.fb-outcome .context { margin-top: 6px; color: var(--text); }
+.fb-actions { display: flex; gap: 8px; margin-top: 14px; }
+.fb.done h2, .fb.dismissed h2 { color: var(--muted); }
+.fb-bumps summary { cursor: pointer; color: var(--muted); font-size: 13px; width: fit-content; }
+.fb-bump { margin-top: 8px; max-width: 46ch; overflow-wrap: anywhere; }
+.fb-bump code { font-size: 12px; }
+.fb-asks { margin-top: 36px; }
+.fb-asks > h2 { font-size: 15px; font-weight: 650; margin-bottom: 10px; }

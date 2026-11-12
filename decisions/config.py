@@ -25,6 +25,9 @@ class Config:
     # Open decisions expire (are closed as `expired`) this many days after they're created unless
     # they set their own due_at. 0 = decisions without a due_at never expire.
     deadline_days: float = 4
+    # Where "Report upstream" on a piece of feedback opens a prefilled issue, for the app's developers.
+    # Empty = no such button.
+    feedback_issues_url: str = "https://github.com/ArvidSU/decide/issues/new"
     webhook_timeout: float = 10
     # Give up after this many failed attempts (0 = retry forever).
     webhook_max_attempts: int = 25

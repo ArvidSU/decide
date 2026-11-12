@@ -1,8 +1,8 @@
 """Coding agents decisions knows how to pick back up.
 
 Each agent says how `decide create` recognizes a session of it (an env var the agent sets for the
-commands it runs), how the resumer continues that session headlessly, how a person resumes it by
-hand, and where it reads skills from. Any other agent works too: set DECISIONS_AGENT and
+commands it runs), how the resumer continues that session headlessly, how it asks a fork of the
+session for feedback, how a person resumes it by hand, and where it reads skills from. Any other agent works too: set DECISIONS_AGENT and
 DECISIONS_SESSION_ID (or pass --agent/--session), and give the resumer a command for it with
 `--agent-command NAME=CMD`.
 """
@@ -19,6 +19,7 @@ class Agent:
     binary: str
     session_env: str        # set by the agent in the environment of the commands it runs
     resume_command: str     # headless; gets $RESUME_SESSION_ID, $RESUME_PROMPT, $RESUME_CWD, $DECISION_*
+    feedback_command: str   # headless, in a fork of the session; gets what resume_command gets, may only run decide
     manual_command: str     # what a person pastes into a terminal; {session} is shell-quoted
     skills_dir: str
 
@@ -27,10 +28,13 @@ AGENTS = {a.name: a for a in [
     Agent("claude-code", "claude", "CLAUDE_CODE_SESSION_ID",
           'claude --resume "$RESUME_SESSION_ID" -p "$RESUME_PROMPT" '
           '--permission-mode acceptEdits --allowedTools "Bash(decide:*)"',
+          'claude --resume "$RESUME_SESSION_ID" --fork-session -p "$RESUME_PROMPT" --allowedTools "Bash(decide:*)"',
           "claude --resume {session}", "~/.claude/skills"),
     # Workspace-write sandbox, plus network so `decide` can reach the server.
     Agent("codex", "codex", "CODEX_THREAD_ID",
           'codex exec resume -c sandbox_mode=workspace-write -c sandbox_workspace_write.network_access=true '
+          '"$RESUME_SESSION_ID" "$RESUME_PROMPT"',
+          'codex exec fork -c sandbox_mode=workspace-write -c sandbox_workspace_write.network_access=true '
           '"$RESUME_SESSION_ID" "$RESUME_PROMPT"',
           "codex resume {session}", "~/.agents/skills"),
 ]}
@@ -57,6 +61,12 @@ def resume_command(agent: str, overrides: dict[str, str] | None = None) -> str |
     if overrides and agent in overrides:
         return overrides[agent]
     return AGENTS[agent].resume_command if agent in AGENTS else None
+
+
+def feedback_command(agent: str, overrides: dict[str, str] | None = None) -> str | None:
+    if overrides and agent in overrides:
+        return overrides[agent]
+    return AGENTS[agent].feedback_command if agent in AGENTS else None
 
 
 def manual_command(resume: dict | None) -> str | None:

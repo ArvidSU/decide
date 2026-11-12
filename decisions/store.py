@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS tokens (
   hash TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL,
   rolled_at TEXT,
-  last_used_at TEXT
+  last_used_at TEXT,
+  -- 1 = this machine's resumer asks its sessions for feedback once everything they waited on has happened.
+  feedback INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
@@ -211,11 +213,43 @@ CREATE TRIGGER IF NOT EXISTS attempts_no_update BEFORE UPDATE ON delivery_attemp
   BEGIN SELECT RAISE(ABORT, 'delivery attempts are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS attempts_no_delete BEFORE DELETE ON delivery_attempts
   BEGIN SELECT RAISE(ABORT, 'delivery attempts are immutable'); END;
+
+-- What agents tell the user about Decisions itself: bugs, improvements, feature requests.
+-- `session` is the agent session it came from (as a decision's `resume`), if it came from one.
+CREATE TABLE IF NOT EXISTS feedback (
+  id TEXT PRIMARY KEY,
+  num INTEGER NOT NULL UNIQUE,
+  space TEXT NOT NULL REFERENCES spaces(name),
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  actor TEXT NOT NULL,
+  session TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  status_note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS feedback_by_space ON feedback(space, status);
+
+-- Sessions a resumer asked for feedback, once everything they waited on had happened. Each is asked once.
+CREATE TABLE IF NOT EXISTS feedback_asks (
+  session_id TEXT PRIMARY KEY,
+  space TEXT NOT NULL REFERENCES spaces(name),
+  agent TEXT NOT NULL,
+  machine TEXT NOT NULL,
+  about TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL,
+  asked_at TEXT NOT NULL,
+  finished_at TEXT,
+  -- The `decide` commands that failed in the session, which it was asked about: [{ts, command, error}].
+  bumps TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 # The version of SCHEMA. Each database records the version it's at in `PRAGMA user_version`.
 # Changing SCHEMA means adding one to this and a migration below.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 # The accents a space can have. The GUI has the shades of each (app.css, `[data-accent]`).
 SPACE_COLORS = ("indigo", "teal", "orange", "pink", "green", "purple", "blue", "slate")
@@ -238,6 +272,33 @@ def _space_colors(conn):
 
 
 MIGRATIONS[2] = _space_colors
+
+
+def _feedback(conn):
+    """3: agents' feedback on Decisions, the sessions asked for it, and each machine's opt-in to being asked
+    (off for the machines there are)."""
+    conn.execute("ALTER TABLE tokens ADD COLUMN feedback INTEGER NOT NULL DEFAULT 0")
+    conn.execute("""CREATE TABLE feedback (
+        id TEXT PRIMARY KEY, num INTEGER NOT NULL UNIQUE, space TEXT NOT NULL REFERENCES spaces(name),
+        kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL, session TEXT,
+        status TEXT NOT NULL DEFAULT 'open', status_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL)""")
+    conn.execute("CREATE INDEX feedback_by_space ON feedback(space, status)")
+    conn.execute("""CREATE TABLE feedback_asks (
+        session_id TEXT PRIMARY KEY, space TEXT NOT NULL REFERENCES spaces(name), agent TEXT NOT NULL,
+        machine TEXT NOT NULL, about TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL, asked_at TEXT NOT NULL,
+        finished_at TEXT)""")
+
+
+MIGRATIONS[3] = _feedback
+
+
+def _bumps(conn):
+    """4: a session asked for feedback has the commands that failed in it. None are known for those asked before."""
+    conn.execute("ALTER TABLE feedback_asks ADD COLUMN bumps TEXT NOT NULL DEFAULT '[]'")
+
+
+MIGRATIONS[4] = _bumps
 
 DEFAULT_WEBHOOK_EVENTS = [
     "decision.resolved",
@@ -275,6 +336,17 @@ PROOF_RESUME_FAILURES = 3
 PROOF_TIMEOUT = 3600
 # A run that hasn't reported back this long (seconds) after its timeout is given up on, so it can be asked for again.
 PROOF_GRACE = 300
+FEEDBACK_KINDS = ("bug", "improvement", "feature")
+# `reported`: passed on to the app's developers, and waiting on them.
+FEEDBACK_STATUSES = ("open", "reported", "done", "dismissed")
+# A resumer's report on asking a session for feedback, and the event each is logged as.
+FEEDBACK_ASK_EVENTS = {"started": "feedback.asked", "finished": "feedback.ask_finished",
+                       "failed": "feedback.ask_failed"}
+# A session is asked for feedback once everything it waited on has been quiet this long (seconds): it may still
+# be acting on the last thing it heard. And only if that was within FEEDBACK_WINDOW, so a machine that opts in
+# doesn't ask every session there ever was.
+FEEDBACK_QUIET = 600
+FEEDBACK_WINDOW = 86400
 MAX_PROOF_SCRIPT = 256 * 1024
 GENESIS = "0" * 64
 # The space a new database starts with. After that it's a space like any other.
@@ -403,6 +475,13 @@ def norm_goal_id(raw: str) -> str:
     if not m:
         raise ApiError(404, f"no goal {raw!r}")
     return f"G-{int(m.group(1))}"
+
+
+def norm_feedback_id(raw: str) -> str:
+    m = re.fullmatch(r"(?i)\s*(?:f-?)?(\d+)\s*", str(raw))
+    if not m:
+        raise ApiError(404, f"no feedback {raw!r}")
+    return f"F-{int(m.group(1))}"
 
 
 def _goal_ids(value, key: str) -> list[str]:
@@ -1940,7 +2019,10 @@ class Store:
                                       "command": body.get("command"), "build": body.get("build"),
                                       "last_seen": time.time(),
                                       "token": scope.token}
-        return self.resumer_status(machine)
+            asks = bool(scope.token and self.conn.execute(
+                "SELECT feedback FROM tokens WHERE id=?", (scope.token,)).fetchone()["feedback"])
+        # `feedback`: whether this machine is opted in to its sessions being asked for feedback.
+        return self.resumer_status(machine) | {"feedback": asks}
 
     def _resumer_dict(self, r: dict) -> dict:
         return {"online": time.time() - r["last_seen"] < 90, "name": r["name"], "pid": r["pid"],
@@ -1968,6 +2050,150 @@ class Store:
             if not self.resumers.pop(machine, None):
                 raise ApiError(404, f"no resumer seen on {machine!r}")
         return {"forgotten": machine}
+
+    # ------------------------------------------------------------------ feedback
+
+    def _feedback_row(self, fid: str, scope: Scope = ALL):
+        row = self.conn.execute("SELECT * FROM feedback WHERE id=?", (fid,)).fetchone()
+        if not row or not scope.allows(row["space"]):
+            raise ApiError(404, f"no feedback {fid}")
+        return row
+
+    def _feedback_dict(self, row) -> dict:
+        return {"id": row["id"], "space": row["space"], "kind": row["kind"], "title": row["title"],
+                "body": row["body"], "actor": row["actor"],
+                "session": json.loads(row["session"]) if row["session"] else None, "status": row["status"],
+                "status_note": row["status_note"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+                "url": f"{self.cfg.public_url}/feedback#{row['id']}"}
+
+    @staticmethod
+    def _ask_dict(row) -> dict:
+        return {"session_id": row["session_id"], "space": row["space"], "agent": row["agent"],
+                "machine": row["machine"], "about": json.loads(row["about"]), "status": row["status"],
+                "asked_at": row["asked_at"], "finished_at": row["finished_at"], "bumps": json.loads(row["bumps"])}
+
+    def send_feedback(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """Feedback on Decisions itself, from an agent (or anyone): `kind` is one of FEEDBACK_KINDS, `session`
+        the agent session it comes from."""
+        kind = body.get("kind")
+        if kind not in FEEDBACK_KINDS:
+            raise ApiError(400, f"kind must be one of {', '.join(FEEDBACK_KINDS)}")
+        title, text = _req_str(body, "title"), _opt_type(body, "body", str, "")
+        session = _resume(body.get("session"))
+        session = session and {k: v for k, v in session.items() if k != "prompt"}
+        with self.tx():
+            space = self._space_for(scope, body.get("space"))
+            num = self.conn.execute("SELECT COALESCE(MAX(num), 0) + 1 FROM feedback").fetchone()[0]
+            ts = now_iso()
+            self.conn.execute(
+                "INSERT INTO feedback (id, num, space, kind, title, body, actor, session, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (f"F-{num}", num, space, kind, title, text, actor, canonical(session) if session else None, ts, ts))
+            out = self._feedback_dict(self._feedback_row(f"F-{num}"))
+            self._event(None, "feedback.sent", actor, {"feedback": out}, space)
+            return out
+
+    def list_feedback(self, status=None, space=None, scope: Scope = ALL) -> dict:
+        """Feedback, newest first, and the sessions most recently asked for it."""
+        cond, args = scope.where("space")
+        if space:
+            cond, args = cond + " AND space=?", [*args, space]
+        with self.lock:
+            asks = self.conn.execute(
+                "SELECT * FROM feedback_asks WHERE 1=1" + cond + " ORDER BY asked_at DESC LIMIT 20", args).fetchall()
+            if status and status != "all":
+                cond, args = cond + " AND status=?", [*args, status]
+            rows = self.conn.execute("SELECT * FROM feedback WHERE 1=1" + cond + " ORDER BY num DESC", args).fetchall()
+            return {"feedback": [self._feedback_dict(r) for r in rows], "asks": [self._ask_dict(r) for r in asks]}
+
+    def get_feedback(self, raw_id: str, scope: Scope = ALL) -> dict:
+        with self.lock:
+            return self._feedback_dict(self._feedback_row(norm_feedback_id(raw_id), scope))
+
+    def update_feedback(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """Mark feedback reported upstream, done or dismissed (or open again), with a note on why."""
+        fid = norm_feedback_id(raw_id)
+        status = body.get("status")
+        if status not in FEEDBACK_STATUSES:
+            raise ApiError(400, f"status must be one of {', '.join(FEEDBACK_STATUSES)}")
+        note = _opt_type(body, "note", str, "")
+        with self.tx():
+            row = self._feedback_row(fid, scope)
+            if status != row["status"] or note != row["status_note"]:
+                self.conn.execute("UPDATE feedback SET status=?, status_note=?, updated_at=? WHERE id=?",
+                                  (status, note, now_iso(), fid))
+                self._event(None, "feedback.updated", actor,
+                            {"id": fid, "status": [row["status"], status], "note": note}, row["space"])
+            return self._feedback_dict(self._feedback_row(fid))
+
+    def feedback_due(self, machine: str, scope: Scope = ALL) -> list[dict]:
+        """Sessions on `machine` to ask for feedback now: everything they waited on has happened (each decision
+        is closed and each goal achieved or abandoned, and they've been resumed with the news), nothing has
+        happened to any of it for FEEDBACK_QUIET, and the last of it was within FEEDBACK_WINDOW. A session
+        isn't asked twice, nor when it already sent feedback by itself."""
+        cond, args = scope.where("space")
+        with self.lock:
+            sessions: dict[str, dict] = {}
+
+            def add(resume, row):
+                if resume and resume.get("machine") == machine:
+                    s = sessions.setdefault(resume["session_id"], {"resume": resume, "space": row["space"], "on": []})
+                    s["on"].append(row)
+
+            for row in self.conn.execute("SELECT * FROM decisions WHERE resume IS NOT NULL" + cond, args).fetchall():
+                add(json.loads(row["resume"]), row)
+            for row in self.conn.execute("SELECT * FROM goals WHERE proof IS NOT NULL" + cond, args).fetchall():
+                add(json.loads(row["proof"]).get("resume"), row)
+            done = {r[0] for r in self.conn.execute("SELECT session_id FROM feedback_asks")}
+            done |= {json.loads(r[0])["session_id"] for r in self.conn.execute(
+                "SELECT session FROM feedback WHERE session IS NOT NULL")}
+            now, due = datetime.now(timezone.utc), []
+            for sid, s in sessions.items():
+                is_goal = lambda row: row["id"].startswith("G-")
+                if sid in done or any(row["status"] == ("active" if is_goal(row) else "open") for row in s["on"]):
+                    continue
+                ids = {goal: [row["id"] for row in s["on"] if is_goal(row) == goal] for goal in (False, True)}
+                marks = lambda xs: ",".join("?" * len(xs))
+                last = parse_ts(self.conn.execute(
+                    f"SELECT MAX(ts) FROM events WHERE decision_id IN ({marks(ids[False])}) "
+                    f"OR goal_id IN ({marks(ids[True])})", (*ids[False], *ids[True])).fetchone()[0])
+                if not last or not FEEDBACK_QUIET <= (now - last).total_seconds() <= FEEDBACK_WINDOW:
+                    continue
+                states = [self._proof_view(row["id"], row)["resume_state"] if is_goal(row)
+                          else self._resume_state(row["id"], row) for row in s["on"]]
+                if any(state["status"] in ("pending", "started") for state in states):
+                    continue  # still to be resumed with the news, or being resumed right now
+                due.append({k: s["resume"].get(k) for k in ("session_id", "agent", "machine", "cwd")}
+                           | {"space": s["space"], "about": sorted(ids[False] + ids[True], key=lambda i: (i[0], int(i[2:])))})
+            return due
+
+    def feedback_ask(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
+        """A resumer's report on asking a session for feedback. `started` claims the session (409 if it has
+        been asked before), with `agent`, `machine`, what it waited on (`about`) and the commands that failed in
+        it (`bumps`); then `finished` or `failed`."""
+        status, sid = body.get("status"), _req_str(body, "session_id")
+        if status not in FEEDBACK_ASK_EVENTS:
+            raise ApiError(400, f"status must be one of {', '.join(FEEDBACK_ASK_EVENTS)}")
+        detail = {k: v for k, v in body.items() if k not in ("status", "space")}
+        with self.tx():
+            row = self.conn.execute("SELECT * FROM feedback_asks WHERE session_id=?", (sid,)).fetchone()
+            if status == "started":
+                if row:
+                    raise ApiError(409, f"session {sid} has been asked for feedback")
+                about, bumps = _opt_type(body, "about", list, []), _opt_type(body, "bumps", list, [])
+                self.conn.execute(
+                    "INSERT INTO feedback_asks (session_id, space, agent, machine, about, status, asked_at, bumps) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (sid, self._space_for(scope, body.get("space")), _req_str(body, "agent"),
+                     _req_str(body, "machine"), canonical(about), status, now_iso(), canonical(bumps)))
+            elif not row or not scope.allows(row["space"]):
+                raise ApiError(404, f"session {sid} hasn't been asked for feedback")
+            else:
+                self.conn.execute("UPDATE feedback_asks SET status=?, finished_at=? WHERE session_id=?",
+                                  (status, now_iso(), sid))
+            row = self.conn.execute("SELECT * FROM feedback_asks WHERE session_id=?", (sid,)).fetchone()
+            self._event(None, FEEDBACK_ASK_EVENTS[status], actor, detail, row["space"])
+            return self._ask_dict(row)
 
     # ------------------------------------------------------------------ spaces and machine tokens
 
@@ -2085,6 +2311,9 @@ class Store:
                 raise ApiError(409, f"space {name!r} still has goals")
             if self.conn.execute("SELECT 1 FROM subscriptions WHERE space=?", (name,)).fetchone():
                 raise ApiError(409, f"space {name!r} still has webhooks")
+            if self.conn.execute("SELECT 1 FROM feedback WHERE space=?", (name,)).fetchone():
+                raise ApiError(409, f"space {name!r} still has feedback")
+            self.conn.execute("DELETE FROM feedback_asks WHERE space=?", (name,))
             revoked = [self._token_dict(r) for r in
                        self.conn.execute("SELECT * FROM tokens WHERE space=?", (name,)).fetchall()]
             self.conn.execute("DELETE FROM tokens WHERE space=?", (name,))
@@ -2098,7 +2327,7 @@ class Store:
                       key=lambda r: r["last_seen"], reverse=True)
         return {"id": row["id"], "name": row["name"], "space": row["space"], "created_at": row["created_at"],
                 "rolled_at": row["rolled_at"], "last_used_at": row["last_used_at"],
-                "resumer": self._resumer_dict(seen[0]) if seen else None}
+                "feedback": bool(row["feedback"]), "resumer": self._resumer_dict(seen[0]) if seen else None}
 
     def _token_row(self, tid: str):
         row = self.conn.execute("SELECT * FROM tokens WHERE id=?", (tid,)).fetchone()
@@ -2138,17 +2367,19 @@ class Store:
             return self._token_dict(self._token_row(tid)) | {"token": secret}
 
     def update_token(self, tid: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
-        """Rename a machine, or move it to another space: the same secret then sees that space instead.
-        A move is logged in both spaces' chains."""
+        """Rename a machine, move it to another space (the same secret then sees that space instead), or opt it
+        in to (or out of) its sessions being asked for feedback. A move is logged in both spaces' chains."""
         self._admin(scope)
         with self.tx():
             row = self._token_row(tid)
             new = {"name": (_req_str(body, "name")[:60] if "name" in body else row["name"]),
-                   "space": _opt_type(body, "space", str) or row["space"]}
+                   "space": _opt_type(body, "space", str) or row["space"],
+                   "feedback": _opt_type(body, "feedback", bool, bool(row["feedback"]))}
             self._space_row(new["space"])
-            changes = {k: [row[k], v] for k, v in new.items() if v != row[k]}
+            changes = {k: [bool(row[k]) if k == "feedback" else row[k], v] for k, v in new.items() if v != row[k]}
             if changes:
-                self.conn.execute("UPDATE tokens SET name=?, space=? WHERE id=?", (new["name"], new["space"], tid))
+                self.conn.execute("UPDATE tokens SET name=?, space=?, feedback=? WHERE id=?",
+                                  (new["name"], new["space"], int(new["feedback"]), tid))
                 for space in dict.fromkeys((row["space"], new["space"])):
                     self._event(None, "token.updated", actor,
                                 {"token_id": tid, "name": new["name"], "changes": changes}, space)

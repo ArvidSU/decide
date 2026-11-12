@@ -202,6 +202,7 @@ class Handler(BaseHTTPRequestHandler):
                 "build": dist.fingerprint(),
                 "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
+                "feedback_issues_url": c.feedback_issues_url or None,
                 "default_webhook_events": DEFAULT_WEBHOOK_EVENTS, "cursor": self.store.cursor(),
                 # Where this caller's new decisions go when they don't say: null = they have to say.
                 "space": self.scope.default or (spaces[0]["name"] if len(spaces) == 1 else None),
@@ -325,6 +326,33 @@ class Handler(BaseHTTPRequestHandler):
     @route("POST", "/api/decisions/([^/]+)/ack")
     def ack_decision(self, did):
         return self.store.ack_decision(did, self.actor, self.scope)
+
+    # ------------------------------------------------------------------ feedback
+
+    @route("GET", "/api/feedback")
+    def list_feedback(self):
+        g = lambda k, d=None: self.qs.get(k, [d])[0]
+        return self.store.list_feedback(status=g("status"), space=g("space"), scope=self.scope)
+
+    @route("POST", "/api/feedback")
+    def send_feedback(self):
+        return 201, self.store.send_feedback(self._body(), self.actor, self.scope)
+
+    @route("GET", "/api/feedback/due")
+    def feedback_due(self):
+        return {"sessions": self.store.feedback_due(self.qs.get("machine", [""])[0], self.scope)}
+
+    @route("POST", "/api/feedback/asks")
+    def feedback_ask(self):
+        return 201, self.store.feedback_ask(self._body(), self.actor, self.scope)
+
+    @route("GET", "/api/feedback/([^/]+)")
+    def get_feedback(self, fid):
+        return self.store.get_feedback(fid, self.scope)
+
+    @route("PATCH", "/api/feedback/([^/]+)")
+    def update_feedback(self, fid):
+        return self.store.update_feedback(fid, self._body(), self.actor, self.scope)
 
     # ------------------------------------------------------------------ goals and the map
 

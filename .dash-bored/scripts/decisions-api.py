@@ -3,7 +3,7 @@
 Usage: python3 .dash-bored/scripts/decisions-api.py <view>
 
 Views: server, resumer, chain, deliveries (status JSON); open, recent,
-delivery-list, goals (list JSON); activity (chart JSON).
+delivery-list, goals, feedback (list JSON); activity (chart JSON).
 
 Reads the server from DECISIONS_URL (default http://127.0.0.1:8787) and sends
 DECISIONS_TOKEN as a bearer token when set. Read-only; stdlib only and
@@ -226,6 +226,31 @@ def goals_list():
     out(items)
 
 
+def feedback_list():
+    res = get("/feedback?status=all")
+    asked = {a["session_id"] for a in res["asks"]}
+    items = []
+    for f in res["feedback"]:
+        s = f.get("session") or {}
+        bits = [f["kind"], "from " + ("%s on %s" % (s["agent"], s["machine"]) if s else f["actor"]), ago(f["created_at"])]
+        if s.get("session_id") in asked:
+            bits.append("asked for")
+        if f["status"] != "open":
+            bits.append("%s %s" % (f["status"], ago(f["updated_at"])))
+        if f.get("status_note"):
+            bits.append("“%s”" % f["status_note"][:80])
+        items.append({"id": f["id"], "title": "%s · %s" % (f["id"], f["title"]), "detail": " · ".join(bits),
+                      "state": {"open": "pending", "reported": "running", "done": "success", "dismissed": "closed"}[f["status"]],
+                      "tags": [f["status"], f["kind"]], "url": f["url"],
+                      "prompt": ("Feedback %s on the Decisions app (\"%s\", a %s) is open. Read it with `decide feedback "
+                                 "get %s`, find what it's about in this repo, and fix it or say why not. When done, "
+                                 "`decide feedback set %s --status done --note \"what you did\"`."
+                                 % (f["id"], f["title"], f["kind"], f["id"], f["id"]))})
+    # Open first, so what's left to look at leads.
+    items.sort(key=lambda x: x["tags"][0] != "open")
+    out(items)
+
+
 def activity():
     days = 14
     today = datetime.now(timezone.utc).date()
@@ -256,7 +281,7 @@ def reason(exc):
 
 VIEWS = {"server": server, "resumer": resumer, "chain": chain, "deliveries": deliveries,
          "open": open_list, "recent": recent_list, "delivery-list": delivery_list, "goals": goals_list,
-         "activity": activity}
+         "feedback": feedback_list, "activity": activity}
 
 if __name__ == "__main__":
     view = sys.argv[1] if len(sys.argv) > 1 else ""
