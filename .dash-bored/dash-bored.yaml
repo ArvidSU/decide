@@ -256,20 +256,51 @@ root:
                                   label: Selected decision summary
                                   command: 'decide get --markdown "$DASH_ITEM_DECISION"'
                     second:
-                      node:
-                        id: goals-panel
-                        component: ./components/external/core/group
-                        props:
-                          title: Goals
-                          description: Active goals with the decisions toward them, and abandoned goals with how many decisions went into them. The map in the GUI (/map) shows how they connect.
-                        children:
-                          node:
-                            id: goal-list
-                            component: ./components/external/core/list
-                            props:
-                              sort: source-order
-                              filterByTags: true
-                              source: { shell: python3 .dash-bored/scripts/decisions-api.py goals, every: 30000, timeoutMs: 10000 }
+                      axis: vertical
+                      first:
+                        node:
+                          id: goals-panel
+                          component: ./components/external/core/group
+                          props:
+                            title: Goals
+                            description: Active goals with the decisions toward them, and abandoned goals with how many decisions went into them. The map in the GUI (/map) shows how they connect.
+                          children:
+                            node:
+                              id: goal-list
+                              component: ./components/external/core/list
+                              props:
+                                sort: source-order
+                                filterByTags: true
+                                source: { shell: python3 .dash-bored/scripts/decisions-api.py goals, every: 30000, timeoutMs: 10000 }
+                      second:
+                        node:
+                          id: feedback-panel
+                          component: ./components/external/core/group
+                          props:
+                            title: Feedback from agents
+                            description: Bugs, improvements and feature requests agents sent about Decisions itself (decide feedback send, or asked for by an opted-in machine's resumer). Open ones lead. Brief agent hands one to the agent to fix.
+                          children:
+                            axis: vertical
+                            first:
+                              node:
+                                id: feedback-list
+                                component: ./components/external/core/list
+                                props:
+                                  sort: source-order
+                                  filterByTags: true
+                                  source: { shell: python3 .dash-bored/scripts/decisions-api.py feedback, every: 30000, timeoutMs: 10000 }
+                                  itemActions:
+                                    - name: Open in browser
+                                      action: { run: "component:open-feedback:run", with: { url: "${item.url}" } }
+                                    - name: Brief agent
+                                      action: { run: agent:prompt, with: { prompt: "${item.prompt}" } }
+                            second:
+                              node:
+                                id: open-feedback
+                                component: ./components/external/core/command
+                                props:
+                                  label: Open selected feedback
+                                  command: 'open "$DASH_ITEM_URL"'
                   second:
                     node:
                       id: delivery-panel

@@ -1374,6 +1374,159 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual([i["key"] for i in self.call("GET", f"/api/goals/{gid}")["issues"]], ["GH-4"])
         self.assertNotEqual(run("goal", "issue", gid, "LIN-1", "--remove").returncode, 0)
 
+    # ---------------------------------------------------------------- feedback
+
+    def test_feedback_is_sent_listed_and_closed(self):
+        session = {"session_id": "sess-9", "agent": "claude-code", "machine": "mb", "cwd": "/work"}
+        self.call("POST", "/api/feedback", {"kind": "rant", "title": "x"}, expect=400)
+        self.call("POST", "/api/feedback", {"kind": "bug"}, expect=400)
+        self.call("POST", "/api/feedback", {"kind": "bug", "title": "x", "session": {"agent": "a"}}, expect=400)
+        f = self.call("POST", "/api/feedback", {"kind": "bug", "title": "wait exits 0 on a timeout",
+                                                "body": "Expected **124**.", "session": session | {"prompt": "p"}},
+                      expect=201)
+        self.assertEqual((f["id"], f["kind"], f["status"], f["actor"], f["session"], f["space"]),
+                         ("F-1", "bug", "open", "agent", session, "default"))
+        self.assertTrue(f["url"].endswith("/feedback#F-1"))
+        self.call("POST", "/api/feedback", {"kind": "feature", "title": "Compare two options"}, expect=201)
+        listed = lambda q="": [x["id"] for x in self.call("GET", f"/api/feedback{q}")["feedback"]]
+        self.assertEqual(listed(), ["F-2", "F-1"])
+        self.assertEqual(self.call("GET", "/api/feedback/f-1")["body"], "Expected **124**.")
+        self.call("GET", "/api/feedback/F-7", expect=404)
+        self.call("PATCH", "/api/feedback/F-1", {"status": "fixed"}, expect=400)
+        done = self.call("PATCH", "/api/feedback/F-1", {"status": "done", "note": "Fixed in abc123"}, actor="me",
+                         expect=200)
+        self.assertEqual((done["status"], done["status_note"]), ("done", "Fixed in abc123"))
+        self.call("PATCH", "/api/feedback/F-1", {"status": "done", "note": "Fixed in abc123"}, actor="me")  # no change
+        self.assertEqual((listed("?status=open"), listed("?status=done")), (["F-2"], ["F-1"]))
+        events = [e for e in self.call("GET", "/api/events?limit=500")["events"] if e["type"].startswith("feedback.")]
+        self.assertEqual([(e["type"], e["actor"]) for e in events],
+                         [("feedback.sent", "agent"), ("feedback.sent", "agent"), ("feedback.updated", "me")])
+        self.assertEqual(events[0]["data"]["feedback"]["title"], "wait exits 0 on a timeout")
+        self.assertEqual(events[2]["data"], {"id": "F-1", "status": ["open", "done"], "note": "Fixed in abc123"})
+        self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
+
+        # The CLI records the agent session it runs in.
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(work)
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT, "CLAUDE_CODE_SESSION_ID": "sess-cli",
+                            "DECISIONS_MACHINE": "mb"}
+        decide = lambda *a: subprocess.run([sys.executable, "-m", "decisions", "feedback", *a], env=env, cwd=work,
+                                           capture_output=True, text=True)
+        sent = decide("send", "Say which space", "--kind", "improvement", "--body", "The error lists them.")
+        self.assertIn("F-3 sent", sent.stdout, sent.stderr)
+        got = self.call("GET", "/api/feedback/F-3")
+        self.assertEqual((got["actor"], got["session"]["session_id"], got["session"]["agent"], got["session"]["machine"]),
+                         ("claude-code", "sess-cli", "claude-code", "mb"))
+        self.assertEqual(decide("send", "x", "--kind", "rant").returncode, 2)
+        out = decide("list").stdout
+        self.assertIn("F-3", out)
+        self.assertIn("Say which space", out)
+        self.assertNotIn("F-1", out)
+        self.assertIn("The error lists them.", decide("get", "F-3").stdout)
+        self.assertIn("dismissed", decide("set", "F-3", "--status", "dismissed", "--note", "by design").stdout)
+        self.assertEqual(self.call("GET", "/api/feedback/F-3")["status_note"], "by design")
+
+    def test_a_session_is_due_for_feedback_once_everything_it_waited_on_has_happened(self):
+        from unittest import mock
+        from decisions import store as st
+        session = lambda sid, machine="mb": {"session_id": sid, "agent": "claude-code", "machine": machine, "cwd": "/w"}
+        due = lambda machine="mb": self.call("GET", f"/api/feedback/due?machine={machine}")["sessions"]
+        d1 = self.create(resume=session("s1"))["id"]
+        d2 = self.create(resume=session("s1"))["id"]
+        d3 = self.create(resume=session("s2"))["id"]
+        d4 = self.create(resume=session("s3", "other"))["id"]
+        gid = self.goal("Ship it")["id"]
+        self.call("PUT", f"/api/goals/{gid}/proof", {"success": "released", "command": "./prove.sh", "machine": "mb",
+                                                     "resume": session("s1")}, expect=200)
+        with mock.patch.object(st, "FEEDBACK_QUIET", 0):
+            self.assertEqual(due(), [])
+            # Decided, but the session hasn't heard yet.
+            for did in (d1, d3, d4):
+                self.call("POST", f"/api/decisions/{did}/resolve", {"selected": ["1"]}, actor="me", expect=200)
+            self.assertEqual(due(), [])
+            for did in (d1, d3, d4):
+                self.call("POST", f"/api/decisions/{did}/resume-events", {"status": "started"}, expect=201)
+            self.assertEqual(due(), [])
+            for did in (d1, d3, d4):
+                self.call("POST", f"/api/decisions/{did}/resume-events", {"status": "finished"}, expect=201)
+            # s2 has nothing left; s1 still waits on a decision and a goal; s3 lives on another machine.
+            self.assertEqual(due(), [session("s2") | {"space": "default", "about": [d3]}])
+            self.assertEqual([s["session_id"] for s in due("other")], ["s3"])
+            self.call("POST", f"/api/decisions/{d2}/cancel", {}, actor="me", expect=200)
+            self.assertEqual([s["session_id"] for s in due()], ["s2"])
+            self.call("PATCH", f"/api/goals/{gid}", {"status": "abandoned"}, actor="me", expect=200)
+            self.assertEqual({s["session_id"]: s["about"] for s in due()}, {"s2": [d3], "s1": [d1, d2, gid]})
+            # Reopening a decision makes its session wait again.
+            self.call("POST", f"/api/decisions/{d2}/reopen", {}, actor="me", expect=200)
+            self.assertEqual([s["session_id"] for s in due()], ["s2"])
+            self.call("POST", f"/api/decisions/{d2}/cancel", {}, actor="me", expect=200)
+            # A session that sent feedback by itself isn't asked.
+            self.call("POST", "/api/feedback", {"kind": "bug", "title": "x", "session": session("s1")}, expect=201)
+            self.assertEqual([s["session_id"] for s in due()], ["s2"])
+            # Only what just finished, and not before it has been quiet for a while.
+            with mock.patch.object(st, "FEEDBACK_WINDOW", 0):
+                self.assertEqual(due(), [])
+            with mock.patch.object(st, "FEEDBACK_QUIET", 600):
+                self.assertEqual(due(), [])
+
+            # Each session is asked once: the first resumer to report claims it.
+            ask = lambda status, expect, **kw: self.call("POST", "/api/feedback/asks",
+                                                         {"status": status, "session_id": "s2"} | kw, actor="resumer", expect=expect)
+            ask("finished", 404)
+            ask("started", 400)
+            ask("asked", 400)
+            asked = ask("started", 201, agent="claude-code", machine="mb", about=[d3], log="/tmp/x.log")
+            self.assertEqual((asked["status"], asked["about"], asked["finished_at"]), ("started", [d3], None))
+            ask("started", 409, agent="claude-code", machine="mb")
+            self.assertEqual(due(), [])
+            self.assertEqual(ask("finished", 201, exit_code=0)["status"], "finished")
+        self.assertEqual([a["session_id"] for a in self.call("GET", "/api/feedback")["asks"]], ["s2"])
+        events = [e for e in self.call("GET", "/api/events?limit=500")["events"] if e["type"].startswith("feedback.ask")]
+        self.assertEqual([e["type"] for e in events], ["feedback.asked", "feedback.ask_finished"])
+        self.assertEqual(events[0]["data"], {"session_id": "s2", "agent": "claude-code", "machine": "mb",
+                                             "about": [d3], "log": "/tmp/x.log"})
+        self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
+
+    def test_resumer_asks_a_finished_session_for_feedback_in_a_fork(self):
+        from unittest import mock
+        from decisions import agents, store as st
+        self.assertIn("--fork-session", agents.feedback_command("claude-code"))
+        self.assertIn("exec fork", agents.feedback_command("codex"))
+        self.assertIsNone(agents.feedback_command("gemini"))
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(work)
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT, "DECISIONS_MACHINE": "mb",
+                            "DECISIONS_STATE_DIR": os.path.join(self.tmp, "state")}
+        session = {"session_id": "sess-fb", "agent": "claude-code", "machine": "mb", "cwd": work}
+        did = self.create(resume=session)["id"]
+        self.call("POST", f"/api/decisions/{did}/cancel", {}, actor="me", expect=200)
+        asks = lambda: self.call("GET", "/api/feedback")["asks"]
+        # What the fork sends counts as the session's: the command is run as if inside it.
+        command = (f'claude-code={sys.executable} -m decisions feedback send "from $RESUME_SESSION_ID in $PWD" '
+                   f'--kind improvement --body "$RESUME_PROMPT"')
+        start = lambda *flags: subprocess.Popen(
+            [sys.executable, "-m", "decisions", "resumer", "run", "--feedback-command", command, *flags],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        with mock.patch.object(st, "FEEDBACK_QUIET", 0):
+            # A machine that isn't opted in asks nobody.
+            resumer = start()
+            self.assertEqual(resumer.stdout.readline()[:10], "[resumer] ")
+            time.sleep(1)
+            resumer.terminate(); resumer.wait()
+            self.assertEqual(asks(), [])
+            resumer = start("--feedback")
+            done = next((True for _ in range(100) if [a["status"] for a in asks()] == ["finished"] or time.sleep(0.1)),
+                        False)
+            resumer.terminate(); resumer.wait()
+        self.assertTrue(done, resumer.stdout.read())
+        sent = self.call("GET", "/api/feedback")["feedback"]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0]["session"]["session_id"], sent[0]["actor"]), ("sess-fb", "claude-code"))
+        self.assertIn("from sess-fb in ", sent[0]["title"])
+        self.assertIn(os.path.basename(work), sent[0]["title"])
+        self.assertIn(f"has happened ({did})", sent[0]["body"])
+        self.assertIn("decide feedback send", sent[0]["body"])
+
 
 class RemoteTest(unittest.TestCase):
     """The server on one machine, agents on others: token auth, installing from the server, connect."""
@@ -1894,6 +2047,52 @@ class SpacesTest(unittest.TestCase):
         counts = {sp["name"]: sp["tokens"] for sp in self.call("GET", "/api/spaces")["spaces"]}
         self.assertEqual((counts["work"], counts["private"]), (0, 2))
 
+    def test_a_machine_opts_in_to_its_sessions_being_asked_for_feedback(self):
+        tid = self.tokens["id-work"]
+        beat = lambda token: self.call("POST", "/api/resumer/heartbeat", {"machine": "m"}, token=token, expect=200)
+        self.assertFalse(self.call("GET", "/api/tokens")["tokens"][0]["feedback"])
+        self.assertFalse(beat("tok-work")["feedback"])
+        self.call("PATCH", f"/api/tokens/{tid}", {"feedback": "yes"}, expect=400)
+        self.call("PATCH", f"/api/tokens/{tid}", {"feedback": True}, token="tok-work", expect=403)
+        self.assertTrue(self.call("PATCH", f"/api/tokens/{tid}", {"feedback": True}, expect=200)["feedback"])
+        self.assertEqual((beat("tok-work")["feedback"], beat("tok-private")["feedback"], beat("admin")["feedback"]),
+                         (True, False, False))
+        event = self.call("GET", "/api/events?limit=500")["events"][-1]
+        self.assertEqual((event["type"], event["space"], event["data"]["changes"]),
+                         ("token.updated", "work", {"feedback": [False, True]}))
+        # Renaming it leaves it opted in.
+        self.assertTrue(self.call("PATCH", f"/api/tokens/{tid}", {"name": "desk"}, expect=200)["feedback"])
+        self.assertFalse(self.call("PATCH", f"/api/tokens/{tid}", {"feedback": False}, expect=200)["feedback"])
+
+    def test_feedback_stays_in_its_space(self):
+        session = {"session_id": "s1", "agent": "codex", "machine": "m"}
+        f = self.call("POST", "/api/feedback", {"kind": "bug", "title": "x", "session": session}, token="tok-work",
+                      expect=201)
+        self.assertEqual(f["space"], "work")
+        self.call("POST", "/api/feedback", {"kind": "bug", "title": "x"}, expect=400)  # the admin says which space
+        self.call("POST", "/api/feedback", {"kind": "bug", "title": "x", "space": "work"}, token="tok-private", expect=404)
+        ids = lambda token, q="": [x["id"] for x in self.call("GET", f"/api/feedback{q}", token=token)["feedback"]]
+        self.assertEqual((ids("tok-work"), ids("tok-private"), ids("admin"), ids("admin", "?space=private")),
+                         (["F-1"], [], ["F-1"], []))
+        self.call("GET", "/api/feedback/F-1", token="tok-private", expect=404)
+        self.call("PATCH", "/api/feedback/F-1", {"status": "done"}, token="tok-private", expect=404)
+        # A machine only hears about its own space's sessions, and can't report on another's.
+        d = self.create("tok-work", resume=session | {"session_id": "s2"})
+        self.call("POST", f"/api/decisions/{d['id']}/cancel", {}, expect=200)
+        from unittest import mock
+        from decisions import store as st
+        with mock.patch.object(st, "FEEDBACK_QUIET", 0):
+            due = lambda token: [s["session_id"] for s in
+                                 self.call("GET", "/api/feedback/due?machine=m", token=token)["sessions"]]
+            self.assertEqual((due("tok-work"), due("tok-private")), (["s2"], []))
+        ask = {"session_id": "s2", "agent": "codex", "machine": "m"}
+        self.call("POST", "/api/feedback/asks", ask | {"status": "started"}, token="tok-work", expect=201)
+        self.call("POST", "/api/feedback/asks", ask | {"status": "finished"}, token="tok-private", expect=404)
+        self.assertEqual(self.call("GET", "/api/feedback", token="tok-private")["asks"], [])
+        self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
+        # A space with feedback isn't empty.
+        self.call("DELETE", "/api/spaces/work", expect=409)
+
     def test_forgetting_resumers(self):
         seen = lambda: [r["machine"] for r in self.call("GET", "/api/resumer")["resumers"]]
         self.call("POST", "/api/resumer/heartbeat", {"machine": "laptop"}, token="tok-work", expect=200)
@@ -2038,8 +2237,9 @@ class SchemaTest(unittest.TestCase):
         for name in ("private", "work"):
             store.create_space({"name": name, "deadline_days": 3}, "me")
         goal = store.create_goal({"title": "Keep me", "space": "work"}, "me")
-        # Back to version 1: spaces without the column.
+        # Back to version 1: spaces without the column, and nothing later versions added.
         store.conn.execute("ALTER TABLE spaces DROP COLUMN color")
+        self.before_feedback(store.conn)
         store.conn.execute("PRAGMA user_version=1")
         store.conn.close()
         store = self.open()
@@ -2052,6 +2252,35 @@ class SchemaTest(unittest.TestCase):
         fresh = sqlite3.connect(":memory:")
         fresh.executescript(st.SCHEMA)
         self.assertEqual(st.schema_differences(st.schema_structure(store.conn), st.schema_structure(fresh)), [])
+
+    @staticmethod
+    def before_feedback(conn):
+        """Take a database back to before version 3."""
+        conn.execute("ALTER TABLE tokens DROP COLUMN feedback")
+        conn.execute("DROP TABLE feedback")
+        conn.execute("DROP TABLE feedback_asks")
+
+    def test_version_3_adds_feedback_and_leaves_machines_opted_out(self):
+        from decisions import store as st
+        store = self.open()
+        token = store.create_token({"name": "laptop"}, "me")
+        goal = store.create_goal({"title": "Keep me"}, "me")
+        self.before_feedback(store.conn)
+        store.conn.execute("PRAGMA user_version=2")
+        store.conn.close()
+        store = self.open()
+        self.assertEqual((store.schema_was, self.version()), (2, st.SCHEMA_VERSION))
+        kept = store.list_tokens()[0]
+        self.assertEqual((kept["id"], kept["name"], kept["feedback"]), (token["id"], "laptop", False))
+        self.assertEqual(store.scope_for(token["token"]).token, token["id"])
+        self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
+        self.assertTrue(store.verify_chain()["ok"])
+        fresh = sqlite3.connect(":memory:")
+        fresh.executescript(st.SCHEMA)
+        self.assertEqual(st.schema_differences(st.schema_structure(store.conn), st.schema_structure(fresh)), [])
+        self.assertEqual(store.send_feedback({"kind": "bug", "title": "x"}, "agent")["id"], "F-1")
+        self.assertTrue(store.update_token(token["id"], {"feedback": True}, "me")["feedback"])
+        self.assertTrue(store.verify_chain()["ok"])
 
     def test_a_migration_that_misses_the_schema_changes_nothing(self):
         from decisions.store import SCHEMA_VERSION, SchemaError

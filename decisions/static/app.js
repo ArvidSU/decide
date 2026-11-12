@@ -38,6 +38,9 @@ const S = {
   goalResumer: null,  // the resumer on the machine that runs the goal's proof
   editingGoal: false,
   addingTag: false,
+  feedback: [],       // what agents sent about Decisions itself
+  feedbackAsks: [],   // the sessions most recently asked for it
+  feedbackStatus: "open",
 };
 
 // It goes in the Authorization header, which fetch() refuses outright if it has spaces or non-ASCII.
@@ -430,9 +433,11 @@ function valueHtml(v, m) {
 // ------------------------------------------------------------------ data loading
 
 async function loadList() {
-  const [list, goals] = await Promise.all([api("GET", "/api/decisions?status=all&limit=500"), api("GET", "/api/goals?status=all")]);
+  const [list, goals, feedback] = await Promise.all([api("GET", "/api/decisions?status=all&limit=500"), api("GET", "/api/goals?status=all"), api("GET", "/api/feedback")]);
   S.list = list.decisions;
   S.goals = goals.goals;
+  S.feedback = feedback.feedback;
+  S.feedbackAsks = feedback.asks;
   renderSidebar();
 }
 
@@ -505,7 +510,7 @@ async function poll() {
         } else if ((S.goal || location.pathname === "/map") && !isTyping() && !dialogOpen()) {
           // The goal page and the map show decisions too, so any change can matter there.
           await (S.goal ? loadGoal(S.goal.id) : renderMap());
-        }
+        } else if (location.pathname === "/feedback" && !dialogOpen()) renderFeedback();
       }
       if (S.offline) { S.offline = false; $("#conn").hidden = true; await loadList(); if (S.d && !isTyping()) await loadDecision(S.d.id, { keepSelection: true }); }
     } catch {
@@ -549,6 +554,7 @@ async function route() {
     renderSidebar();
     if (path === "/map") return await renderMap();
     if (path === "/settings") return await renderSettings();
+    if (path === "/feedback") return renderFeedback();
     const first = S.list.filter((d) => actionable(d) && inSpace(d)).sort(byDeadline)[0];
     if (first) return navigate(`/d/${first.id}`, true);
     renderEmpty();
@@ -589,8 +595,14 @@ function renderSidebar() {
     `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && open.length ? "has-open" : ""}" data-status="${t}" aria-pressed="${S.status === t}" title="${S.counts[t]} ${STATUS_NAMES[t].toLowerCase()}${t === "open" && later ? `, ${later} waiting on another decision` : ""}">${STATUS_NAMES[t]}${t === "open" && open.length ? `<span class="n">${open.length}</span>` : ""}</button>`).join(""));
   $("#settings-btn").classList.toggle("active", location.pathname === "/settings");
   $("#map-btn").classList.toggle("active", location.pathname === "/map" || !!S.goal);
+  const openFeedback = S.feedback.filter((f) => inSpace(f) && f.status === "open").length;
+  for (const btn of [$("#feedback-btn"), $("#mb-feedback")]) {
+    btn.classList.toggle("has-new", openFeedback > 0);
+    btn.title = `Feedback from agents on Decisions${openFeedback ? `: ${openFeedback} open` : ""}`;
+  }
+  $("#feedback-btn").classList.toggle("active", location.pathname === "/feedback");
   document.title = (open.length ? `(${open.length}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : S.goal ? `${S.goal.id} · ${S.goal.title}`
-    : location.pathname === "/map" ? "Map" : "Decisions");
+    : location.pathname === "/map" ? "Map" : location.pathname === "/feedback" ? "Feedback" : "Decisions");
   setHtml($("#mb-title"), `Decisions${open.length ? `<span class="n" aria-label="${open.length} open">${open.length}</span>` : ""}`);
   setHtml($("#attention"), open.length
     ? `<a href="/d/${open[0].id}" data-nav class="attention ${urgency(open[0])}" title="Undecided decisions expire at their deadline">
@@ -685,6 +697,55 @@ function renderEmpty() {
     ],
     "webhooks": [{"url": "http://localhost:8790/"}]
   }'</pre></div></div>`;
+}
+
+// ------------------------------------------------------------------ feedback
+
+const FEEDBACK_KINDS = { bug: "Bug", improvement: "Improvement", feature: "Feature request" };
+const FEEDBACK_STATUS = { open: "Open", done: "Done", dismissed: "Dismissed", all: "All" };
+
+// What agents had to say about Decisions itself, and which sessions were asked.
+function renderFeedback() {
+  renderSidebar();
+  const all = S.feedback.filter(inSpace);
+  const shown = all.filter((f) => S.feedbackStatus === "all" || f.status === S.feedbackStatus);
+  const count = (st) => st === "all" ? all.length : all.filter((f) => f.status === st).length;
+  const asks = S.feedbackAsks.filter(inSpace);
+  const from = (f) => f.session ? `${esc(f.session.agent)} session on ${esc(f.session.machine)}` : esc(f.actor);
+  const main = $("#main");
+  const scroll = main.querySelector(".feedback-page") ? main.scrollTop : 0;
+  main.innerHTML = `<div class="page narrow feedback-page">
+    <div class="map-head"><div><h1 class="d-title">Feedback</h1>
+      <p>Bugs, improvements and feature requests for Decisions itself, sent by the agents that use it with <code>decide feedback send</code>. Machines that are opted in under <a href="/settings" data-nav>Settings → Machines</a> ask each session once everything it waited on has happened.</p></div></div>
+    <div class="tag-filter" role="group" aria-label="Status">${Object.entries(FEEDBACK_STATUS).map(([st, label]) =>
+      `<button class="tagb ${S.feedbackStatus === st ? "on" : ""}" data-action="feedback-filter" data-status="${st}" aria-pressed="${S.feedbackStatus === st}">${label} ${count(st)}</button>`).join("")}</div>
+    <div class="fb-list">${shown.map((f) => `<article class="panel fb ${esc(f.status)}" id="${esc(f.id)}">
+      <header><span class="badge fb-kind ${esc(f.kind)}">${esc(FEEDBACK_KINDS[f.kind] || f.kind)}</span><h2><span class="fb-id">${esc(f.id)}</span> ${esc(f.title)}</h2></header>
+      <div class="fb-meta">${from(f)} · <span title="${esc(fullTime(f.created_at))}">${ago(f.created_at)}</span>${multiSpace() && !S.space ? ` · ${spaceDot(f.space)}${esc(f.space)}` : ""}</div>
+      ${f.body ? `<div class="context">${md(f.body)}</div>` : ""}
+      ${f.status !== "open" ? `<div class="fb-outcome"><span class="badge ${f.status === "done" ? "ok" : ""}">${esc(FEEDBACK_STATUS[f.status])}</span> <span title="${esc(fullTime(f.updated_at))}">${ago(f.updated_at)}</span>${f.status_note ? `<div class="context">${md(f.status_note)}</div>` : ""}</div>` : ""}
+      <div class="fb-actions">${f.status === "open"
+        ? `<button class="btn small" data-action="feedback-status" data-id="${esc(f.id)}" data-status="done">${icon("check", 14)}Done</button><button class="btn small ghost" data-action="feedback-status" data-id="${esc(f.id)}" data-status="dismissed">Dismiss</button>`
+        : `<button class="btn small ghost" data-action="feedback-status" data-id="${esc(f.id)}" data-status="open">${icon("undo", 14)}Open again</button>`}</div>
+    </article>`).join("") || `<div class="empty-state"><span class="es-ic">${icon("message", 24)}</span><h2>${all.length ? `No ${esc(FEEDBACK_STATUS[S.feedbackStatus].toLowerCase())} feedback` : "No feedback yet"}</h2>
+      <p>${all.length ? "Nothing here with this status." : "Agents send it when something about Decisions got in their way. Opt a machine in under Settings → Machines to have its sessions asked."}</p></div>`}</div>
+    ${asks.length ? `<section class="fb-asks"><h2>Sessions asked</h2>
+      <div class="panel"><div class="table-scroll"><table class="plain"><tr><th>Session</th><th>Waited on</th><th>Asked</th><th>Sent</th></tr>
+      ${asks.map((a) => { const sent = S.feedback.filter((f) => f.session?.session_id === a.session_id);
+        return `<tr><td>${esc(a.agent)} on ${esc(a.machine)}<div class="muted small mono">${esc(a.session_id)}</div></td>
+          <td>${a.about.map((id) => refChip(id)).join(" ")}</td>
+          <td class="nowrap"><span title="${esc(fullTime(a.asked_at))}">${ago(a.asked_at)}</span>${a.status === "failed" ? ` <span class="badge failed">Failed</span>` : a.status === "started" ? ` <span class="badge pending">Asking…</span>` : ""}</td>
+          <td>${sent.map((f) => `<a class="chip ref" href="#${esc(f.id)}" title="${esc(f.title)}">${esc(f.id)}</a>`).join(" ") || `<span class="muted">${a.status === "started" ? "" : "Nothing"}</span>`}</td></tr>`; }).join("")}</table></div></div></section>` : ""}
+  </div>`;
+  main.scrollTop = scroll;
+  // A link to one piece of feedback (/feedback#F-3) shows it whatever its status.
+  const target = location.hash.slice(1);
+  if (/^F-\d+$/.test(target) && S.feedbackTarget !== target) {
+    S.feedbackTarget = target;
+    const f = all.find((x) => x.id === target);
+    if (f && !shown.includes(f)) { S.feedbackStatus = f.status; return renderFeedback(); }
+    document.getElementById(target)?.scrollIntoView({ block: "start" });
+  }
 }
 
 // Event types a global webhook can subscribe to, grouped and described.
@@ -808,13 +869,15 @@ function machinesSetting(cfg, tokens, resumers) {
   const tokenOf = new Set(tokens.map((t) => t.resumer?.machine).filter(Boolean));
   const others = resumers.filter((r) => !tokenOf.has(r.machine));
   return `<section class="setting">
-    <header><h2>Machines</h2><p>Each machine gets its own token for one space. Its install command sets up the <code>decide</code> CLI, the agent skill and the resumer, so agent sessions pick back up when you decide.</p></header>
+    <header><h2>Machines</h2><p>Each machine gets its own token for one space. Its install command sets up the <code>decide</code> CLI, the agent skill and the resumer, so agent sessions pick back up when you decide.</p>
+      <p>A machine that asks for <a href="/feedback" data-nav>feedback</a> has its resumer fork each session once everything it waited on has happened, and ask the fork what would make Decisions better.</p></header>
     <div>
-      <div class="panel">${tokens.length ? `<div class="table-scroll"><table class="plain"><tr><th>Machine</th>${multiSpace() ? "<th>Space</th>" : ""}<th class="nowrap">Last used</th><th>Resumer</th><th><span class="sr-only">Actions</span></th></tr>
+      <div class="panel">${tokens.length ? `<div class="table-scroll"><table class="plain"><tr><th>Machine</th>${multiSpace() ? "<th>Space</th>" : ""}<th class="nowrap">Last used</th><th>Resumer</th><th>Feedback</th><th><span class="sr-only">Actions</span></th></tr>
         ${tokens.map((t) => `<tr><td><strong>${esc(t.name)}</strong><div class="muted small mono">${esc(t.id)}</div></td>
           ${multiSpace() ? `<td class="nowrap">${spaceDot(t.space)}${esc(t.space)}</td>` : ""}
           <td class="nowrap">${t.last_used_at ? `<span title="${esc(fullTime(t.last_used_at))}">${ago(t.last_used_at)}</span>` : `<span class="muted">Never</span>`}${t.rolled_at ? `<div class="muted small">rolled ${ago(t.rolled_at)}</div>` : ""}</td>
           <td>${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span><span class="host">${esc(t.resumer.machine)}</span>${behind(cfg, t.resumer)}</span>` : `<span class="muted">Not seen</span>`}</td>
+          <td><label class="check-label small nowrap" title="Ask this machine's sessions for feedback on Decisions once everything they waited on has happened"><input type="checkbox" data-action="token-feedback" data-id="${t.id}" data-name="${esc(t.name)}" ${t.feedback ? "checked" : ""}>Ask sessions</label></td>
           <td style="text-align:right;width:1%">${machineMenuHtml(t, spaces.length > 1)}</td></tr>`).join("")}</table></div>`
         : `<div class="muted small">No machine tokens yet. Connect one below.</div>`}
         <form class="form-row" id="add-token" style="margin-top:14px">
@@ -2303,6 +2366,7 @@ document.addEventListener("click", async (e) => {
   const spaceTab = e.target.closest("[data-space]");
   if (spaceTab) {
     S.space = spaceTab.dataset.space; storage("space", S.space); renderSidebar();
+    if (location.pathname === "/feedback") renderFeedback();
     return location.pathname === "/map" && renderMap().catch(fail);
   }
 
@@ -2405,6 +2469,23 @@ document.addEventListener("click", async (e) => {
         field: "Space", value: from, choices: S.config.spaces.map((s) => ({ value: s.name, label: s.name })), ok: "Move" });
       if (to === null || to === from) return;
       try { await api("PATCH", `/api/tokens/${id}`, { space: to }); toast(`Moved ${a.dataset.name} to ${to}`); await spacesChanged(); } catch (err) { fail(err); }
+      return;
+    }
+    case "token-feedback":
+      try {
+        await api("PATCH", `/api/tokens/${id}`, { feedback: a.checked });
+        toast(a.checked ? `${a.dataset.name} asks its sessions for feedback once they're done` : `${a.dataset.name} no longer asks its sessions for feedback`);
+      } catch (err) { fail(err); }
+      return renderSettings();
+    case "feedback-filter": S.feedbackStatus = a.dataset.status; return renderFeedback();
+    case "feedback-status": {
+      const f = S.feedback.find((x) => x.id === id), to = a.dataset.status;
+      let note = "";
+      if (to !== "open") {
+        note = await ask({ title: to === "done" ? `${id} is done` : `Dismiss ${id}`, body: `<p>${esc(f.title)}</p>`, field: to === "done" ? "What was done about it (optional)" : "Why not (optional)", multiline: true, ok: to === "done" ? "Mark done" : "Dismiss" });
+        if (note === null) return;
+      }
+      try { await api("PATCH", `/api/feedback/${id}`, { status: to, note }); await loadList(); renderFeedback(); } catch (err) { fail(err); }
       return;
     }
     case "forget-resumer":
@@ -2672,6 +2753,7 @@ function palette() {
     ...Object.entries(STATUS_NAMES).map(([k, v]) => ({ kind: "cmd", icon: "filter", label: `Show ${v.toLowerCase()} decisions`, run: () => { S.status = k; storage("status", k); renderSidebar(); drawer(true); } })),
     { kind: "cmd", icon: "map", label: "Map of goals and decisions", run: () => navigate("/map") },
     { kind: "cmd", icon: "target", label: "New goal…", run: () => newGoal() },
+    { kind: "cmd", icon: "message", label: "Feedback from agents", run: () => navigate("/feedback") },
     { kind: "cmd", icon: "settings", label: "Settings", run: () => navigate("/settings") },
     ...(S.d ? [{ kind: "cmd", icon: "copy", label: `Copy link to ${S.d.id}`, run: () => copy(`[${S.d.id}: ${S.d.title}](${S.d.url})`, "link") }] : []),
     ...(S.d?.status === "open" ? [{ kind: "cmd", icon: "link", label: `Make ${S.d.id} depend on another decision…`, run: addDependency }] : []),
@@ -2729,6 +2811,8 @@ document.addEventListener("keydown", (e) => {
   $("#mb-settings").innerHTML = icon("settings", 18);
   $("#settings-btn").innerHTML = icon("settings", 16);
   $("#map-btn").innerHTML = icon("map", 16);
+  $("#feedback-btn").innerHTML = icon("message", 16);
+  $("#mb-feedback").innerHTML = icon("message", 18);
   $("#mb-map").innerHTML = icon("map", 18);
   $("#logo-mark").innerHTML = icon("check", 14);
   $("#search-wrap").insertAdjacentHTML("afterbegin", icon("search", 15));
