@@ -241,13 +241,15 @@ CREATE TABLE IF NOT EXISTS feedback_asks (
   about TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL,
   asked_at TEXT NOT NULL,
-  finished_at TEXT
+  finished_at TEXT,
+  -- The `decide` commands that failed in the session, which it was asked about: [{ts, command, error}].
+  bumps TEXT NOT NULL DEFAULT '[]'
 );
 """
 
 # The version of SCHEMA. Each database records the version it's at in `PRAGMA user_version`.
 # Changing SCHEMA means adding one to this and a migration below.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # The accents a space can have. The GUI has the shades of each (app.css, `[data-accent]`).
 SPACE_COLORS = ("indigo", "teal", "orange", "pink", "green", "purple", "blue", "slate")
@@ -290,6 +292,14 @@ def _feedback(conn):
 
 MIGRATIONS[3] = _feedback
 
+
+def _bumps(conn):
+    """4: a session asked for feedback has the commands that failed in it. None are known for those asked before."""
+    conn.execute("ALTER TABLE feedback_asks ADD COLUMN bumps TEXT NOT NULL DEFAULT '[]'")
+
+
+MIGRATIONS[4] = _bumps
+
 DEFAULT_WEBHOOK_EVENTS = [
     "decision.resolved",
     "decision.reopened",
@@ -327,7 +337,8 @@ PROOF_TIMEOUT = 3600
 # A run that hasn't reported back this long (seconds) after its timeout is given up on, so it can be asked for again.
 PROOF_GRACE = 300
 FEEDBACK_KINDS = ("bug", "improvement", "feature")
-FEEDBACK_STATUSES = ("open", "done", "dismissed")
+# `reported`: passed on to the app's developers, and waiting on them.
+FEEDBACK_STATUSES = ("open", "reported", "done", "dismissed")
 # A resumer's report on asking a session for feedback, and the event each is logged as.
 FEEDBACK_ASK_EVENTS = {"started": "feedback.asked", "finished": "feedback.ask_finished",
                        "failed": "feedback.ask_failed"}
@@ -2059,7 +2070,7 @@ class Store:
     def _ask_dict(row) -> dict:
         return {"session_id": row["session_id"], "space": row["space"], "agent": row["agent"],
                 "machine": row["machine"], "about": json.loads(row["about"]), "status": row["status"],
-                "asked_at": row["asked_at"], "finished_at": row["finished_at"]}
+                "asked_at": row["asked_at"], "finished_at": row["finished_at"], "bumps": json.loads(row["bumps"])}
 
     def send_feedback(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
         """Feedback on Decisions itself, from an agent (or anyone): `kind` is one of FEEDBACK_KINDS, `session`
@@ -2100,7 +2111,7 @@ class Store:
             return self._feedback_dict(self._feedback_row(norm_feedback_id(raw_id), scope))
 
     def update_feedback(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
-        """Mark feedback done or dismissed (or open again), with a note on why."""
+        """Mark feedback reported upstream, done or dismissed (or open again), with a note on why."""
         fid = norm_feedback_id(raw_id)
         status = body.get("status")
         if status not in FEEDBACK_STATUSES:
@@ -2158,7 +2169,8 @@ class Store:
 
     def feedback_ask(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
         """A resumer's report on asking a session for feedback. `started` claims the session (409 if it has
-        been asked before), with `agent`, `machine` and what it waited on (`about`); then `finished` or `failed`."""
+        been asked before), with `agent`, `machine`, what it waited on (`about`) and the commands that failed in
+        it (`bumps`); then `finished` or `failed`."""
         status, sid = body.get("status"), _req_str(body, "session_id")
         if status not in FEEDBACK_ASK_EVENTS:
             raise ApiError(400, f"status must be one of {', '.join(FEEDBACK_ASK_EVENTS)}")
@@ -2168,12 +2180,12 @@ class Store:
             if status == "started":
                 if row:
                     raise ApiError(409, f"session {sid} has been asked for feedback")
-                about = _opt_type(body, "about", list, [])
+                about, bumps = _opt_type(body, "about", list, []), _opt_type(body, "bumps", list, [])
                 self.conn.execute(
-                    "INSERT INTO feedback_asks (session_id, space, agent, machine, about, status, asked_at) "
-                    "VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO feedback_asks (session_id, space, agent, machine, about, status, asked_at, bumps) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
                     (sid, self._space_for(scope, body.get("space")), _req_str(body, "agent"),
-                     _req_str(body, "machine"), canonical(about), status, now_iso()))
+                     _req_str(body, "machine"), canonical(about), status, now_iso(), canonical(bumps)))
             elif not row or not scope.allows(row["space"]):
                 raise ApiError(404, f"session {sid} hasn't been asked for feedback")
             else:

@@ -872,5 +872,8 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
 .fb-outcome .context { margin-top: 6px; color: var(--text); }
 .fb-actions { display: flex; gap: 8px; margin-top: 14px; }
 .fb.done h2, .fb.dismissed h2 { color: var(--muted); }
+.fb-bumps summary { cursor: pointer; color: var(--muted); font-size: 13px; width: fit-content; }
+.fb-bump { margin-top: 8px; max-width: 46ch; overflow-wrap: anywhere; }
+.fb-bump code { font-size: 12px; }
 .fb-asks { margin-top: 36px; }
 .fb-asks > h2 { font-size: 15px; font-weight: 650; margin-bottom: 10px; }

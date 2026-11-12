@@ -240,7 +240,7 @@ def feedback_list():
         if f.get("status_note"):
             bits.append("“%s”" % f["status_note"][:80])
         items.append({"id": f["id"], "title": "%s · %s" % (f["id"], f["title"]), "detail": " · ".join(bits),
-                      "state": {"open": "pending", "done": "success", "dismissed": "closed"}[f["status"]],
+                      "state": {"open": "pending", "reported": "running", "done": "success", "dismissed": "closed"}[f["status"]],
                       "tags": [f["status"], f["kind"]], "url": f["url"],
                       "prompt": ("Feedback %s on the Decisions app (\"%s\", a %s) is open. Read it with `decide feedback "
                                  "get %s`, find what it's about in this repo, and fix it or say why not. When done, "

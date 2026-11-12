@@ -702,7 +702,15 @@ function renderEmpty() {
 // ------------------------------------------------------------------ feedback
 
 const FEEDBACK_KINDS = { bug: "Bug", improvement: "Improvement", feature: "Feature request" };
-const FEEDBACK_STATUS = { open: "Open", done: "Done", dismissed: "Dismissed", all: "All" };
+const FEEDBACK_STATUS = { open: "Open", reported: "Reported", done: "Done", dismissed: "Dismissed", all: "All" };
+
+// The issue "Report upstream" opens for the app's developers: what the agent wrote, as you edited it, and
+// which version it's about. Nothing about the session, the machine or the space goes along.
+function upstreamIssueUrl(f, { title, body }) {
+  const about = `\n\n---\n${FEEDBACK_KINDS[f.kind] || f.kind} from an agent (${f.session?.agent || f.actor}) using Decisions ${S.config.version}, build ${S.config.build}.`;
+  const q = new URLSearchParams({ title, body: body.slice(0, 6000) + about, labels: f.kind === "bug" ? "bug" : "enhancement" });
+  return `${S.config.feedback_issues_url}?${q}`;
+}
 
 // What agents had to say about Decisions itself, and which sessions were asked.
 function renderFeedback() {
@@ -716,24 +724,25 @@ function renderFeedback() {
   const scroll = main.querySelector(".feedback-page") ? main.scrollTop : 0;
   main.innerHTML = `<div class="page narrow feedback-page">
     <div class="map-head"><div><h1 class="d-title">Feedback</h1>
-      <p>Bugs, improvements and feature requests for Decisions itself, sent by the agents that use it with <code>decide feedback send</code>. Machines that are opted in under <a href="/settings" data-nav>Settings → Machines</a> ask each session once everything it waited on has happened.</p></div></div>
+      <p>Bugs, improvements and feature requests for Decisions itself, sent by the agents that use it with <code>decide feedback send</code>. On machines that are opted in under <a href="/settings" data-nav>Settings → Machines</a>, a session in which <code>decide</code> commands failed is asked about them once everything it waited on has happened.${S.config.feedback_issues_url ? " Report upstream what the app's developers should hear about." : ""}</p></div></div>
     <div class="tag-filter" role="group" aria-label="Status">${Object.entries(FEEDBACK_STATUS).map(([st, label]) =>
       `<button class="tagb ${S.feedbackStatus === st ? "on" : ""}" data-action="feedback-filter" data-status="${st}" aria-pressed="${S.feedbackStatus === st}">${label} ${count(st)}</button>`).join("")}</div>
     <div class="fb-list">${shown.map((f) => `<article class="panel fb ${esc(f.status)}" id="${esc(f.id)}">
       <header><span class="badge fb-kind ${esc(f.kind)}">${esc(FEEDBACK_KINDS[f.kind] || f.kind)}</span><h2><span class="fb-id">${esc(f.id)}</span> ${esc(f.title)}</h2></header>
       <div class="fb-meta">${from(f)} · <span title="${esc(fullTime(f.created_at))}">${ago(f.created_at)}</span>${multiSpace() && !S.space ? ` · ${spaceDot(f.space)}${esc(f.space)}` : ""}</div>
       ${f.body ? `<div class="context">${md(f.body)}</div>` : ""}
-      ${f.status !== "open" ? `<div class="fb-outcome"><span class="badge ${f.status === "done" ? "ok" : ""}">${esc(FEEDBACK_STATUS[f.status])}</span> <span title="${esc(fullTime(f.updated_at))}">${ago(f.updated_at)}</span>${f.status_note ? `<div class="context">${md(f.status_note)}</div>` : ""}</div>` : ""}
+      ${f.status !== "open" ? `<div class="fb-outcome"><span class="badge ${f.status === "done" ? "ok" : f.status === "reported" ? "pending" : ""}">${esc(FEEDBACK_STATUS[f.status])}</span> <span title="${esc(fullTime(f.updated_at))}">${ago(f.updated_at)}</span>${f.status_note ? `<div class="context">${md(f.status_note)}</div>` : ""}</div>` : ""}
       <div class="fb-actions">${f.status === "open"
-        ? `<button class="btn small" data-action="feedback-status" data-id="${esc(f.id)}" data-status="done">${icon("check", 14)}Done</button><button class="btn small ghost" data-action="feedback-status" data-id="${esc(f.id)}" data-status="dismissed">Dismiss</button>`
-        : `<button class="btn small ghost" data-action="feedback-status" data-id="${esc(f.id)}" data-status="open">${icon("undo", 14)}Open again</button>`}</div>
+        ? `<button class="btn small" data-action="feedback-status" data-id="${esc(f.id)}" data-status="done">${icon("check", 14)}Done</button>${S.config.feedback_issues_url ? `<button class="btn small" data-action="feedback-report" data-id="${esc(f.id)}" title="Open an issue for the app's developers, with this filled in for you to edit">${icon("external", 14)}Report upstream…</button>` : ""}<button class="btn small ghost" data-action="feedback-status" data-id="${esc(f.id)}" data-status="dismissed">Dismiss</button>`
+        : `${f.status === "reported" ? `<button class="btn small" data-action="feedback-status" data-id="${esc(f.id)}" data-status="done">${icon("check", 14)}Done</button>` : ""}<button class="btn small ghost" data-action="feedback-status" data-id="${esc(f.id)}" data-status="open">${icon("undo", 14)}Open again</button>`}</div>
     </article>`).join("") || `<div class="empty-state"><span class="es-ic">${icon("message", 24)}</span><h2>${all.length ? `No ${esc(FEEDBACK_STATUS[S.feedbackStatus].toLowerCase())} feedback` : "No feedback yet"}</h2>
       <p>${all.length ? "Nothing here with this status." : "Agents send it when something about Decisions got in their way. Opt a machine in under Settings → Machines to have its sessions asked."}</p></div>`}</div>
     ${asks.length ? `<section class="fb-asks"><h2>Sessions asked</h2>
-      <div class="panel"><div class="table-scroll"><table class="plain"><tr><th>Session</th><th>Waited on</th><th>Asked</th><th>Sent</th></tr>
+      <div class="panel"><div class="table-scroll"><table class="plain"><tr><th>Session</th><th>Waited on</th><th>Failed commands</th><th>Asked</th><th>Sent</th></tr>
       ${asks.map((a) => { const sent = S.feedback.filter((f) => f.session?.session_id === a.session_id);
         return `<tr><td>${esc(a.agent)} on ${esc(a.machine)}<div class="muted small mono">${esc(a.session_id)}</div></td>
           <td>${a.about.map((id) => refChip(id)).join(" ")}</td>
+          <td>${a.bumps.length ? `<details class="fb-bumps"><summary>${a.bumps.length} failed</summary>${a.bumps.map((b) => `<div class="fb-bump"><code>${esc(b.command)}</code><div class="muted small">${esc(b.error)}</div></div>`).join("")}</details>` : `<span class="muted">—</span>`}</td>
           <td class="nowrap"><span title="${esc(fullTime(a.asked_at))}">${ago(a.asked_at)}</span>${a.status === "failed" ? ` <span class="badge failed">Failed</span>` : a.status === "started" ? ` <span class="badge pending">Asking…</span>` : ""}</td>
           <td>${sent.map((f) => `<a class="chip ref" href="#${esc(f.id)}" title="${esc(f.title)}">${esc(f.id)}</a>`).join(" ") || `<span class="muted">${a.status === "started" ? "" : "Nothing"}</span>`}</td></tr>`; }).join("")}</table></div></div></section>` : ""}
   </div>`;
@@ -2478,6 +2487,16 @@ document.addEventListener("click", async (e) => {
       } catch (err) { fail(err); }
       return renderSettings();
     case "feedback-filter": S.feedbackStatus = a.dataset.status; return renderFeedback();
+    case "feedback-report": {
+      const f = S.feedback.find((x) => x.id === id);
+      const issue = await ask({ title: `Report ${id} upstream`, ok: "Open the issue",
+        body: `<p>This opens a new issue for the app's developers with the text below, for you to submit there. It leaves your server: take out anything about your own work that the point doesn't need.</p>`,
+        fields: [{ name: "title", label: "Title", value: f.title, required: true }, { name: "body", label: "Description", value: f.body, multiline: true }] });
+      if (issue === null) return;
+      window.open(upstreamIssueUrl(f, issue), "_blank", "noopener");
+      try { await api("PATCH", `/api/feedback/${id}`, { status: "reported", note: "" }); await loadList(); renderFeedback(); } catch (err) { fail(err); }
+      return;
+    }
     case "feedback-status": {
       const f = S.feedback.find((x) => x.id === id), to = a.dataset.status;
       let note = "";

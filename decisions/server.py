@@ -202,6 +202,7 @@ class Handler(BaseHTTPRequestHandler):
                 "build": dist.fingerprint(),
                 "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
+                "feedback_issues_url": c.feedback_issues_url or None,
                 "default_webhook_events": DEFAULT_WEBHOOK_EVENTS, "cursor": self.store.cursor(),
                 # Where this caller's new decisions go when they don't say: null = they have to say.
                 "space": self.scope.default or (spaces[0]["name"] if len(spaces) == 1 else None),

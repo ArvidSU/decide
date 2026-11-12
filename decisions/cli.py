@@ -768,6 +768,44 @@ def cmd_feedback_send(args):
     print(f"{f['id']} sent: {f['url']}")
 
 
+# The `decide` commands that failed in each agent session on this machine, one JSON object per line. A resumer
+# that asks sessions for feedback asks about these, and leaves a session without any alone.
+MAX_BUMPS = 30
+
+
+def _file_name(session_id: str) -> str:
+    """A session id as part of a file name."""
+    return re.sub(r"[^\w.-]", "_", session_id)
+
+
+def _bumps_file(session_id: str) -> str:
+    return os.path.join(STATE_DIR, "bumps", _file_name(session_id) + ".jsonl")
+
+
+def _record_bump(argv: list[str], error: str):
+    """Note that a `decide` command failed in the agent session it ran in. Never gets in the command's way."""
+    session = agents.detect_session()
+    if not session:
+        return
+    import shlex
+    try:
+        path = _bumps_file(session[1])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                                 "command": ("decide " + shlex.join(argv))[:400], "error": error.strip()[:600]}) + "\n")
+    except OSError:
+        pass
+
+
+def _read_bumps(session_id: str) -> list[dict]:
+    try:
+        with open(_bumps_file(session_id)) as fh:
+            return [json.loads(line) for line in fh if line.strip()][-MAX_BUMPS:]
+    except (OSError, ValueError):
+        return []
+
+
 def _feedback_line(f: dict) -> str:
     return f"{f['id']:<6} {f['kind']:<12} {f['status']:<10} {f['title']}  ({f['actor']}, {_until(f['created_at'])})"
 
@@ -870,18 +908,25 @@ def _goal_resume_prompt(g: dict) -> str:
 
 
 def _feedback_prompt(s: dict) -> str:
-    """What a fork of a session is told once everything the session waited on has happened."""
+    """What a fork of a session is told once everything the session waited on has happened: the `decide`
+    commands that failed in it, and to say which of them were Decisions' doing."""
+    bumps = "\n".join(f'{i}. `{b["command"]}`\n   {b["error"]}' for i, b in enumerate(s["bumps"], 1))
+    n = len(s["bumps"])
     return (f'[decisions] Everything this session was waiting on in Decisions has happened ({", ".join(s["about"])}), '
-            f'so the user would like your feedback on Decisions itself: the `decide` CLI, the decisions skill\'s '
-            f'instructions, the prompts you were resumed with, and the GUI as far as the user told you about it. This '
-            f'is a fork of the session, only for feedback: don\'t continue the task and don\'t change any files. '
-            f'Think back over the session. What was confusing, missing, slow or broken? What did you have to guess or '
-            f'work around? What would have saved you or the user time? Run `decide feedback list` to see what was '
-            f'sent before, then for each distinct point that isn\'t there yet: `decide feedback send "<one-line '
-            f'title>" --kind bug|improvement|feature --body "<what happened, what you expected, and a concrete '
-            f'suggestion; name the D-/G- ids and commands involved>"`. Be specific: one point the user can act on '
-            f'beats five vague ones. If nothing is worth the user\'s time, send nothing and say so. Then end your '
-            f'turn.')
+            f'and {n} `decide` command{"s" if n > 1 else ""} failed along the way:\n\n{bumps}\n\n'
+            f'The user collects what trips agents up in Decisions itself (the `decide` CLI, the decisions skill\'s '
+            f'instructions, the prompts you were resumed with), to improve it. This is a fork of the session, only '
+            f'for that: don\'t continue the task and don\'t change any files. For each failure, look at what led '
+            f'you to run the command that way. Was it Decisions\' doing (the skill or a prompt told you wrong or '
+            f'didn\'t say, the error didn\'t tell you what to do instead, it can\'t do what you needed), or a slip '
+            f'of your own that the error made easy to fix? Only the first kind is feedback. Run `decide feedback '
+            f'list` to see what was sent before, then for each such point that isn\'t there yet: `decide feedback '
+            f'send "<one-line title>" --kind bug|improvement|feature --body "<the command and what it answered, '
+            f'what led you to it, and what you\'d change>"`. Write it so it can be passed on to the app\'s '
+            f'developers: leave out the project\'s names, paths and anything private the point doesn\'t need. If '
+            f'something else in Decisions got in your way without a failed command, that counts too, as long as you '
+            f'can quote where in the session. If all of it was a slip of your own, send nothing and say so. Then end '
+            f'your turn.')
 
 
 def _agent_commands(items, flag: str = "--agent-command") -> dict[str, str]:
@@ -991,16 +1036,17 @@ def _prove_one(client: Client, g: dict, seq: int, log_dir: str):
 
 
 def _ask_one(client: Client, s: dict, command: str, log_dir: str):
-    """Ask a session that's done for feedback on Decisions: claim it (each session is asked once, whichever
-    resumer gets there), then run the agent's feedback command in a fork of it. What the fork sends with
+    """Ask a session that's done about the `decide` commands that failed in it (`s["bumps"]`): claim it (each
+    session is asked once, whichever resumer gets there), then run the agent's feedback command in a fork of it. What the fork sends with
     `decide feedback send` is recorded as coming from the session itself."""
     sid = s["session_id"]
     report = lambda status, **detail: client.call("POST", "/api/feedback/asks",
                                                   {"status": status, "session_id": sid, **detail})
     cwd = s.get("cwd") or os.path.expanduser("~")
-    log = os.path.join(log_dir, f"feedback-{sid}.log")
+    log = os.path.join(log_dir, f"feedback-{_file_name(sid)}.log")
     try:
-        report("started", agent=s["agent"], machine=s["machine"], space=s["space"], about=s["about"], log=log)
+        report("started", agent=s["agent"], machine=s["machine"], space=s["space"], about=s["about"],
+               bumps=s["bumps"], log=log)
     except SystemExit:  # asked already
         return
     if not os.path.isdir(cwd):
@@ -1124,8 +1170,8 @@ def cmd_resumer_run(args):
     resumes the session that owns a goal when the user agrees to its proof, and when it has passed or failed. Pulls the event feed with a
     persisted cursor, so nothing is missed while it (or the machine) is down; heartbeats so the GUI can warn
     you when it isn't running. Keeps itself, `decide` and the skill on the server's code (unless --no-update).
-    On a machine that's opted in (Settings → Machines, or --feedback), asks each session for feedback on
-    Decisions, in a fork of it, once everything it waited on has happened."""
+    On a machine that's opted in (Settings → Machines, or --feedback), once everything a session waited on has
+    happened, asks a fork of it about the `decide` commands that failed in it: which were Decisions' doing."""
     client = Client(actor=os.environ.get("DECISIONS_ACTOR") or "resumer")
     update = _SelfUpdate(not args.no_update)
     work: list[threading.Thread] = []  # resumes and proofs in flight: a restart waits for them
@@ -1171,8 +1217,11 @@ def cmd_resumer_run(args):
                 if args.feedback or beat.get("feedback"):
                     due = client.call("GET", f"/api/feedback/due?machine={urllib.parse.quote(me)}")["sessions"]
                     for s in due:
+                        # Nothing failed in it: nothing to ask about. (It can still fail something and be asked.)
+                        if not (bumps := _read_bumps(s["session_id"])):
+                            continue
                         if command := agents.feedback_command(s["agent"], feedback_overrides):
-                            start(_ask_one, client, s, command, log_dir)
+                            start(_ask_one, client, s | {"bumps": bumps}, command, log_dir)
                         elif s["agent"] not in unaskable:
                             unaskable.add(s["agent"])
                             print(f"[resumer] no feedback command for agent {s['agent']!r}; give the resumer "
@@ -1483,9 +1532,31 @@ def _resume_flags(parser, when: str):
                                         "the resumer has an --agent-command for)")
 
 
+class _Parser(argparse.ArgumentParser):
+    """Remembers what was wrong with the command line, for `_record_bump`."""
+    usage_error = None
+
+    def error(self, message):
+        _Parser.usage_error = f"usage error: {message}"
+        super().error(message)
+
+
 def main(argv=None):
+    """Run a command. One that fails inside an agent session is noted (`_record_bump`): those are what the
+    session is asked about when it's done."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    try:
+        _main(argv)
+    except SystemExit as exc:
+        # A message, or a usage error. A bare exit code is an answer (`resumer status`: offline), not a failure.
+        if error := exc.code if isinstance(exc.code, str) else _Parser.usage_error:
+            _record_bump(argv, error)
+        raise
+
+
+def _main(argv):
     from . import __version__
-    p = argparse.ArgumentParser(prog="decide", description="General-purpose decision log.")
+    p = _Parser(prog="decide", description="General-purpose decision log.")
     p.add_argument("--version", action="version", version=f"decide {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1705,7 +1776,7 @@ def main(argv=None):
     r.add_argument("--space", help="space to send it in (default: the token's space, or DECISIONS_SPACE)")
     r.set_defaults(fn=cmd_feedback_send)
     r = fsub.add_parser("list", help="feedback sent so far, newest first")
-    r.add_argument("--status", default="open", choices=["open", "done", "dismissed", "all"])
+    r.add_argument("--status", default="open", choices=["open", "reported", "done", "dismissed", "all"])
     r.add_argument("--space", help="only this space")
     r.add_argument("--json", action="store_true")
     r.set_defaults(fn=cmd_feedback_list)
@@ -1713,9 +1784,9 @@ def main(argv=None):
     r.add_argument("id")
     r.add_argument("--json", action="store_true")
     r.set_defaults(fn=cmd_feedback_get)
-    r = fsub.add_parser("set", help="mark feedback done or dismissed, or open again")
+    r = fsub.add_parser("set", help="mark feedback reported upstream, done or dismissed, or open again")
     r.add_argument("id")
-    r.add_argument("--status", required=True, choices=["open", "done", "dismissed"])
+    r.add_argument("--status", required=True, choices=["open", "reported", "done", "dismissed"])
     r.add_argument("--note", help="what was done about it, or why not")
     r.set_defaults(fn=cmd_feedback_set)
 
@@ -1734,7 +1805,8 @@ def main(argv=None):
                    "asks for its proof)")
     update_help = ("don't update decide, the skill and this resumer when the server runs newer code (default: "
                    "follow the server, if decide was installed from it)")
-    feedback_help = ("ask each session for feedback on Decisions once everything it waited on has happened "
+    feedback_help = ("once everything a session waited on has happened, ask a fork of it about the decide "
+                     "commands that failed in it "
                      "(default: only if this machine is opted in on the server: Settings → Machines, or "
                      "`decide token set ID --feedback on`)")
     feedback_command_help = ("NAME=COMMAND: how to ask one agent's session for feedback, adding or replacing a "

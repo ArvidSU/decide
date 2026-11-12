@@ -199,13 +199,17 @@ def seed_feedback(cache, sprint, tenancy):
         if status:
             call("PATCH", f"/api/feedback/{fid}", {"status": status, "note": note}, ME)
 
-    def asked(sid, about, agent=AGENT):
+    def asked(sid, about, bumps, agent=AGENT):
+        """A session whose `decide` commands failed (`bumps`: command, error) was asked about them."""
         for status in ("started", "finished"):
-            call("POST", "/api/feedback/asks", {"status": status, "session_id": sid, "agent": agent,
-                                                "machine": MACHINE, "about": about}, "resumer")
+            call("POST", "/api/feedback/asks", {
+                "status": status, "session_id": sid, "agent": agent, "machine": MACHINE, "about": about,
+                "bumps": [{"ts": "2026-11-10T09:00:00Z", "command": c, "error": e} for c, e in bumps]}, "resumer")
 
     # A session that was asked once its decision was settled, and had two things to say.
-    asked("demo-session-2", [cache])
+    asked("demo-session-2", [cache], [
+        (f"decide wait {cache} --on decision.resolved --json --follow", "usage error: unrecognized arguments: --follow"),
+        (f"decide get {cache} --reasons", "usage error: unrecognized arguments: --reasons")])
     feedback("bug", "decide wait says nothing when the decision is reopened",
              f"I was waiting on {cache} with `decide wait --on decision.resolved,decision.cancelled,decision.expired`. "
              f"It was decided, I started on HTTP caching, and then it was **reopened and decided again** while I "
@@ -217,8 +221,9 @@ def seed_feedback(cache, sprint, tenancy):
              f"ruled out (\"Refresh locks the table\") was only in `decide get --json`, under the option's "
              f"`exclude_reason`. One line per ruled-out option in the prompt would have saved the lookup.",
              sid="demo-session-2")
-    # One that was asked and had nothing to add.
-    asked("demo-session-3", [tenancy])
+    # One that was asked and put it down to a slip of its own.
+    asked("demo-session-3", [tenancy], [
+        ("decide create --json tenancy.json -q", "error: 400 'title' is required and must be a non-empty string")])
     # Sent unprompted, while the session was still waiting.
     feedback("feature", "Let me mark one option as my recommendation",
              f"For {sprint} I had a clear favourite and could only say so in `context`, where it's easy to miss. An "
@@ -228,6 +233,11 @@ def seed_feedback(cache, sprint, tenancy):
              "`decide fill D-3 --json fill.json` with `{\"id\": \"1\", \"attributes\": {…}}` fails with "
              "`expected a list of option patches, each with an 'id'`. Wrapping it in `[…]` works. Accept both.",
              actor="codex", status="done", note="`decide fill` wraps a single object in a list.")
+    feedback("bug", "The resume prompt for an expired decision doesn't say what it was about",
+             "Resumed after an expiry, the prompt gave the id, the title and the deadline, and told me to carry on "
+             "with my own judgement. The options I'd proposed weren't in it, so I had to `decide get` to recall what "
+             "the choice even was. List the option labels in that prompt.",
+             actor="codex", status="reported")
     feedback("feature", "Decide for the user when a decision expires",
              "When a decision expires I have to guess anyway. Let me name a default option that's picked at the "
              "deadline, so the log shows a resolution instead of an expiry.",
