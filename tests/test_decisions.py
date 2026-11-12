@@ -2224,6 +2224,253 @@ class ServerUpdateTest(unittest.TestCase):
                 self.assertEqual(update.installer("a.whl")[:5], ["/x/uv", "pip", "install", "--python", sys.executable])
 
 
+# Stand-in for `uv` in InstallScriptTest: a tool is a venv in $TOOLS that the wheel is unpacked into, with its
+# `decide` in $BIN_DIR.
+FAKE_UV = r'''import glob, os, shutil, subprocess, sys, zipfile
+args = sys.argv[1:]
+open(os.environ["OUT"] + "/uv", "a").write(" ".join(args) + "\n")
+tools, bin_dir = os.environ["TOOLS"], os.environ["BIN_DIR"]
+if args[:2] == ["tool", "dir"]:
+    print(bin_dir if "--bin" in args else tools)
+elif args[:2] == ["tool", "install"]:
+    venv = tools + "/decisions"
+    if not os.path.isdir(venv):
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", venv], check=True)
+        open(venv + "/uv-receipt.toml", "w").write("[tool]\n")
+    python = venv + "/bin/python"
+    site = subprocess.run([python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    for old in [site + "/decisions"] + glob.glob(site + "/decisions-*.dist-info"):
+        shutil.rmtree(old, ignore_errors=True)
+    zipfile.ZipFile(args[-1]).extractall(site)
+    os.makedirs(bin_dir, exist_ok=True)
+    with open(bin_dir + "/decide", "w") as fh:
+        fh.write(f"#!{python}\nimport sys\nfrom decisions.cli import main\nsys.exit(main())\n")
+    os.chmod(bin_dir + "/decide", 0o755)
+else:
+    sys.exit(f"fake uv: {args}")
+'''
+
+# Stand-in for launchctl and systemctl in InstallScriptTest: it runs what a service that's kept running would
+# run (not the jobs on a timer), with its pid in $OUT.
+FAKE_SERVICES = r'''import glob, os, plistlib, shlex, signal, subprocess, sys, time
+args = sys.argv[1:]
+out, home = os.environ["OUT"], os.environ["HOME"]
+open(out + "/service", "a").write(" ".join(args) + "\n")
+
+def stop(name):
+    try:
+        pid = int(open(f"{out}/{name}.pid").read())
+        os.kill(pid, signal.SIGTERM)
+        while True:
+            os.kill(pid, 0)
+            time.sleep(0.05)
+    except (OSError, ValueError):
+        pass
+
+def start(name, argv, env, log):
+    stop(name)
+    proc = subprocess.Popen(argv, env=os.environ | env, stdin=subprocess.DEVNULL, stdout=open(log, "a"),
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    open(f"{out}/{name}.pid", "w").write(str(proc.pid))
+
+def launchd(label):
+    plist = plistlib.load(open(f"{home}/Library/LaunchAgents/{label}.plist", "rb"))
+    if plist.get("KeepAlive"):
+        start(label, plist["ProgramArguments"], plist["EnvironmentVariables"], plist["StandardOutPath"])
+
+def systemd(unit):
+    if unit.endswith(".timer") or "Type=oneshot" in open(f"{home}/.config/systemd/user/{unit}").read():
+        return
+    lines = open(f"{home}/.config/systemd/user/{unit}").read().splitlines()
+    value = lambda key: [line[len(key) + 1:] for line in lines if line.startswith(key + "=")]
+    start(unit, shlex.split(value("ExecStart")[0]),
+          dict(shlex.split(e)[0].split("=", 1) for e in value("Environment")), value("StandardOutput")[0][len("append:"):])
+
+if os.path.basename(sys.argv[0]) == "launchctl":
+    label = args[-1].rsplit("/", 1)[-1].removesuffix(".plist")
+    if args[0] == "print":
+        sys.exit(113)  # not loaded
+    if args[0] == "bootout":
+        stop(label)
+    if args[0] in ("bootstrap", "kickstart"):
+        launchd(label)
+elif args[:2] == ["--user", "restart"]:
+    systemd(args[2])
+elif args[:2] == ["--user", "disable"]:
+    stop(args[-1])
+'''
+
+
+class InstallScriptTest(unittest.TestCase):
+    """install.sh, the one command that sets a server up. Upstream is a real git repository of this code, the
+    script is the real one, and so is the server it starts, in a home directory of its own. Two stand-ins: `uv`
+    (FAKE_UV) and launchctl / systemctl (FAKE_SERVICES)."""
+
+    def setUp(self):
+        import shutil
+        import socket
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        path = lambda *parts: os.path.join(self.tmp, *parts)
+        self.upstream, self.out, self.home, bin_dir = path("upstream"), path("out"), path("home"), path("bin")
+        for d in (self.out, self.home, bin_dir):
+            os.makedirs(d)
+        shutil.copytree(os.path.join(ROOT, "decisions"), os.path.join(self.upstream, "decisions"),
+                        ignore=shutil.ignore_patterns("__pycache__", ".commit"))
+        for name in ("LICENSE", "pyproject.toml"):
+            shutil.copy(os.path.join(ROOT, name), self.upstream)
+        self.git("init", "-q", "-b", "main")
+        self.first = self.commit("one")
+        for name, text in (("uv", FAKE_UV), ("launchctl", FAKE_SERVICES), ("systemctl", FAKE_SERVICES)):
+            with open(os.path.join(bin_dir, name), "w") as fh:
+                fh.write(f"#!{sys.executable}\n{text}")
+        with open(os.path.join(bin_dir, "python3"), "w") as fh:  # the script looks for a python3 >= 3.11: this one
+            fh.write(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        for name in os.listdir(bin_dir):
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.conf = os.path.join(self.home, ".config/decisions/config.toml")
+        self.db = os.path.join(self.home, ".local/share/decisions/decisions.db")
+        self.decide_bin = path("tool-bin", "decide")
+        self.env = {k: v for k, v in os.environ.items()
+                    if k != "PYTHONPATH" and not k.startswith(("DECISIONS_", "XDG_", "UV_"))} | {
+            "HOME": self.home, "PATH": bin_dir + os.pathsep + os.environ["PATH"], "OUT": self.out, "TMPDIR": self.tmp,
+            "TOOLS": path("tools"), "BIN_DIR": path("tool-bin"), "DECISIONS_STATE_DIR": path("state")}
+        self.addCleanup(self.stop)
+
+    def stop(self):
+        import glob
+        import signal
+        for pidfile in glob.glob(os.path.join(self.out, "*.pid")):
+            try:
+                with open(pidfile) as fh:
+                    os.kill(int(fh.read()), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=self.upstream,
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, message, **appended):
+        """A commit on upstream's main that appends text to files of the package. Returns its hash."""
+        for name, text in appended.items():
+            with open(os.path.join(self.upstream, "decisions", name.replace("_", ".")), "a") as fh:
+                fh.write("\n" + text + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def install(self, *flags):
+        return subprocess.run(["sh", os.path.join(ROOT, "install.sh"), "--repo", self.upstream, *flags], cwd=self.tmp,
+                              env=self.env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+    def decide(self, *args):
+        return subprocess.run([self.decide_bin, *args], cwd=self.tmp, env=self.env | {"DECISIONS_URL": self.base},
+                              capture_output=True, text=True)
+
+    def api(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=10) as r:
+            return json.loads(r.read())
+
+    def said(self, name):
+        try:
+            return open(os.path.join(self.out, name)).read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def installs(self):
+        return [line for line in self.said("uv") if line.startswith("tool install")]
+
+    def service(self, label):
+        import plistlib
+        import shlex
+        if sys.platform == "darwin":
+            return plistlib.load(open(f"{self.home}/Library/LaunchAgents/com.decisions.{label}.plist", "rb"))["ProgramArguments"]
+        unit = open(f"{self.home}/.config/systemd/user/decisions-{label}.service").read()
+        return shlex.split(next(line for line in unit.splitlines() if line.startswith("ExecStart="))[len("ExecStart="):])
+
+    def test_installs_a_server_and_upgrades_it_keeping_its_data(self):
+        import tomllib
+        # A machine without a server. Upstream has no releases yet: the head of main it is.
+        new = self.install("--port", str(self.port), "--follow", "tags")
+        self.assertEqual(new.returncode, 0, new.stdout + new.stderr)
+        self.assertIn("has no releases yet", new.stdout)
+        self.assertIn(f"\nGUI: {self.base}\n", new.stdout)
+        self.assertNotIn("admin token", new.stdout)
+        self.assertIn("Settings → Machines → Connect a machine", new.stdout)
+        self.assertIn("It only listens on this machine", new.stdout)
+        self.assertIn(os.path.dirname(self.decide_bin), new.stdout.split("Next:")[1])  # it's not on PATH: say where
+        # The server answers, and knows which commit it is.
+        cfg = self.api("/api/config")
+        self.assertEqual((cfg["commit"]["hash"], cfg["commit"]["subject"]), (self.first, "one"))
+        written = tomllib.load(open(self.conf, "rb"))
+        self.assertEqual(written, {"host": "127.0.0.1", "port": self.port, "db": "~/.local/share/decisions/decisions.db",
+                                   "token": "", "base_url": "", "follow": "tags", "upstream": self.upstream})
+        self.assertEqual(os.stat(self.conf).st_mode & 0o777, 0o600)
+        self.assertEqual(self.service("server"), [self.decide_bin, "serve", "--config", self.conf])
+        self.assertEqual(self.service("server-update"), [self.decide_bin, "server", "update", "--config", self.conf])
+        # What it installed is what its updater would have: there's nothing to update to.
+        check = self.decide("server", "update", "--check")
+        self.assertEqual((check.returncode, check.stdout[:21]), (0, "nothing to update to:"), check.stdout + check.stderr)
+        self.assertEqual(self.decide("create", "--title", "Keep me", "-o", "yes", "-q").stdout.strip(), "D-1")
+        config_was = open(self.conf).read()
+
+        # Run again, with the same flags or none: now there's a release, and main is ahead of it. The server moves to
+        # the release, with its config and data, and a backup from before.
+        second = self.commit("two", markdown_py="# two")
+        self.git("tag", "v0.2.0")
+        self.commit("three", markdown_py="# three")
+        again = self.install("--port", str(self.port))
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn(f"a server is already set up here: keeping {self.conf}", again.stdout)
+        self.assertIn("backed up the database to ", again.stdout)
+        self.assertIn(f"preparing v0.2.0 ({second[:7]}): two", again.stdout)
+        self.assertEqual(self.api("/api/config")["commit"]["hash"], second)
+        self.assertEqual(self.api("/api/decisions/D-1")["title"], "Keep me")
+        self.assertTrue(self.api("/api/events/verify")["ok"])
+        self.assertEqual(open(self.conf).read(), config_was)
+        backups = os.listdir(os.path.dirname(self.db) + "/backups")
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(sqlite3.connect(os.path.join(os.path.dirname(self.db), "backups", backups[0])).execute(
+            "SELECT title FROM decisions").fetchall(), [("Keep me",)])
+        installs = len(self.installs())
+
+        # What the config says can't be changed with a flag: nothing is touched.
+        other = self.install("--network")
+        self.assertEqual(other.returncode, 1)
+        self.assertIn(f"a server is already set up here, with host = 127.0.0.1 in {self.conf}", other.stderr)
+        other = self.install("--follow", "main")
+        self.assertEqual(other.returncode, 1)
+        self.assertIn("with follow = tags", other.stderr)
+
+        # A release that can't upgrade the database isn't installed: the server runs what it ran.
+        self.commit("a table without its migration", store_py='SCHEMA += "CREATE TABLE extra (id TEXT);"')
+        self.git("tag", "v0.3.0")
+        bad = self.install()
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        self.assertIn("can't be upgraded to the schema of this code", bad.stderr)
+        self.assertIn("Nothing was installed or restarted", bad.stderr)
+        self.assertEqual(self.api("/api/config")["commit"]["hash"], second)
+        self.assertEqual(self.api("/api/decisions/D-1")["title"], "Keep me")
+        self.assertEqual(len(self.installs()), installs)
+
+    def test_refuses_before_changing_anything(self):
+        unknown = self.install("--frobnicate")
+        self.assertEqual((unknown.returncode, unknown.stdout), (2, ""))
+        self.assertIn("unknown option: --frobnicate", unknown.stderr)
+        gone = subprocess.run(["sh", os.path.join(ROOT, "install.sh"), "--repo", self.upstream + "-gone"],
+                              cwd=self.tmp, env=self.env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(gone.returncode, 1)
+        self.assertIn("can't reach", gone.stderr)
+        self.assertEqual((self.installs(), self.said("service")[1:], os.listdir(self.home)), ([], [], []))
+        self.assertEqual(subprocess.run(["sh", os.path.join(ROOT, "install.sh"), "--help"], capture_output=True,
+                                        text=True).stdout[:31], "Install the Decisions server on")
+
+
 class SpacesTest(unittest.TestCase):
     """Spaces are hard boundaries: a space's token sees only that space; the admin token sees all."""
 
