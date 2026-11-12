@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import agents
 from .config import load_config
-from .store import FILL_TRIGGERS, PROOF_RESUME_TRIGGERS, event_matches, script_hash
+from .store import FILL_TRIGGERS, PROOF_RESUME_TRIGGERS, SPACE_COLORS, event_matches, script_hash
 from .webhooks import verify
 
 EXIT_TIMEOUT = 124
@@ -1202,18 +1202,23 @@ def cmd_verify(args):
 def cmd_space_list(args):
     for sp in Client().call("GET", "/api/spaces")["spaces"]:
         days = f"{sp['effective_deadline_days']:g}d" + ("" if sp["deadline_days"] is not None else " (server default)")
-        print(f"{sp['name']:<16} {sp['open']:>3} open / {sp['decisions']:<4} deadline {days:<22} "
+        print(f"{sp['name']:<16} {sp['color']:<7} {sp['open']:>3} open / {sp['decisions']:<4} deadline {days:<22} "
               f"{sp['tokens']} token{'' if sp['tokens'] == 1 else 's'}")
 
 
 def cmd_space_create(args):
-    body = {"name": args.name} | ({"deadline_days": args.deadline_days} if args.deadline_days is not None else {})
+    body = {"name": args.name} | ({"deadline_days": args.deadline_days} if args.deadline_days is not None else {}) \
+        | ({"color": args.color} if args.color else {})
     _print(Client().call("POST", "/api/spaces", body))
 
 
 def cmd_space_set(args):
-    days = None if args.deadline_days == "default" else float(args.deadline_days)
-    _print(Client().call("PATCH", f"/api/spaces/{args.name}", {"deadline_days": days}))
+    body = {"color": args.color} if args.color else {}
+    if args.deadline_days is not None:
+        body["deadline_days"] = None if args.deadline_days == "default" else float(args.deadline_days)
+    if not body:
+        sys.exit("error: give --deadline-days and/or --color")
+    _print(Client().call("PATCH", f"/api/spaces/{args.name}", body))
 
 
 def cmd_space_delete(args):
@@ -1517,10 +1522,12 @@ def main(argv=None):
     r = psub.add_parser("create", help="create a space")
     r.add_argument("name", help="lowercase letters, digits, - and _")
     r.add_argument("--deadline-days", type=float, help="default deadline for its decisions (default: the server's)")
+    r.add_argument("--color", choices=SPACE_COLORS, help="its accent in the GUI (default: one no space has yet)")
     r.set_defaults(fn=cmd_space_create)
-    r = psub.add_parser("set", help="change a space's default deadline")
+    r = psub.add_parser("set", help="change a space's default deadline or its color")
     r.add_argument("name")
-    r.add_argument("--deadline-days", required=True, help="days, or `default` for the server's deadline_days")
+    r.add_argument("--deadline-days", help="days, or `default` for the server's deadline_days")
+    r.add_argument("--color", choices=SPACE_COLORS, help="its accent in the GUI")
     r.set_defaults(fn=cmd_space_set)
     r = psub.add_parser("delete", help="delete an empty space; revokes its tokens")
     r.add_argument("name")

@@ -418,7 +418,23 @@ async function loadList() {
 // Spaces only show up in the GUI once there's more than one to tell apart.
 const multiSpace = () => (S.config?.spaces || []).length > 1;
 const inSpace = (d) => !S.space || d.space === S.space;
-const spaceChip = (d) => multiSpace() ? `<span class="chip space" title="Space">${esc(d.space)}</span>` : "";
+// Each space has a color (one of SPACE_COLORS; app.css has its shades under [data-accent]).
+const spaceColor = (name) => (S.config?.spaces || []).find((s) => s.name === name)?.color || "indigo";
+const spaceDot = (name) => `<span class="space-dot" data-accent="${esc(spaceColor(name))}"></span>`;
+const spaceChip = (d) => multiSpace() ? `<span class="chip space" title="Space">${spaceDot(d.space)}${esc(d.space)}</span>` : "";
+
+// The page wears the color of the space in view: the one picked in the sidebar, or with all of them
+// showing, the space of the decision or goal that's open.
+function applyAccent() {
+  const spaces = S.config?.spaces || [];
+  const color = spaceColor(S.space || S.d?.space || S.goal?.space || (spaces.length === 1 ? spaces[0].name : ""));
+  const root = document.documentElement;
+  if (root.dataset.accent === color) return;
+  root.dataset.accent = color;
+  const fill = getComputedStyle(root).getPropertyValue("--accent-fill").trim();
+  const fav = $("link[rel=icon]");
+  if (fill) fav.href = fav.getAttribute("href").replace(/fill='%23[0-9a-f]{6}'/i, `fill='%23${fill.slice(1)}'`);
+}
 
 let loadSeq = 0;
 async function loadDecision(id, { keepSelection = false } = {}) {
@@ -533,13 +549,14 @@ const STATUS_NAMES = { open: "Open", resolved: "Resolved", expired: "Expired", c
 function renderSidebar() {
   const spaces = (S.config?.spaces || []).map((s) => s.name);
   if (S.space && !spaces.includes(S.space)) S.space = "";
+  applyAccent();
   if (!STATUS_NAMES[S.status]) S.status = "open";
   const spaceTabs = $("#space-tabs");
   spaceTabs.hidden = !multiSpace();
   if (multiSpace()) {
     const openIn = (s) => S.list.filter((d) => actionable(d) && (!s || d.space === s)).length;
     setHtml(spaceTabs, ["", ...spaces].map((s) => { const n = openIn(s);
-      return `<button class="tab ${S.space === s ? "active" : ""} ${n ? "has-open" : ""}" data-space="${esc(s)}" aria-pressed="${S.space === s}">${s ? esc(s) : "All spaces"}<span class="n">${n || ""}</span></button>`; }).join(""));
+      return `<button class="tab ${S.space === s ? "active" : ""} ${n ? "has-open" : ""}" data-space="${esc(s)}" ${s ? `data-accent="${esc(spaceColor(s))}"` : ""} aria-pressed="${S.space === s}">${s ? spaceDot(s) + esc(s) : "All spaces"}<span class="n">${n || ""}</span></button>`; }).join(""));
   }
   const list = S.list.filter(inSpace);
   S.counts = { open: 0, resolved: 0, expired: 0, cancelled: 0, all: list.length };
@@ -581,7 +598,7 @@ function renderSidebar() {
     const live = d.option_count - d.excluded_count;
     const meta = [
       `<span class="dl-id" title="${d.excluded_count ? `${live} of ` : ""}${d.option_count} option${d.option_count === 1 ? "" : "s"}${d.excluded_count ? " in play" : ""}">${esc(d.id)}</span>`,
-      multiSpace() && !S.space ? `<span class="dl-space">${esc(d.space)}</span>` : "",
+      multiSpace() && !S.space ? `<span class="dl-space">${spaceDot(d.space)}${esc(d.space)}</span>` : "",
       d.source ? `<span class="dl-source">${esc(d.source)}</span>` : "",
     ].filter(Boolean).join(sep);
     const current = S.d && S.d.id === d.id;
@@ -739,12 +756,15 @@ async function renderSettings() {
 const installCommand = (cfg, token) => `curl -fsSL ${cfg.install_url} | sh` + (token ? ` -s -- --token ${token}` : "");
 
 // Spaces separate contexts (work, private, …). Each machine gets its own token for one space.
+const SPACE_COLORS = ["indigo", "teal", "orange", "pink", "green", "purple", "blue", "slate"];
 function spacesSetting(spaces) {
   return `<section class="setting">
-    <header><h2>Spaces</h2><p>Hard boundaries between contexts. A machine's token sees only its space, so work agents never see private decisions. Use tags for topics within a space.</p></header>
+    <header><h2>Spaces</h2><p>Hard boundaries between contexts. A machine's token sees only its space, so work agents never see private decisions. Each has a color, which the app wears while you're in it. Use tags for topics within a space.</p></header>
     <div>
-      <div class="panel"><div class="table-scroll"><table class="plain"><tr><th>Space</th><th>Decisions</th><th>Deadline</th><th>Machines</th><th><span class="sr-only">Actions</span></th></tr>
+      <div class="panel"><div class="table-scroll"><table class="plain"><tr><th>Space</th><th>Color</th><th>Decisions</th><th>Deadline</th><th>Machines</th><th><span class="sr-only">Actions</span></th></tr>
         ${spaces.map((sp) => `<tr><td><strong>${esc(sp.name)}</strong></td>
+          <td class="nowrap"><span class="swatches" role="group" aria-label="Color of ${esc(sp.name)}">${SPACE_COLORS.map((c) =>
+            `<button class="swatch" data-accent="${c}" data-action="space-color" data-id="${esc(sp.name)}" data-color="${c}" aria-pressed="${sp.color === c}" aria-label="${c}" title="${c[0].toUpperCase()}${c.slice(1)}"></button>`).join("")}</span></td>
           <td class="nowrap">${sp.decisions}${sp.open ? ` <span class="muted">· ${sp.open} open</span>` : ""}</td>
           <td class="nowrap" ${sp.deadline_days === null ? `title="The server's deadline_days"` : ""}>${sp.effective_deadline_days ? `${sp.effective_deadline_days} days` : "None"}${sp.deadline_days === null ? ` <span class="muted">· default</span>` : ""}</td>
           <td>${sp.tokens}</td>
@@ -768,7 +788,7 @@ function machinesSetting(cfg, tokens, resumers) {
     <div>
       <div class="panel">${tokens.length ? `<div class="table-scroll"><table class="plain"><tr><th>Machine</th>${multiSpace() ? "<th>Space</th>" : ""}<th class="nowrap">Last used</th><th>Resumer</th><th><span class="sr-only">Actions</span></th></tr>
         ${tokens.map((t) => `<tr><td><strong>${esc(t.name)}</strong><div class="muted small mono">${esc(t.id)}</div></td>
-          ${multiSpace() ? `<td>${esc(t.space)}</td>` : ""}
+          ${multiSpace() ? `<td class="nowrap">${spaceDot(t.space)}${esc(t.space)}</td>` : ""}
           <td class="nowrap">${t.last_used_at ? `<span title="${esc(fullTime(t.last_used_at))}">${ago(t.last_used_at)}</span>` : `<span class="muted">Never</span>`}${t.rolled_at ? `<div class="muted small">rolled ${ago(t.rolled_at)}</div>` : ""}</td>
           <td>${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span><span class="host">${esc(t.resumer.machine)}</span></span>` : `<span class="muted">Not seen</span>`}</td>
           <td style="text-align:right;width:1%">${machineMenuHtml(t, spaces.length > 1)}</td></tr>`).join("")}</table></div>`
@@ -845,7 +865,7 @@ function webhookTable(hooks) {
 function focusKey(el) {
   if (!el || el === document.body || !el.tagName) return null;
   if (el.id) return `#${CSS.escape(el.id)}`;
-  const attrs = ["data-filter", "data-part", "data-set", "data-action", "data-id", "data-key", "data-value", "data-pick", "data-sort", "data-status", "data-space", "name", "value"]
+  const attrs = ["data-filter", "data-part", "data-set", "data-action", "data-id", "data-key", "data-value", "data-pick", "data-sort", "data-status", "data-space", "data-color", "name", "value"]
     .filter((a) => el.hasAttribute(a));
   if (!attrs.length) return null;
   return el.tagName.toLowerCase() + attrs.map((a) => `[${a}="${CSS.escape(el.getAttribute(a))}"]`).join("");
@@ -2387,6 +2407,9 @@ document.addEventListener("click", async (e) => {
       try { await api("PATCH", `/api/spaces/${id}`, { deadline_days: v === "" ? null : Number(v) }); await spacesChanged(); } catch (err) { fail(err); }
       return;
     }
+    case "space-color":
+      try { await api("PATCH", `/api/spaces/${id}`, { color: a.dataset.color }); await spacesChanged(); } catch (err) { fail(err); }
+      return;
     case "delete-space": {
       if (Number(a.dataset.decisions)) return toast(`${id} still has decisions, so it can't be deleted`, { error: true });
       const n = Number(a.dataset.tokens);

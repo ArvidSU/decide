@@ -28,7 +28,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS spaces (
   name TEXT PRIMARY KEY,
   deadline_days REAL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- One of SPACE_COLORS: the accent the GUI wears for this space, to tell spaces apart.
+  color TEXT NOT NULL DEFAULT 'indigo'
 );
 
 -- A machine's API token: it sees only its space. Only a hash is stored; the token is shown once.
@@ -213,7 +215,10 @@ CREATE TRIGGER IF NOT EXISTS attempts_no_delete BEFORE DELETE ON delivery_attemp
 
 # The version of SCHEMA. Each database records the version it's at in `PRAGMA user_version`.
 # Changing SCHEMA means adding one to this and a migration below.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# The accents a space can have. The GUI has the shades of each (app.css, `[data-accent]`).
+SPACE_COLORS = ("indigo", "teal", "orange", "pink", "green", "purple", "blue", "slate")
 
 # version -> a function taking the connection, that brings a database at the version before to it.
 # `Store` runs the ones a database hasn't had, in order, in one transaction with foreign keys off, and
@@ -221,6 +226,18 @@ SCHEMA_VERSION = 1
 # would commit), carry the data over, and leave the rows of `events` as they are: rewriting them breaks
 # the hash chain. A migration that has been committed is never edited.
 MIGRATIONS: dict = {}
+
+
+def _space_colors(conn):
+    """2: spaces get a color. `default` keeps the indigo everything had; the others each get their own."""
+    conn.execute("ALTER TABLE spaces ADD COLUMN color TEXT NOT NULL DEFAULT 'indigo'")
+    colors = ("teal", "orange", "pink", "green", "purple", "blue", "slate")
+    others = conn.execute("SELECT name FROM spaces WHERE name != 'default' ORDER BY created_at, name").fetchall()
+    for i, (name,) in enumerate(others):
+        conn.execute("UPDATE spaces SET color=? WHERE name=?", (colors[i % len(colors)], name))
+
+
+MIGRATIONS[2] = _space_colors
 
 DEFAULT_WEBHOOK_EVENTS = [
     "decision.resolved",
@@ -1966,7 +1983,7 @@ class Store:
         n = self.conn.execute(
             "SELECT COUNT(*) AS total, COALESCE(SUM(status='open'), 0) AS open FROM decisions WHERE space=?",
             (row["name"],)).fetchone()
-        return {"name": row["name"], "deadline_days": row["deadline_days"],
+        return {"name": row["name"], "color": row["color"], "deadline_days": row["deadline_days"],
                 "effective_deadline_days": self.cfg.deadline_days if row["deadline_days"] is None
                 else row["deadline_days"],
                 "created_at": row["created_at"], "decisions": n["total"], "open": n["open"],
@@ -1985,17 +2002,29 @@ class Store:
             raise ApiError(400, "deadline_days must be >= 0 (0 = no default deadline)")
         return days
 
+    @staticmethod
+    def _color(body: dict):
+        color = body.get("color")
+        if color is not None and color not in SPACE_COLORS:
+            raise ApiError(400, f"color must be one of {', '.join(SPACE_COLORS)}")
+        return color
+
+    def _free_color(self) -> str:
+        """The first color no space has yet, or once they all have one, the one the fewest have."""
+        used = [r[0] for r in self.conn.execute("SELECT color FROM spaces").fetchall()]
+        return min(SPACE_COLORS, key=used.count)
+
     def create_space(self, body: dict, actor: str, scope: Scope = ALL) -> dict:
         self._admin(scope)
         name = _req_str(body, "name")
         if not SPACE_NAME.fullmatch(name):
             raise ApiError(400, "space names are 1-40 lowercase letters, digits, - and _")
-        days = self._deadline_days(body)
+        days, color = self._deadline_days(body), self._color(body)
         with self.tx():
             if self.conn.execute("SELECT 1 FROM spaces WHERE name=?", (name,)).fetchone():
                 raise ApiError(409, f"space {name!r} already exists")
-            self.conn.execute("INSERT INTO spaces (name, deadline_days, created_at) VALUES (?,?,?)",
-                              (name, days, now_iso()))
+            self.conn.execute("INSERT INTO spaces (name, deadline_days, created_at, color) VALUES (?,?,?,?)",
+                              (name, days, now_iso(), color or self._free_color()))
             out = self._space_dict(self._space_row(name))
             self._event(None, "space.created", actor, {"space": out}, name)
             return out
@@ -2004,12 +2033,18 @@ class Store:
         self._admin(scope)
         with self.tx():
             row = self._space_row(name)
+            changes = {}
             if "deadline_days" in body:
                 days = self._deadline_days(body)
                 if days != row["deadline_days"]:
                     self.conn.execute("UPDATE spaces SET deadline_days=? WHERE name=?", (days, name))
-                    self._event(None, "space.updated", actor,
-                                {"changes": {"deadline_days": [row["deadline_days"], days]}}, name)
+                    changes["deadline_days"] = [row["deadline_days"], days]
+            color = self._color(body)
+            if color and color != row["color"]:
+                self.conn.execute("UPDATE spaces SET color=? WHERE name=?", (color, name))
+                changes["color"] = [row["color"], color]
+            if changes:
+                self._event(None, "space.updated", actor, {"changes": changes}, name)
             return self._space_dict(self._space_row(name))
 
     def delete_space(self, name: str, actor: str, scope: Scope = ALL) -> dict:

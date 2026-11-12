@@ -54,6 +54,26 @@
   }
 }
 
+/* A space's color (SPACE_COLORS in store.py). On <html> the whole page wears it; on a chip, tab or dot, just that. */
+[data-accent="indigo"] { --accent: #5451d6; --accent-fill: #5451d6; --accent-soft: #eeeefc; }
+[data-accent="teal"] { --accent: #0c7574; --accent-fill: #0c7574; --accent-soft: #e7f1f1; }
+[data-accent="orange"] { --accent: #ad500c; --accent-fill: #ad500c; --accent-soft: #f7eee7; }
+[data-accent="pink"] { --accent: #c22d78; --accent-fill: #c22d78; --accent-soft: #f9eaf2; }
+[data-accent="green"] { --accent: #2a752e; --accent-fill: #2a752e; --accent-soft: #eaf1ea; }
+[data-accent="purple"] { --accent: #8b3fc9; --accent-fill: #8b3fc9; --accent-soft: #f3ecfa; }
+[data-accent="blue"] { --accent: #1a66c2; --accent-fill: #1a66c2; --accent-soft: #e8f0f9; }
+[data-accent="slate"] { --accent: #55606f; --accent-fill: #55606f; --accent-soft: #eeeff1; }
+@media (prefers-color-scheme: dark) {
+  [data-accent="indigo"] { --accent: #9a98ff; --accent-fill: #5754d9; --accent-soft: #25254a; }
+  [data-accent="teal"] { --accent: #45c8c2; --accent-fill: #12807e; --accent-soft: #173538; }
+  [data-accent="orange"] { --accent: #f29a52; --accent-fill: #b55a14; --accent-soft: #432b1b; }
+  [data-accent="pink"] { --accent: #f57fb6; --accent-fill: #bf3279; --accent-soft: #462037; }
+  [data-accent="green"] { --accent: #6fcf74; --accent-fill: #2f7f34; --accent-soft: #1f3524; }
+  [data-accent="purple"] { --accent: #c492f5; --accent-fill: #8a44c4; --accent-soft: #38254b; }
+  [data-accent="blue"] { --accent: #6db1ff; --accent-fill: #2470cc; --accent-soft: #1c304d; }
+  [data-accent="slate"] { --accent: #a9b4c4; --accent-fill: #5b6675; --accent-soft: #2b2e35; }
+}
+
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
 body {
@@ -99,6 +119,13 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible { outlin
 .tabs.spaces .tab { flex: none; padding: 4px 9px; }
 .tab:not(.has-open) .n:empty { display: none; }
 .dl-space { font-weight: 600; }
+.space-dot { display: inline-block; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.dl-space .space-dot, td .space-dot { margin-right: 5px; }
+.swatches { display: inline-flex; gap: 6px; vertical-align: middle; }
+.swatch { width: 16px; height: 16px; padding: 0; border: 0; border-radius: 50%; background: var(--accent-fill); cursor: pointer; }
+.swatch:hover { transform: scale(1.15); }
+.swatch[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
+.swatch:focus-visible { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--text); }
 .chip.space { color: var(--text); }
 
 /* What's waiting on you, and how soon the next one expires. */
@@ -580,6 +607,8 @@ table.plain { width: 100%; border-collapse: collapse; font-size: 13px; margin-to
   .subtle-list summary, .timeline details summary, .callout details summary { min-height: 44px; display: flex; align-items: center; }
   .afchip { height: 36px; }
   .afchip button { width: 36px; height: 36px; }
+  .swatches { gap: 10px; }
+  .swatch { width: 26px; height: 26px; }
   .omenu-btn, .omenu-btn.icon-only { min-height: 44px; min-width: 44px; justify-content: center; }
   .menu button, .menu a { height: 44px; }
   .dl-meta, .opt-desc, .pick-rule, .block-head .count, .timeline .when, .kv { font-size: 13.5px; }

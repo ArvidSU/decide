@@ -201,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
                 "install_url": self._server_url() + "/install.sh",
                 "default_webhook_events": DEFAULT_WEBHOOK_EVENTS, "cursor": self.store.cursor(),
                 "space": self.scope.default, "admin": self.scope.everything,
-                "spaces": [{"name": sp["name"], "deadline_days": sp["effective_deadline_days"]}
+                "spaces": [{"name": sp["name"], "color": sp["color"], "deadline_days": sp["effective_deadline_days"]}
                            for sp in self.store.list_spaces(self.scope)],
                 "webhook": {"timeout": c.webhook_timeout, "max_attempts": c.webhook_max_attempts,
                             "backoff_base": c.webhook_backoff_base, "backoff_max": c.webhook_backoff_max,

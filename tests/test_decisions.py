@@ -1681,6 +1681,20 @@ class SpacesTest(unittest.TestCase):
         self.assertEqual((sp["deadline_days"], sp["effective_deadline_days"]), (30, 30))
         sp = self.call("PATCH", "/api/spaces/private", {"deadline_days": None}, expect=200)
         self.assertEqual((sp["deadline_days"], sp["effective_deadline_days"]), (None, self.cfg.deadline_days))
+        # Each space gets a color no other has, unless it's given one; the GUI reads them from the config.
+        colors = lambda: {s["name"]: s["color"] for s in self.call("GET", "/api/config")["spaces"]}
+        self.assertEqual(colors()["default"], "indigo")
+        self.assertEqual(len(set(colors().values())), 3)
+        self.call("POST", "/api/spaces", {"name": "home", "color": "mauve"}, expect=400)
+        self.assertEqual(self.call("POST", "/api/spaces", {"name": "home", "color": "indigo"}, expect=201)["color"], "indigo")
+        self.call("PATCH", "/api/spaces/home", {"color": "mauve"}, expect=400)
+        self.call("PATCH", "/api/spaces/home", {"color": "slate"}, token="tok-work", expect=403)
+        before = self.call("GET", "/api/events/verify")["chains"]["home"]["events"]
+        sp = self.call("PATCH", "/api/spaces/home", {"color": "slate", "deadline_days": 2}, expect=200)
+        self.assertEqual((sp["color"], sp["deadline_days"], colors()["home"]), ("slate", 2, "slate"))
+        self.call("PATCH", "/api/spaces/home", {"color": "slate"}, expect=200)  # no change, no event
+        self.assertEqual(self.call("GET", "/api/events/verify")["chains"]["home"]["events"], before + 1)
+        self.call("DELETE", "/api/spaces/home", expect=200)
         self.create("tok-work")
         self.call("DELETE", "/api/spaces/work", expect=409)
         self.call("DELETE", "/api/spaces/default", expect=409)
@@ -1719,10 +1733,11 @@ class SchemaTest(unittest.TestCase):
             conn.close()
 
     def upgraded(self, schema, migration):
-        """Patch the store to a version 2 with `schema` appended to SCHEMA and reached by `migration`."""
+        """Patch the store to a next version with `schema` appended to SCHEMA and reached by `migration`."""
         from unittest import mock
         from decisions import store
-        return mock.patch.multiple(store, SCHEMA=store.SCHEMA + schema, SCHEMA_VERSION=2, MIGRATIONS={2: migration})
+        return mock.patch.multiple(store, SCHEMA=store.SCHEMA + schema, SCHEMA_VERSION=store.SCHEMA_VERSION + 1,
+                                   MIGRATIONS=store.MIGRATIONS | {store.SCHEMA_VERSION + 1: migration})
 
     def test_every_version_after_the_first_has_a_migration(self):
         from decisions.store import MIGRATIONS, SCHEMA_VERSION
@@ -1735,15 +1750,20 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual(self.open().schema_was, SCHEMA_VERSION)
 
     def test_a_database_from_before_versions_is_adopted_with_its_data(self):
-        store = self.open()
-        goal = store.create_goal({"title": "Keep me"}, "me")
-        store.conn.execute("PRAGMA user_version=0")
-        store.conn.close()
-        store = self.open()
-        self.assertEqual((store.schema_was, self.version()), (0, 1))
-        self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
+        from unittest import mock
+        from decisions import store as st
+        # Such a database has the first versioned schema, so this is as if SCHEMA were still at version 1.
+        with mock.patch.multiple(st, SCHEMA_VERSION=1, MIGRATIONS={}):
+            store = self.open()
+            goal = store.create_goal({"title": "Keep me"}, "me")
+            store.conn.execute("PRAGMA user_version=0")
+            store.conn.close()
+            store = self.open()
+            self.assertEqual((store.schema_was, self.version()), (0, 1))
+            self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
 
     def test_a_migration_carries_the_data_over(self):
+        from decisions.store import SCHEMA_VERSION as was
         store = self.open()
         goal = store.create_goal({"title": "Keep me"}, "me")
         store.conn.close()
@@ -1756,16 +1776,37 @@ class SchemaTest(unittest.TestCase):
         with self.upgraded("ALTER TABLE goals ADD COLUMN shouted TEXT NOT NULL DEFAULT '';"
                            "CREATE INDEX goals_by_shouted ON goals(shouted);", migrate):
             store = self.open()
-            self.assertEqual((store.schema_was, self.version()), (1, 2))
+            self.assertEqual((store.schema_was, self.version()), (was, was + 1))
             self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
             self.assertEqual(store.conn.execute("SELECT shouted FROM goals").fetchone()[0], "KEEP ME")
             self.assertTrue(store.verify_chain()["ok"])
             store.create_goal({"title": "Still works"}, "me")
             store.conn.close()
-            self.assertEqual(self.open().schema_was, 2)
+            self.assertEqual(self.open().schema_was, was + 1)
+
+    def test_version_2_gives_spaces_colors(self):
+        from decisions import store as st
+        store = self.open()
+        for name in ("private", "work"):
+            store.create_space({"name": name, "deadline_days": 3}, "me")
+        goal = store.create_goal({"title": "Keep me", "space": "work"}, "me")
+        # Back to version 1: spaces without the column.
+        store.conn.execute("ALTER TABLE spaces DROP COLUMN color")
+        store.conn.execute("PRAGMA user_version=1")
+        store.conn.close()
+        store = self.open()
+        self.assertEqual((store.schema_was, self.version()), (1, st.SCHEMA_VERSION))
+        spaces = {s["name"]: s for s in store.list_spaces()}
+        self.assertEqual({n: s["color"] for n, s in spaces.items()}, {"default": "indigo", "private": "teal", "work": "orange"})
+        self.assertEqual(spaces["work"]["deadline_days"], 3)
+        self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
+        self.assertTrue(store.verify_chain()["ok"])
+        fresh = sqlite3.connect(":memory:")
+        fresh.executescript(st.SCHEMA)
+        self.assertEqual(st.schema_differences(st.schema_structure(store.conn), st.schema_structure(fresh)), [])
 
     def test_a_migration_that_misses_the_schema_changes_nothing(self):
-        from decisions.store import SchemaError
+        from decisions.store import SCHEMA_VERSION, SchemaError
         store = self.open()
         goal = store.create_goal({"title": "Keep me"}, "me")
         store.conn.close()
@@ -1777,7 +1818,7 @@ class SchemaTest(unittest.TestCase):
         with self.upgraded("ALTER TABLE goals ADD COLUMN shouted TEXT NOT NULL DEFAULT '';", migrate):
             with self.assertRaisesRegex(SchemaError, "goals"):
                 self.open()
-        self.assertEqual(self.version(), 1)
+        self.assertEqual(self.version(), SCHEMA_VERSION)
         store = self.open()
         self.assertEqual(store.get_goal(goal["id"])["title"], "Keep me")
 
