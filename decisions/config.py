@@ -6,6 +6,9 @@ import socket
 import tomllib
 from dataclasses import dataclass, fields
 
+# What `decide` keeps between runs on this machine: logs, the resumer's cursor, what the server updater did.
+STATE_DIR = os.path.expanduser(os.environ.get("DECISIONS_STATE_DIR", "~/.local/state/decisions"))
+
 
 @dataclass
 class Config:
@@ -28,6 +31,13 @@ class Config:
     # Where "Report upstream" on a piece of feedback opens a prefilled issue, for the app's developers.
     # Empty = no such button.
     feedback_issues_url: str = "https://github.com/ArvidSU/decide/issues/new"
+    # What `decide server update` upgrades this server to: the git repository its code comes from, and which
+    # of its commits to follow. `tags` = its newest release (a tag like v1.2.0), `main` = the head of main.
+    upstream: str = "https://github.com/ArvidSU/decide"
+    follow: str = "tags"
+    # How long (seconds) `decide server update` gives the restarted server to answer with the new code before it
+    # puts the previous code back.
+    update_timeout: float = 120
     webhook_timeout: float = 10
     # Give up after this many failed attempts (0 = retry forever).
     webhook_max_attempts: int = 25

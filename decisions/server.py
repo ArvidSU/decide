@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__, dist
+from . import __version__, dist, update
 from .config import Config, is_loopback
 from .markdown import decision_markdown
 from .store import ALL, DEFAULT_WEBHOOK_EVENTS, SCHEMA_VERSION, ApiError, Scope, Store
@@ -202,6 +202,8 @@ class Handler(BaseHTTPRequestHandler):
                 "build": dist.fingerprint(),
                 # The git commit that code is, for people: null when it came without one.
                 "commit": dist.commit(),
+                # What `decide server update` last did on this machine: null when it never ran here.
+                "update": update.summary(),
                 "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
                 "feedback_issues_url": c.feedback_issues_url or None,

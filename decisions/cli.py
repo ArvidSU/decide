@@ -26,7 +26,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import agents
-from .config import load_config
+from .config import STATE_DIR, load_config
 from .store import FILL_TRIGGERS, PROOF_RESUME_TRIGGERS, SPACE_COLORS, event_matches, script_hash
 from .webhooks import verify
 
@@ -842,9 +842,9 @@ def cmd_feedback_set(args):
 
 # ---------------------------------------------------------------------------- resumer
 
-STATE_DIR = os.path.expanduser(os.environ.get("DECISIONS_STATE_DIR", "~/.local/state/decisions"))
 RESUMER_SERVICE = "com.decisions.resumer"
 SERVER_SERVICE = "com.decisions.server"
+UPDATE_SERVICE = "com.decisions.server-update"
 # A `decide goal wait` that disconnected this recently (seconds) is taken to have heard the result itself.
 LIVE_WAIT_GRACE = 5
 
@@ -1314,12 +1314,18 @@ def _bootout(label: str):
         time.sleep(0.2)
 
 
-def _install_service(label: str, argv: list[str], env: dict, log: str):
+def _timer_path(label):
+    return _unit_path(label).removesuffix(".service") + ".timer"
+
+
+def _install_service(label: str, argv: list[str], env: dict, log: str, every: int | None = None):
+    """Keep `argv` running in the background. With `every`, run it every that many seconds instead."""
     import plistlib
     import shlex
     if sys.platform == "darwin":
         plist = {"Label": label, "ProgramArguments": argv, "EnvironmentVariables": env, "RunAtLoad": True,
-                 "KeepAlive": True, "StandardOutPath": log, "StandardErrorPath": log}
+                 "StandardOutPath": log, "StandardErrorPath": log} | (
+                     {"StartInterval": every} if every else {"KeepAlive": True})
         os.makedirs(os.path.dirname(_plist_path(label)), exist_ok=True)
         _bootout(label)
         with open(_plist_path(label), "wb") as fh:
@@ -1330,14 +1336,21 @@ def _install_service(label: str, argv: list[str], env: dict, log: str):
             "[Unit]", f"Description=decisions ({label})", "After=network-online.target", "",
             "[Service]", f"ExecStart={shlex.join(argv)}",
             *(f"Environment={shlex.quote(f'{k}={v}')}" for k, v in env.items()),
-            "Restart=always", "RestartSec=5", f"StandardOutput=append:{log}", f"StandardError=append:{log}", "",
-            "[Install]", "WantedBy=default.target", ""])
+            *(["Type=oneshot"] if every else ["Restart=always", "RestartSec=5"]),
+            f"StandardOutput=append:{log}", f"StandardError=append:{log}", "",
+            *([] if every else ["[Install]", "WantedBy=default.target", ""])])
         os.makedirs(os.path.dirname(_unit_path(label)), exist_ok=True)
         with open(_unit_path(label), "w") as fh:
             fh.write(unit)
+        if every:
+            with open(_timer_path(label), "w") as fh:
+                fh.write("\n".join(["[Unit]", f"Description=decisions ({label})", "",
+                                    "[Timer]", "OnActiveSec=10", f"OnUnitActiveSec={every}", "",
+                                    "[Install]", "WantedBy=timers.target", ""]))
+        started = os.path.basename(_timer_path(label)) if every else _unit_name(label)
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "--user", "enable", "--now", _unit_name(label)], check=True)
-        subprocess.run(["systemctl", "--user", "restart", _unit_name(label)], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", started], check=True)
+        subprocess.run(["systemctl", "--user", "restart", started], check=True)
         print("note: to keep it running while you're logged out: sudo loginctl enable-linger $USER")
     else:
         sys.exit(f"error: don't know how to install a background service on {sys.platform}; "
@@ -1349,10 +1362,35 @@ def _uninstall_service(label: str):
     if sys.platform == "darwin":
         _bootout(label)
     elif sys.platform.startswith("linux"):
-        subprocess.run(["systemctl", "--user", "disable", "--now", _unit_name(label)], capture_output=True)
-    if os.path.exists(_service_path(label)):
-        os.remove(_service_path(label))
+        for unit in (os.path.basename(_timer_path(label)), _unit_name(label)):
+            subprocess.run(["systemctl", "--user", "disable", "--now", unit], capture_output=True)
+    for path in (_service_path(label), _timer_path(label)):
+        if os.path.exists(path):
+            os.remove(path)
     print(f"uninstalled {label}")
+
+
+def _service_argv(label: str) -> list[str] | None:
+    """The command an installed service runs. None when it isn't installed."""
+    import plistlib
+    import shlex
+    try:
+        with open(_service_path(label), "rb") as fh:
+            if sys.platform == "darwin":
+                return plistlib.load(fh).get("ProgramArguments") or []
+            return next((shlex.split(line[len("ExecStart="):]) for line in fh.read().decode().splitlines()
+                         if line.startswith("ExecStart=")), [])
+    except FileNotFoundError:
+        return None
+
+
+def _restart_service(label: str):
+    cmd = (["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"] if sys.platform == "darwin"
+           else ["systemctl", "--user", "restart", _unit_name(label)])
+    done = subprocess.run(cmd, capture_output=True, text=True)
+    if done.returncode:
+        from .update import Failed
+        raise Failed(f"`{' '.join(cmd)}` failed: {(done.stderr or done.stdout).strip() or done.returncode}.")
 
 
 def _service_env(*tools: str | None) -> dict:
@@ -1419,6 +1457,8 @@ def cmd_server_install(args):
     from other machines, and a token is generated if the config doesn't have one."""
     from .config import is_loopback
     decide = _which_decide()
+    if args.auto_update:
+        _refuse_checkout()
     path = os.path.expanduser(args.config or os.environ.get("DECISIONS_CONFIG") or "~/.config/decisions/config.toml")
     cfg = load_config(path if os.path.exists(path) else None, {"host": args.host, "port": args.port, "db": args.db})
     if not os.path.exists(path):
@@ -1439,6 +1479,8 @@ def cmd_server_install(args):
     os.makedirs(STATE_DIR, exist_ok=True)
     _install_service(SERVER_SERVICE, [decide, "serve", "--config", path], _service_env(decide),
                      os.path.join(STATE_DIR, "server.log"))
+    if args.auto_update:
+        _install_updater(decide, cfg, ["--config", path], args.every)
     url = cfg.public_url
     print(f"\nGUI: {url}" + (f"/#token={cfg.token}" if cfg.token else "") + "  (this link holds the admin token)")
     if not is_loopback(cfg.host):
@@ -1447,7 +1489,62 @@ def cmd_server_install(args):
 
 
 def cmd_server_uninstall(args):
+    if os.path.exists(_service_path(UPDATE_SERVICE)):
+        _uninstall_service(UPDATE_SERVICE)
     _uninstall_service(SERVER_SERVICE)
+
+
+def _refuse_checkout():
+    from . import update
+    if root := update.checkout():
+        sys.exit(f"error: this decide runs from a checkout ({root}), which is its developer's to update: pull "
+                 "there and restart the server. `decide server update` is for a decide installed from upstream, "
+                 "e.g. `uv tool install git+https://github.com/ArvidSU/decide`.")
+
+
+def _install_updater(decide: str, cfg, flags: list[str], every: int):
+    """The background job that runs `decide server update` every `every` seconds."""
+    import shutil
+    _install_service(UPDATE_SERVICE, [decide, "server", "update", *flags],
+                     _service_env(decide, *(shutil.which(tool) for tool in ("uv", "pipx", "git"))),
+                     os.path.join(STATE_DIR, "server-update.log"), every=every)
+    print(f"every {every} s, this machine updates its server to "
+          f"{'the newest release' if cfg.follow == 'tags' else 'the head of main'} of {cfg.upstream}")
+
+
+def cmd_server_update(args):
+    """Upgrade this machine's server to upstream's code, keeping its data (decisions/update.py)."""
+    from . import update
+    if args.uninstall:
+        return _uninstall_service(UPDATE_SERVICE)
+    service = _service_argv(SERVER_SERVICE)
+    path = args.config or (service[service.index("--config") + 1] if service and "--config" in service[:-1]
+                           else os.environ.get("DECISIONS_CONFIG") or "~/.config/decisions/config.toml")
+    path = os.path.expanduser(path)
+    cfg = load_config(path if os.path.exists(path) else None, {"follow": args.follow, "upstream": args.upstream})
+    if cfg.follow not in update.FOLLOW:
+        sys.exit(f"error: follow = {cfg.follow!r}; it's one of: {', '.join(update.FOLLOW)}")
+    if args.check:
+        try:
+            state, detail, _ = update.look(cfg)
+        except update.Failed as exc:
+            sys.exit(f"error: can't look at {cfg.upstream}: {exc}")
+        print({"behind": "update available", "current": "up to date", "waiting": "nothing to update to"}[state]
+              + ": " + detail)
+        sys.exit(1 if state == "behind" else 0)
+    _refuse_checkout()
+    if service is None:
+        sys.exit(f"error: no server is installed as a service on this machine ({_service_path(SERVER_SERVICE)}): "
+                 "`decide server install` first. A Docker server is upgraded by rebuilding its image.")
+    if args.install:
+        flags = [x for flag, value in (("--follow", args.follow), ("--upstream", args.upstream),
+                                       ("--config", args.config)) if value for x in (flag, value)]
+        return _install_updater(service[0], cfg, flags, args.every)
+    status = update.update(cfg, lambda: _restart_service(SERVER_SERVICE), retry=args.retry)
+    stamp = "" if sys.stdout.isatty() else time.strftime("%Y-%m-%dT%H:%M:%S%z ")
+    print(f"{stamp}{status['state']}: {status['detail']}", flush=True)
+    if status["state"] in ("stuck", "error"):
+        sys.exit(1)
 
 
 def cmd_ack(args):
@@ -1586,9 +1683,29 @@ def _main(argv):
     r.add_argument("--db")
     r.add_argument("--base-url", help="URL other machines use, if not http://<hostname>:<port>")
     r.add_argument("--config", help="config file (default ~/.config/decisions/config.toml; created if missing)")
+    r.add_argument("--auto-update", action="store_true",
+                   help="also keep it on upstream's code: run `decide server update` regularly")
+    r.add_argument("--every", type=int, default=3600, metavar="SECONDS",
+                   help="with --auto-update: how often (default 3600)")
     r.set_defaults(fn=cmd_server_install)
-    r = ssub.add_parser("uninstall", help="stop and remove the service")
+    r = ssub.add_parser("uninstall", help="stop and remove the service, and its updater")
     r.set_defaults(fn=cmd_server_uninstall)
+    r = ssub.add_parser("update", help="upgrade the server installed here to upstream's code, keeping its data: "
+                                       "back the database up, upgrade a copy of the backup with the new code, and "
+                                       "only then install it and restart")
+    r.add_argument("--check", action="store_true", help="only say whether there's an update (exit 1 if so)")
+    r.add_argument("--follow", choices=["tags", "main"],
+                   help="what to run: upstream's newest release tag, or the head of its main branch "
+                        "(default: `follow` in the server's config, normally tags)")
+    r.add_argument("--upstream", metavar="URL", help="the git repository to follow (default: `upstream` in the "
+                                                     "server's config)")
+    r.add_argument("--config", help="the server's config file (default: the one its service uses)")
+    r.add_argument("--retry", action="store_true", help="try now, also a version that failed before")
+    r.add_argument("--install", action="store_true", help="do this regularly: install a background job "
+                                                          "(launchd / systemd --user timer)")
+    r.add_argument("--every", type=int, default=3600, metavar="SECONDS", help="with --install: how often (default 3600)")
+    r.add_argument("--uninstall", action="store_true", help="remove that job")
+    r.set_defaults(fn=cmd_server_update)
 
     s = sub.add_parser("connect", help="point this machine's decide (and resumer) at a server")
     s.add_argument("url", help="e.g. http://homeserver:8787")

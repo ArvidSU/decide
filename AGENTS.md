@@ -16,7 +16,7 @@ The API, CLI flags and GUI can still change freely, because the server, `decide`
 
 A change to behaviour usually touches several of these. Update all that apply in the same change:
 
-- `decisions/store.py` (data and events), `decisions/server.py` (REST), `decisions/cli.py` (`decide`, resumer)
+- `decisions/store.py` (data and events), `decisions/server.py` (REST), `decisions/cli.py` (`decide`, resumer), `decisions/update.py` (`decide server update`)
 - `decisions/static/` (GUI: vanilla JS + CSS, no build step)
 - `decisions/skill/SKILL.md`: what agents are told to do
 - `README.md`: concepts, API table, config
