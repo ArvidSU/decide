@@ -276,7 +276,8 @@ PROOF_TIMEOUT = 3600
 PROOF_GRACE = 300
 MAX_PROOF_SCRIPT = 256 * 1024
 GENESIS = "0" * 64
-DEFAULT_SPACE = "default"
+# The space a new database starts with. After that it's a space like any other.
+FIRST_SPACE = "default"
 SPACE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
 TOKEN_PREFIX = "dk_"
 # A token's last_used_at is written at most this often (seconds), not on every request.
@@ -287,8 +288,8 @@ LAST_USED_EVERY = 60
 class Scope:
     """What a caller may see: one space (a machine token), or (spaces=None) all of them (the admin)."""
     spaces: frozenset[str] | None = None
-    # Where the caller's new decisions and webhooks go.
-    default: str = DEFAULT_SPACE
+    # Where the caller's new decisions and webhooks go. None (the admin): the only space, or the one they name.
+    default: str | None = None
     # The machine token used, if any.
     token: str | None = None
 
@@ -557,7 +558,8 @@ class Store:
         # The schema version the database was at: None = it's new, 0 = from before versions were recorded.
         self.schema_was = self._upgrade()
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("INSERT OR IGNORE INTO spaces (name, created_at) VALUES (?, ?)", (DEFAULT_SPACE, now_iso()))
+        if self.schema_was is None:
+            self.conn.execute("INSERT INTO spaces (name, created_at) VALUES (?, ?)", (FIRST_SPACE, now_iso()))
         # Last heartbeat per machine from resumer daemons (`decide resumer run`). In memory only.
         self.resumers: dict[str, dict] = {}
         # Who is long-polling which decision right now: (decision, actor, types) -> info. In memory only.
@@ -645,8 +647,14 @@ class Store:
         return row
 
     def _space_for(self, scope: Scope, requested) -> str:
-        """The space a caller's new decision or webhook goes to: the one asked for, else their default."""
+        """The space a caller's new decision, goal, webhook or token goes to: the one asked for, else their
+        token's, else the only one there is. With several, the admin has to say which."""
         space = _opt_type({"space": requested}, "space", str) or scope.default
+        if not space:
+            names = [r[0] for r in self.conn.execute("SELECT name FROM spaces ORDER BY name").fetchall()]
+            if len(names) != 1:
+                raise ApiError(400, f"say which space: {', '.join(names)}")
+            space = names[0]
         if not scope.allows(space) or not self.q1("SELECT 1 FROM spaces WHERE name=?", space):
             raise ApiError(404, f"no space {space!r}")
         return space
@@ -2048,14 +2056,17 @@ class Store:
             return self._space_dict(self._space_row(name))
 
     def delete_space(self, name: str, actor: str, scope: Scope = ALL) -> dict:
-        """Only an empty space can go. Its machine tokens are revoked; its event chain stays."""
+        """Only an empty space can go, and not the last one. Its machine tokens are revoked; its event
+        chain stays."""
         self._admin(scope)
         with self.tx():
             self._space_row(name)
-            if name == DEFAULT_SPACE:
-                raise ApiError(409, "the default space can't be deleted")
+            if self.conn.execute("SELECT COUNT(*) FROM spaces").fetchone()[0] == 1:
+                raise ApiError(409, "the only space can't be deleted")
             if self.conn.execute("SELECT 1 FROM decisions WHERE space=?", (name,)).fetchone():
                 raise ApiError(409, f"space {name!r} still has decisions")
+            if self.conn.execute("SELECT 1 FROM goals WHERE space=?", (name,)).fetchone():
+                raise ApiError(409, f"space {name!r} still has goals")
             if self.conn.execute("SELECT 1 FROM subscriptions WHERE space=?", (name,)).fetchone():
                 raise ApiError(409, f"space {name!r} still has webhooks")
             revoked = [self._token_dict(r) for r in
@@ -2089,11 +2100,10 @@ class Store:
         """A token for one machine in one space. The secret is in this response only."""
         self._admin(scope)
         name = _req_str(body, "name")[:60]
-        space = _opt_type(body, "space", str) or DEFAULT_SPACE
         secret = TOKEN_PREFIX + secrets.token_urlsafe(24)
         tid = "tok_" + secrets.token_hex(6)
         with self.tx():
-            self._space_row(space)
+            space = self._space_for(scope, body.get("space"))
             self.conn.execute("INSERT INTO tokens (id, name, space, hash, created_at) VALUES (?,?,?,?,?)",
                               (tid, name, space, self._hash_token(secret), now_iso()))
             out = self._token_dict(self._token_row(tid))

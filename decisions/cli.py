@@ -1242,7 +1242,7 @@ def _print_new_token(c: Client, t: dict):
 
 def cmd_token_create(args):
     c = Client()
-    _print_new_token(c, c.call("POST", "/api/tokens", {"name": args.name, "space": args.space}))
+    _print_new_token(c, c.call("POST", "/api/tokens", {"name": args.name} | ({"space": args.space} if args.space else {})))
 
 
 def cmd_token_roll(args):
@@ -1539,7 +1539,7 @@ def main(argv=None):
     r.set_defaults(fn=cmd_token_list)
     r = tsub.add_parser("create", help="create a token for a machine and print the command that sets it up")
     r.add_argument("name", help="which machine, e.g. laptop")
-    r.add_argument("--space", default="default")
+    r.add_argument("--space", help="the space it sees (needed once there are several)")
     r.set_defaults(fn=cmd_token_create)
     r = tsub.add_parser("roll", help="replace a token's secret; the old one stops working at once")
     r.add_argument("id")

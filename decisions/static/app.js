@@ -770,7 +770,7 @@ function spacesSetting(spaces) {
           <td>${sp.tokens}</td>
           <td style="text-align:right;white-space:nowrap">
             <button class="btn small ghost" data-action="space-deadline" data-id="${esc(sp.name)}" data-days="${sp.deadline_days ?? ""}">Deadline</button>
-            ${sp.name !== "default" ? `<button class="btn small ghost danger" data-action="delete-space" data-id="${esc(sp.name)}" data-decisions="${sp.decisions}" data-tokens="${sp.tokens}">Delete</button>` : ""}</td></tr>`).join("")}</table></div>
+            ${spaces.length > 1 ? `<button class="btn small ghost danger" data-action="delete-space" data-id="${esc(sp.name)}" data-decisions="${sp.decisions}" data-tokens="${sp.tokens}">Delete</button>` : ""}</td></tr>`).join("")}</table></div>
         <form class="form-row" id="add-space" style="margin-top:14px">
           <label class="lf grow">New space<input class="input" name="name" required pattern="[a-z0-9][a-z0-9_\-]{0,39}" placeholder="e.g. work" title="Lowercase letters, digits, - and _"></label>
           <label class="lf">Deadline (days)<input class="input" name="days" type="number" min="0" step="any" placeholder="${esc(S.config.deadline_days)}" style="width:130px"></label>
@@ -795,7 +795,7 @@ function machinesSetting(cfg, tokens, resumers) {
         : `<div class="muted small">No machine tokens yet. Connect one below.</div>`}
         <form class="form-row" id="add-token" style="margin-top:14px">
           <label class="lf grow">Connect a machine<input class="input" name="name" required maxlength="60" placeholder="e.g. work laptop"></label>
-          <label class="lf">Space<select class="input" name="space">${spaces.map((n) => `<option ${n === (S.space || "default") ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
+          <label class="lf">Space<select class="input" name="space">${spaces.map((n) => `<option ${n === S.space ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
           <button class="btn primary">${icon("plus", 15)}Create token</button></form>
       </div>
       ${others.length ? `<div class="status-row"><span class="muted">Other resumers</span>
@@ -2079,13 +2079,18 @@ function goalGoneHtml(d) {
 }
 
 async function newGoal(serves) {
+  // With all spaces showing there's no saying where a new top-level goal belongs, so ask.
+  let space = S.goal?.space || S.space || S.config.space;
+  if (!space) space = await ask({ title: "New goal", body: "<p>Which space is it in?</p>", field: "Space",
+    choices: S.config.spaces.map((s) => ({ value: s.name, label: s.name })), ok: "Next" });
+  if (!space) return;
   const title = await ask({ title: serves ? `New subgoal of ${serves}` : "New goal", body: `<p>${serves ? "A step on the way to it" : "Start with the vision, then the goals that serve it"}. Describe what success looks like on its page.</p>`,
     field: "Goal", placeholder: serves ? "e.g. Onboard a customer in a day" : "e.g. Be the default tool for EU utilities", ok: "Create goal" });
   if (!title) return;
   try {
     // A subgoal starts with its parent's topics (business, tech, …); edit them on its page.
     const tags = serves ? S.goals.find((x) => x.id === serves)?.tags || [] : [];
-    const g = await api("POST", "/api/goals", { title, serves: serves ? [serves] : [], tags, space: S.goal?.space || S.space || S.config.space });
+    const g = await api("POST", "/api/goals", { title, serves: serves ? [serves] : [], tags, space });
     await loadList();
     navigate(`/g/${g.id}`);
   } catch (err) { fail(err); }

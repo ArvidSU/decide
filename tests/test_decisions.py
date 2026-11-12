@@ -1494,7 +1494,12 @@ class SpacesTest(unittest.TestCase):
         self.call("POST", "/api/decisions", {"title": "x", "space": "private"}, token="tok-work", expect=404)
         self.call("POST", "/api/decisions", {"title": "x", "space": "nope"}, token="admin", expect=404)
         self.assertEqual(self.create("admin", space="private")["space"], "private")
-        self.assertEqual(self.create("admin")["space"], "default")
+        # With several spaces the admin has to say which.
+        err = self.call("POST", "/api/decisions", {"title": "x", "options": ["a", "b"]}, token="admin", expect=400)
+        self.assertIn("default, private, work", err["error"])
+        self.call("POST", "/api/goals", {"title": "x"}, token="admin", expect=400)
+        self.call("POST", "/api/tokens", {"name": "laptop"}, token="admin", expect=400)
+        self.assertIsNone(self.call("GET", "/api/config")["space"])
         cfg = self.call("GET", "/api/config", token="tok-work")
         self.assertEqual((cfg["space"], [s["name"] for s in cfg["spaces"]]), ("work", ["work"]))
         self.assertEqual([s["name"] for s in self.call("GET", "/api/config")["spaces"]],
@@ -1697,11 +1702,26 @@ class SpacesTest(unittest.TestCase):
         self.call("DELETE", "/api/spaces/home", expect=200)
         self.create("tok-work")
         self.call("DELETE", "/api/spaces/work", expect=409)
-        self.call("DELETE", "/api/spaces/default", expect=409)
         gone = self.call("DELETE", "/api/spaces/private", expect=200)
         self.assertEqual(gone["revoked_tokens"], [self.tokens["id-private"]])
         self.call("GET", "/api/decisions", token="tok-private", expect=401)
         self.assertEqual([s["name"] for s in self.call("GET", "/api/spaces")["spaces"]], ["default", "work"])
+        # The space a database starts with goes like any other, once it's empty.
+        goal = self.call("POST", "/api/goals", {"title": "x", "space": "default"}, expect=201)
+        self.assertIn("goals", self.call("DELETE", "/api/spaces/default", expect=409)["error"])
+        self.store.conn.execute("DELETE FROM goals WHERE id=?", (goal["id"],))
+        self.call("DELETE", "/api/spaces/default", expect=200)
+        # With one space left, the admin's new decisions and tokens go there, and it can't be deleted.
+        self.assertEqual(self.call("GET", "/api/config")["space"], "work")
+        self.assertEqual(self.create("admin")["space"], "work")
+        self.assertEqual(self.call("POST", "/api/tokens", {"name": "laptop"}, expect=201)["space"], "work")
+        self.assertIn("only space", self.call("DELETE", "/api/spaces/work", expect=409)["error"])
+        self.assertTrue(self.call("GET", "/api/events/verify")["chains"]["default"]["ok"])
+        # And it doesn't come back when the database is opened again.
+        from decisions.store import Store
+        again = Store(self.cfg)
+        self.assertEqual([s["name"] for s in again.list_spaces()], ["work"])
+        again.conn.close()
         # Its chain stays verifiable after it's gone.
         self.assertTrue(self.call("GET", "/api/events/verify")["chains"]["private"]["ok"])
 

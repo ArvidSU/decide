@@ -196,13 +196,16 @@ class Handler(BaseHTTPRequestHandler):
     @route("GET", "/api/config")
     def config(self):
         c = self.cfg
+        spaces = self.store.list_spaces(self.scope)
         return {"base_url": c.public_url, "owner": c.owner, "auth": bool(c.token), "version": __version__,
                 "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
                 "default_webhook_events": DEFAULT_WEBHOOK_EVENTS, "cursor": self.store.cursor(),
-                "space": self.scope.default, "admin": self.scope.everything,
+                # Where this caller's new decisions go when they don't say: null = they have to say.
+                "space": self.scope.default or (spaces[0]["name"] if len(spaces) == 1 else None),
+                "admin": self.scope.everything,
                 "spaces": [{"name": sp["name"], "color": sp["color"], "deadline_days": sp["effective_deadline_days"]}
-                           for sp in self.store.list_spaces(self.scope)],
+                           for sp in spaces],
                 "webhook": {"timeout": c.webhook_timeout, "max_attempts": c.webhook_max_attempts,
                             "backoff_base": c.webhook_backoff_base, "backoff_max": c.webhook_backoff_max,
                             "require_ack": c.webhook_require_ack, "refire_interval": c.webhook_refire_interval}}
