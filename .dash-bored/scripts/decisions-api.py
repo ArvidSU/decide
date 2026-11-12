@@ -243,9 +243,10 @@ def feedback_list():
                       "state": {"open": "pending", "reported": "running", "done": "success", "dismissed": "closed"}[f["status"]],
                       "tags": [f["status"], f["kind"]], "url": f["url"],
                       "prompt": ("Feedback %s on the Decisions app (\"%s\", a %s) is open. Read it with `decide feedback "
-                                 "get %s`, find what it's about in this repo, and fix it or say why not. When done, "
-                                 "`decide feedback set %s --status done --note \"what you did\"`."
-                                 % (f["id"], f["title"], f["kind"], f["id"], f["id"]))})
+                                 "get %s`, find what it's about in this repo, and fix it or say why not. If you fix it, add "
+                                 "a line for %s to decisions/fixed.txt in the same commit: the server marks it done "
+                                 "when it runs that commit. If not, `decide feedback set %s --status dismissed --note "
+                                 "\"why\"`." % (f["id"], f["title"], f["kind"], f["id"], f["uid"], f["id"]))})
     # Open first, so what's left to look at leads.
     items.sort(key=lambda x: x["tags"][0] != "open")
     out(items)

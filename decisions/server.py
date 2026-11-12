@@ -540,6 +540,8 @@ def serve(cfg: Config, insecure: bool = False):
     print(f"decisions: GUI + API on {cfg.public_url}  (db: {cfg.db_path}, auth: {'on' if cfg.token else 'off'})")
     if store.schema_was not in (None, SCHEMA_VERSION):
         print(f"  upgraded the database from schema version {store.schema_was or 'unrecorded'} to {SCHEMA_VERSION}")
+    for f in store.close_fixed_feedback(dist.fixed(), dist.commit()):
+        print(f"  closed {f['id']} ({f['uid']}), which this code addresses: {f['title']}")
     if cfg.host in ("0.0.0.0", "::", "") and not cfg.base_url:
         print(f"  warning: base_url is not set, so decision links use {cfg.public_url}. "
               "Set base_url (DECISIONS_BASE_URL) to the URL other machines use.")

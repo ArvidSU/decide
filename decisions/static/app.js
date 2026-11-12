@@ -705,9 +705,10 @@ const FEEDBACK_KINDS = { bug: "Bug", improvement: "Improvement", feature: "Featu
 const FEEDBACK_STATUS = { open: "Open", reported: "Reported", done: "Done", dismissed: "Dismissed", all: "All" };
 
 // The issue "Report upstream" opens for the app's developers: what the agent wrote, as you edited it, and
-// which version it's about. Nothing about the session, the machine or the space goes along.
+// which version it's about. Nothing about the session, the machine or the space goes along. Its unique id does:
+// the commit that addresses it lists that in decisions/fixed.txt, and this server then marks the feedback done.
 function upstreamIssueUrl(f, { title, body }) {
-  const about = `\n\n---\n${FEEDBACK_KINDS[f.kind] || f.kind} from an agent (${f.session?.agent || f.actor}) using Decisions ${S.config.version}, build ${S.config.build}.`;
+  const about = `\n\n---\n${FEEDBACK_KINDS[f.kind] || f.kind} from an agent (${f.session?.agent || f.actor}) using Decisions ${S.config.version}, build ${S.config.build}.\nFeedback id: \`${f.uid}\`. List it in \`decisions/fixed.txt\` in the commit that addresses this, and the reporter's server closes it when it runs that code.`;
   const q = new URLSearchParams({ title, body: body.slice(0, 6000) + about, labels: f.kind === "bug" ? "bug" : "enhancement" });
   return `${S.config.feedback_issues_url}?${q}`;
 }
@@ -729,7 +730,7 @@ function renderFeedback() {
       `<button class="tagb ${S.feedbackStatus === st ? "on" : ""}" data-action="feedback-filter" data-status="${st}" aria-pressed="${S.feedbackStatus === st}">${label} ${count(st)}</button>`).join("")}</div>
     <div class="fb-list">${shown.map((f) => `<article class="panel fb ${esc(f.status)}" id="${esc(f.id)}">
       <header><span class="badge fb-kind ${esc(f.kind)}">${esc(FEEDBACK_KINDS[f.kind] || f.kind)}</span><h2><span class="fb-id">${esc(f.id)}</span> ${esc(f.title)}</h2></header>
-      <div class="fb-meta">${from(f)} · <span title="${esc(fullTime(f.created_at))}">${ago(f.created_at)}</span>${multiSpace() && !S.space ? ` · ${spaceDot(f.space)}${esc(f.space)}` : ""}</div>
+      <div class="fb-meta">${from(f)} · <span title="${esc(fullTime(f.created_at))}">${ago(f.created_at)}</span> · <code title="Its id on every server. Code that addresses it lists this in decisions/fixed.txt, and a server that runs that code marks it done.">${esc(f.uid)}</code>${multiSpace() && !S.space ? ` · ${spaceDot(f.space)}${esc(f.space)}` : ""}</div>
       ${f.body ? `<div class="context">${md(f.body)}</div>` : ""}
       ${f.status !== "open" ? `<div class="fb-outcome"><span class="badge ${f.status === "done" ? "ok" : f.status === "reported" ? "pending" : ""}">${esc(FEEDBACK_STATUS[f.status])}</span> <span title="${esc(fullTime(f.updated_at))}">${ago(f.updated_at)}</span>${f.status_note ? `<div class="context">${md(f.status_note)}</div>` : ""}</div>` : ""}
       <div class="fb-actions">${f.status === "open"

@@ -1,0 +1,7 @@
+# The feedback this code addresses, one piece per line: its unique id, then what was done about it.
+#
+#   fb-1a2b3c4d5e  decide wait says why when a dependency cancels the decision
+#
+# The id is the fb-… of `decide feedback get F-12`, and of an issue that was reported upstream. A server that
+# has open or reported feedback with one of these ids marks it done when it starts with this code. Add the
+# line in the commit that settles the feedback, and never remove one: servers upgrade at their own pace.
