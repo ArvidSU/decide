@@ -1605,6 +1605,48 @@ class RemoteTest(unittest.TestCase):
                              cwd=self.tmp, env=os.environ | {"PYTHONPATH": target}, check=True)
         self.assertEqual(ver.stdout.strip(), "decide 0.1.0")
 
+    def test_a_server_closes_the_feedback_its_code_addresses(self):
+        """Feedback has an id that's the same everywhere (uid). Code lists the ones it addresses in
+        decisions/fixed.txt, and a server that starts with that code marks its own done, once."""
+        import io
+        from pathlib import Path
+        from unittest import mock
+        from decisions import dist
+        store = self.store
+        sent = [store.send_feedback({"kind": "bug", "title": f"bug {n}"}, "agent") for n in range(1, 6)]
+        uid = {f["id"]: f["uid"] for f in sent}
+        self.assertEqual(len(set(uid.values())), 5)
+        self.assertRegex(uid["F-1"], r"^fb-[0-9a-f]{10}$")
+        req = urllib.request.Request(f"{self.base}/api/feedback/{uid['F-2']}", headers={"Authorization": "Bearer s3cret"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            self.assertEqual(json.loads(r.read())["id"], "F-2")
+        store.update_feedback(uid["F-3"].upper(), {"status": "dismissed", "note": "not ours"}, "me")
+        store.update_feedback("F-4", {"status": "reported"}, "me")
+        self.assertEqual(dist.fixed(), {})  # nothing yet, and the comments in the file aren't ids
+        self.assertIn("decisions/fixed.txt", zipfile.ZipFile(io.BytesIO(dist.wheel()[1])).namelist())
+        listed = os.path.join(self.tmp, "fixed.txt")
+        with open(listed, "w") as fh:
+            fh.write(f"# what this code addresses\n\n{uid['F-1']}  errors say what to do #1\n{uid['F-3']} x\n"
+                     f"{uid['F-4'].upper()}\nfb-0000000000 someone else's\n")
+        with mock.patch.object(dist, "FIXED", Path(listed)):
+            fixed = dist.fixed()
+        self.assertEqual(fixed, {uid["F-1"]: "errors say what to do #1", uid["F-3"]: "x", uid["F-4"]: "",
+                                 "fb-0000000000": "someone else's"})
+        commit = {"hash": "abc1234" + "0" * 33, "date": "2026-01-02T03:04:05+00:00", "subject": "s", "dirty": False}
+        self.assertEqual([f["id"] for f in store.close_fixed_feedback(fixed, commit)], ["F-1", "F-4"])
+        got = {f["id"]: (f["status"], f["status_note"]) for f in store.list_feedback("all")["feedback"]}
+        self.assertEqual(got, {"F-1": ("done", "Addressed by the update to abc1234: errors say what to do #1"),
+                               "F-2": ("open", ""), "F-3": ("dismissed", "not ours"),
+                               "F-4": ("done", "Addressed by the update to abc1234."), "F-5": ("open", "")})
+        events = [e for e in store.events(types=["feedback.updated"]) if e["actor"] == "update"]
+        self.assertEqual([(e["data"]["id"], e["data"]["status"]) for e in events],
+                         [("F-1", ["open", "done"]), ("F-4", ["reported", "done"])])
+        # Opened again by a person: the next start leaves it open.
+        store.update_feedback("F-1", {"status": "open", "note": "still happens"}, "me")
+        self.assertEqual(store.close_fixed_feedback(fixed, None), [])
+        self.assertEqual(store.get_feedback("F-1")["status"], "open")
+        self.assertTrue(store.verify_chain()["ok"])
+
     def test_a_machine_follows_the_servers_build(self):
         """The server names its build; a resumer installed from it reruns the installer when that changes, and
         restarts once the code on disk isn't what it runs. `sh` is a stand-in: nothing is really installed."""
@@ -2333,6 +2375,7 @@ class SchemaTest(unittest.TestCase):
         store.feedback_ask({"status": "started", "session_id": "s1", "agent": "codex", "machine": "m",
                             "about": ["D-1"]}, "resumer")
         store.conn.execute("ALTER TABLE feedback_asks DROP COLUMN bumps")
+        self.before_uids(store.conn)
         store.conn.execute("PRAGMA user_version=3")
         store.conn.close()
         store = self.open()
@@ -2343,6 +2386,37 @@ class SchemaTest(unittest.TestCase):
         fresh = sqlite3.connect(":memory:")
         fresh.executescript(st.SCHEMA)
         self.assertEqual(st.schema_differences(st.schema_structure(store.conn), st.schema_structure(fresh)), [])
+
+    @staticmethod
+    def before_uids(conn):
+        """Take a database back to before version 5."""
+        conn.execute("DROP INDEX feedback_by_uid")
+        conn.execute("ALTER TABLE feedback DROP COLUMN uid")
+
+    def test_version_5_gives_the_feedback_there_is_unique_ids(self):
+        from decisions import store as st
+        store = self.open()
+        sent = [store.send_feedback({"kind": "bug", "title": f"bug {n}", "body": "text"}, "agent") for n in (1, 2, 3)]
+        store.update_feedback("F-2", {"status": "dismissed", "note": "not ours"}, "me")
+        self.before_uids(store.conn)
+        store.conn.execute("PRAGMA user_version=4")
+        store.conn.close()
+        store = self.open()
+        self.assertEqual((store.schema_was, self.version()), (4, st.SCHEMA_VERSION))
+        kept = store.list_feedback("all")["feedback"][::-1]
+        self.assertEqual([(f["id"], f["title"], f["body"], f["status"], f["status_note"], f["created_at"]) for f in kept],
+                         [(f["id"], f["title"], "text", "dismissed" if f["id"] == "F-2" else "open",
+                           "not ours" if f["id"] == "F-2" else "", f["created_at"]) for f in sent])
+        uids = [f["uid"] for f in kept]
+        self.assertEqual(len(set(uids)), 3)
+        for uid in uids:
+            self.assertRegex(uid, r"^fb-[0-9a-f]{10}$")
+        self.assertEqual(store.get_feedback(uids[2])["id"], "F-3")
+        self.assertTrue(store.verify_chain()["ok"])
+        fresh = sqlite3.connect(":memory:")
+        fresh.executescript(st.SCHEMA)
+        self.assertEqual(st.schema_differences(st.schema_structure(store.conn), st.schema_structure(fresh)), [])
+        self.assertEqual(store.send_feedback({"kind": "bug", "title": "x"}, "agent")["id"], "F-4")
 
     def test_a_migration_that_misses_the_schema_changes_nothing(self):
         from decisions.store import SCHEMA_VERSION, SchemaError

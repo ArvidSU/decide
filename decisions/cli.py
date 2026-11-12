@@ -826,6 +826,7 @@ def cmd_feedback_get(args):
     if args.json:
         return _print(f)
     print(_feedback_line(f))
+    print(f"  {f['uid']}: its id on every server. Code that addresses it lists this in decisions/fixed.txt.")
     if f["session"]:
         print(f"  from {f['session']['agent']} session {f['session']['session_id']} on {f['session']['machine']}")
     if f["status_note"]:
@@ -1783,11 +1784,11 @@ def _main(argv):
     r.add_argument("--json", action="store_true")
     r.set_defaults(fn=cmd_feedback_list)
     r = fsub.add_parser("get", help="show one piece of feedback")
-    r.add_argument("id")
+    r.add_argument("id", help="F-12, or its unique id (fb-…)")
     r.add_argument("--json", action="store_true")
     r.set_defaults(fn=cmd_feedback_get)
     r = fsub.add_parser("set", help="mark feedback reported upstream, done or dismissed, or open again")
-    r.add_argument("id")
+    r.add_argument("id", help="F-12, or its unique id (fb-…)")
     r.add_argument("--status", required=True, choices=["open", "reported", "done", "dismissed"])
     r.add_argument("--note", help="what was done about it, or why not")
     r.set_defaults(fn=cmd_feedback_set)

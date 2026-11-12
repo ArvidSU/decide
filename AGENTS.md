@@ -29,3 +29,4 @@ A change to behaviour usually touches several of these. Update all that apply in
 - Every mutation appends to the hash-chained event log. Never update or delete events.
 - Run the tests with `python3 -m unittest discover tests`.
 - Always commit your changes.
+- A commit that settles a piece of feedback adds a line to `decisions/fixed.txt`: the feedback's unique id (the `fb-…` that `decide feedback get F-12` prints, or that an upstream issue names), then what was done. Every server that has that feedback marks it done when it starts with the commit, so don't also `decide feedback set … --status done`. Lines are never removed. `F-12` only means something on one server: don't use it in the file. Feedback you decide not to act on is dismissed by hand, with a note saying why.

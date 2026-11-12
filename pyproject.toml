@@ -18,4 +18,4 @@ build-backend = "setuptools.build_meta"
 packages = ["decisions"]
 
 [tool.setuptools.package-data]
-decisions = ["static/*", "skill/*", ".commit"]
+decisions = ["static/*", "skill/*", "fixed.txt", ".commit"]

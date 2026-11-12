@@ -23,6 +23,8 @@ SKILL = PACKAGE / "skill" / "SKILL.md"
 # The commit this code is, where the code is without its git history: written by whatever shipped it (the
 # deploy, a server's wheel). Its name starts with a dot, so it isn't part of the build.
 COMMIT = PACKAGE / ".commit"
+# The feedback this code addresses, by uid. Part of the package, so it reaches every server however it's installed.
+FIXED = PACKAGE / "fixed.txt"
 
 
 def _package_files() -> list[Path]:
@@ -90,6 +92,17 @@ def installed_build() -> str | None:
         return distribution("decisions").version.partition("+")[2] or None
     except PackageNotFoundError:
         return None
+
+
+def fixed() -> dict[str, str]:
+    """{uid: what was done about it} for the feedback this code says it addresses (FIXED). A server closes
+    the feedback it has with one of those uids when it starts (Store.close_fixed_feedback)."""
+    out = {}
+    for line in FIXED.read_text().splitlines() if FIXED.is_file() else []:
+        uid, _, what = line.strip().partition(" ")
+        if uid and not uid.startswith("#"):
+            out[uid.lower()] = what.strip()
+    return out
 
 
 def commit() -> dict | None:

@@ -216,6 +216,7 @@ CREATE TRIGGER IF NOT EXISTS attempts_no_delete BEFORE DELETE ON delivery_attemp
 
 -- What agents tell the user about Decisions itself: bugs, improvements, feature requests.
 -- `session` is the agent session it came from (as a decision's `resume`), if it came from one.
+-- `id` (F-4) counts on this server; `uid` (fb-…) names it everywhere, so the code that addresses it can say so.
 CREATE TABLE IF NOT EXISTS feedback (
   id TEXT PRIMARY KEY,
   num INTEGER NOT NULL UNIQUE,
@@ -228,9 +229,11 @@ CREATE TABLE IF NOT EXISTS feedback (
   status TEXT NOT NULL DEFAULT 'open',
   status_note TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  uid TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS feedback_by_space ON feedback(space, status);
+CREATE UNIQUE INDEX IF NOT EXISTS feedback_by_uid ON feedback(uid);
 
 -- Sessions a resumer asked for feedback, once everything they waited on had happened. Each is asked once.
 CREATE TABLE IF NOT EXISTS feedback_asks (
@@ -249,7 +252,7 @@ CREATE TABLE IF NOT EXISTS feedback_asks (
 
 # The version of SCHEMA. Each database records the version it's at in `PRAGMA user_version`.
 # Changing SCHEMA means adding one to this and a migration below.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # The accents a space can have. The GUI has the shades of each (app.css, `[data-accent]`).
 SPACE_COLORS = ("indigo", "teal", "orange", "pink", "green", "purple", "blue", "slate")
@@ -300,6 +303,17 @@ def _bumps(conn):
 
 MIGRATIONS[4] = _bumps
 
+
+def _feedback_uids(conn):
+    """5: feedback gets an id that's unique across servers. The feedback there is gets one each."""
+    conn.execute("ALTER TABLE feedback ADD COLUMN uid TEXT NOT NULL DEFAULT ''")
+    for (fid,) in conn.execute("SELECT id FROM feedback").fetchall():
+        conn.execute("UPDATE feedback SET uid=? WHERE id=?", (new_feedback_uid(), fid))
+    conn.execute("CREATE UNIQUE INDEX feedback_by_uid ON feedback(uid)")
+
+
+MIGRATIONS[5] = _feedback_uids
+
 DEFAULT_WEBHOOK_EVENTS = [
     "decision.resolved",
     "decision.reopened",
@@ -339,6 +353,8 @@ PROOF_GRACE = 300
 FEEDBACK_KINDS = ("bug", "improvement", "feature")
 # `reported`: passed on to the app's developers, and waiting on them.
 FEEDBACK_STATUSES = ("open", "reported", "done", "dismissed")
+# Who closes feedback that the code a server starts with says it addresses (decisions/fixed.txt).
+FIXED_ACTOR = "update"
 # A resumer's report on asking a session for feedback, and the event each is logged as.
 FEEDBACK_ASK_EVENTS = {"started": "feedback.asked", "finished": "feedback.ask_finished",
                        "failed": "feedback.ask_failed"}
@@ -475,6 +491,11 @@ def norm_goal_id(raw: str) -> str:
     if not m:
         raise ApiError(404, f"no goal {raw!r}")
     return f"G-{int(m.group(1))}"
+
+
+def new_feedback_uid() -> str:
+    """An id for one piece of feedback that no other server gives out: fb- and 10 hex digits."""
+    return "fb-" + secrets.token_hex(5)
 
 
 def norm_feedback_id(raw: str) -> str:
@@ -2061,8 +2082,17 @@ class Store:
             raise ApiError(404, f"no feedback {fid}")
         return row
 
+    def _feedback_id(self, raw: str) -> str:
+        """The id (F-4) of the feedback named by its id or by its uid (fb-…)."""
+        if re.fullmatch(r"(?i)\s*fb-[0-9a-f]+\s*", str(raw)):
+            row = self.conn.execute("SELECT id FROM feedback WHERE uid=?", (str(raw).strip().lower(),)).fetchone()
+            if not row:
+                raise ApiError(404, f"no feedback {raw!r}")
+            return row["id"]
+        return norm_feedback_id(raw)
+
     def _feedback_dict(self, row) -> dict:
-        return {"id": row["id"], "space": row["space"], "kind": row["kind"], "title": row["title"],
+        return {"id": row["id"], "uid": row["uid"], "space": row["space"], "kind": row["kind"], "title": row["title"],
                 "body": row["body"], "actor": row["actor"],
                 "session": json.loads(row["session"]) if row["session"] else None, "status": row["status"],
                 "status_note": row["status_note"], "created_at": row["created_at"], "updated_at": row["updated_at"],
@@ -2088,9 +2118,10 @@ class Store:
             num = self.conn.execute("SELECT COALESCE(MAX(num), 0) + 1 FROM feedback").fetchone()[0]
             ts = now_iso()
             self.conn.execute(
-                "INSERT INTO feedback (id, num, space, kind, title, body, actor, session, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (f"F-{num}", num, space, kind, title, text, actor, canonical(session) if session else None, ts, ts))
+                "INSERT INTO feedback (id, uid, num, space, kind, title, body, actor, session, created_at, "
+                "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (f"F-{num}", new_feedback_uid(), num, space, kind, title, text, actor,
+                 canonical(session) if session else None, ts, ts))
             out = self._feedback_dict(self._feedback_row(f"F-{num}"))
             self._event(None, "feedback.sent", actor, {"feedback": out}, space)
             return out
@@ -2110,16 +2141,16 @@ class Store:
 
     def get_feedback(self, raw_id: str, scope: Scope = ALL) -> dict:
         with self.lock:
-            return self._feedback_dict(self._feedback_row(norm_feedback_id(raw_id), scope))
+            return self._feedback_dict(self._feedback_row(self._feedback_id(raw_id), scope))
 
     def update_feedback(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
         """Mark feedback reported upstream, done or dismissed (or open again), with a note on why."""
-        fid = norm_feedback_id(raw_id)
         status = body.get("status")
         if status not in FEEDBACK_STATUSES:
             raise ApiError(400, f"status must be one of {', '.join(FEEDBACK_STATUSES)}")
         note = _opt_type(body, "note", str, "")
         with self.tx():
+            fid = self._feedback_id(raw_id)
             row = self._feedback_row(fid, scope)
             if status != row["status"] or note != row["status_note"]:
                 self.conn.execute("UPDATE feedback SET status=?, status_note=?, updated_at=? WHERE id=?",
@@ -2127,6 +2158,26 @@ class Store:
                 self._event(None, "feedback.updated", actor,
                             {"id": fid, "status": [row["status"], status], "note": note}, row["space"])
             return self._feedback_dict(self._feedback_row(fid))
+
+    def close_fixed_feedback(self, fixed: dict[str, str], commit: dict | None = None) -> list[dict]:
+        """Mark done the feedback here that the code this server runs says it addresses: `fixed` is
+        {uid: what was done} (decisions/fixed.txt), `commit` the commit that code is. Only feedback that's open
+        or reported, and each piece once: one that was opened again afterwards stays open. Returns what it closed."""
+        closed = []
+        with self.tx():
+            before = {json.loads(r["data"])["id"] for r in self.conn.execute(
+                "SELECT data FROM events WHERE type='feedback.updated' AND actor=?", (FIXED_ACTOR,))}
+            for row in self.conn.execute("SELECT * FROM feedback WHERE status IN ('open', 'reported') ORDER BY num").fetchall():
+                if row["uid"] not in fixed or row["id"] in before:
+                    continue
+                note = "Addressed by the update" + (f" to {commit['hash'][:7]}" if commit else "") + (
+                    f": {fixed[row['uid']]}" if fixed[row["uid"]] else ".")
+                self.conn.execute("UPDATE feedback SET status='done', status_note=?, updated_at=? WHERE id=?",
+                                  (note, now_iso(), row["id"]))
+                self._event(None, "feedback.updated", FIXED_ACTOR,
+                            {"id": row["id"], "status": [row["status"], "done"], "note": note}, row["space"])
+                closed.append(self._feedback_dict(self._feedback_row(row["id"])))
+        return closed
 
     def feedback_due(self, machine: str, scope: Scope = ALL) -> list[dict]:
         """Sessions on `machine` to ask for feedback now: everything they waited on has happened (each decision
