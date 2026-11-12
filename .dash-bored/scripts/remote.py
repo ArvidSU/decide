@@ -207,12 +207,16 @@ class Local(Remote):
 
 
 def ship(remote):
-    """HEAD, as the server's directory. Returns the fingerprint of the code shipped."""
+    """HEAD, as the server's directory, with the commit it is in decisions/.commit (decisions/dist.py commit()):
+    the image has no git history to ask. Returns the fingerprint of the code shipped."""
     tmp = tempfile.mkdtemp(prefix="decisions-deploy-")
     try:
         archive = subprocess.run(["git", "-C", ROOT, "archive", "HEAD"], capture_output=True, check=True).stdout
         subprocess.run(["tar", "-x", "-C", tmp], input=archive, check=True)
         shipped = fingerprint(tmp)
+        sha, date, subject = git("log", "-1", "--format=%H%x00%cI%x00%s").rstrip("\n").split("\0", 2)
+        with open(os.path.join(tmp, "decisions", ".commit"), "w") as fh:
+            json.dump({"hash": sha, "date": date, "subject": subject}, fh)
         cmd = ["rsync", "-az", "--delete", "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10"]
         cmd += ["--exclude=" + k for k in KEEP]
         dest = "%s:%s/" % (remote.host, remote.path) if remote.host else remote.path + "/"

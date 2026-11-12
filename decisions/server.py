@@ -200,6 +200,8 @@ class Handler(BaseHTTPRequestHandler):
         return {"base_url": c.public_url, "owner": c.owner, "auth": bool(c.token), "version": __version__,
                 # Names the code this server runs. A machine whose decide has another build updates itself.
                 "build": dist.fingerprint(),
+                # The git commit that code is, for people: null when it came without one.
+                "commit": dist.commit(),
                 "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
                 "feedback_issues_url": c.feedback_issues_url or None,

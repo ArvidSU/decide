@@ -778,6 +778,13 @@ async function renderSettings() {
     <div class="settings-head"><h1 class="d-title">Settings</h1><p>Spaces, the machines that use them, where events go, and the audit log.</p></div>
     ${cfg.admin ? spacesSetting(spaces.spaces) + machinesSetting(cfg, tokens.tokens, resumers) : sharedTokenSetting(cfg, resumers)}
     <section class="setting">
+      <header><h2>Version</h2><p>The code this server runs. Machines whose <code>decide</code> was installed from it follow it by themselves.</p></header>
+      <dl class="kv" style="font-size:13.5px;gap:8px 24px;margin:0">
+        <dt>Commit</dt><dd>${cfg.commit ? `${commitHtml(cfg.commit)}<div class="muted small">committed <span title="${esc(fullTime(cfg.commit.date))}">${ago(cfg.commit.date)}</span></div>` : `<span class="muted">Not recorded: this code came without its git history</span>`}</dd>
+        <dt>Build</dt><dd><code>${esc(cfg.build)}</code> <span class="muted">· Decisions ${esc(cfg.version)}</span></dd>
+      </dl>
+    </section>
+    <section class="setting">
       <header><h2>Global webhooks</h2><p>Receive events for every decision${S.space ? ` in <strong>${esc(S.space)}</strong>` : ""}, e.g. to notify Slack or sync another app. Agents set per-decision webhooks themselves.</p></header>
       <div>
         <div class="panel">${webhookTable(global)}</div>
@@ -868,6 +875,17 @@ function spacesSetting(spaces) {
   </section>`;
 }
 
+// A commit, as its short hash and message. `dirty`: a checkout with changes to the code that aren't committed.
+const commitHtml = (c) => `<span class="commit" title="${esc(c.subject)}\n${esc(c.hash)}${c.dirty ? ", plus uncommitted changes" : ""}"><code>${esc(c.hash.slice(0, 7))}${c.dirty ? "+" : ""}</code> <span class="subject">${esc(c.subject)}</span></span>`;
+
+// The commit a machine's decide is, under its name. A machine keeps the commit it was installed from while later
+// ones leave the code as it is (the build), so it can name an older commit than the server and still run its code.
+const machineCommit = (cfg, r) => !r.commit ? ""
+  : `<div class="muted small machine-commit">${commitHtml(r.commit)}${r.build === cfg.build && cfg.commit && r.commit.hash !== cfg.commit.hash ? `<span class="nowrap">· same code as the server</span>` : ""}</div>`;
+
+// The same where there's a line per machine and no room for the message: it's the hash's title.
+const commitChip = (r) => r.commit ? ` <code title="${esc(r.commit.subject)}">${esc(r.commit.hash.slice(0, 7))}${r.commit.dirty ? "+" : ""}</code>` : "";
+
 // A resumer on other code than the server's. One installed from the server updates itself within a minute of
 // the server changing, so this shows for longer only on a machine that runs decide from a checkout, or can't update.
 const behind = (cfg, r) => r.online && r.build && r.build !== cfg.build
@@ -885,7 +903,7 @@ function machinesSetting(cfg, tokens, resumers) {
         ${tokens.map((t) => `<tr><td><strong>${esc(t.name)}</strong><div class="muted small mono">${esc(t.id)}</div></td>
           ${multiSpace() ? `<td class="nowrap">${spaceDot(t.space)}${esc(t.space)}</td>` : ""}
           <td class="nowrap">${t.last_used_at ? `<span title="${esc(fullTime(t.last_used_at))}">${ago(t.last_used_at)}</span>` : `<span class="muted">Never</span>`}${t.rolled_at ? `<div class="muted small">rolled ${ago(t.rolled_at)}</div>` : ""}</td>
-          <td>${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span><span class="host">${esc(t.resumer.machine)}</span>${behind(cfg, t.resumer)}</span>` : `<span class="muted">Not seen</span>`}</td>
+          <td>${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span><span class="host">${esc(t.resumer.machine)}</span>${behind(cfg, t.resumer)}</span>${machineCommit(cfg, t.resumer)}` : `<span class="muted">Not seen</span>`}</td>
           <td><label class="check-label small nowrap" title="Ask this machine's sessions for feedback on Decisions once everything they waited on has happened"><input type="checkbox" data-action="token-feedback" data-id="${t.id}" data-name="${esc(t.name)}" ${t.feedback ? "checked" : ""}>Ask sessions</label></td>
           <td style="text-align:right;width:1%">${machineMenuHtml(t, spaces.length > 1)}</td></tr>`).join("")}</table></div>`
         : `<div class="muted small">No machine tokens yet. Connect one below.</div>`}
@@ -895,7 +913,7 @@ function machinesSetting(cfg, tokens, resumers) {
           <button class="btn primary">${icon("plus", 15)}Create token</button></form>
       </div>
       ${others.length ? `<div class="status-row"><span class="muted">Other resumers</span>
-        ${others.map((r) => `<span class="item"><span class="live ${r.online ? "on" : "off"}"></span>${esc(r.machine)} <span class="muted">${r.token ? "" : "admin token · "}${r.online ? "online" : "offline"}</span>${behind(cfg, r)}${r.online ? "" : `<button class="icon-btn" data-action="forget-resumer" data-id="${esc(r.machine)}" title="Remove ${esc(r.machine)} from this list" aria-label="Remove ${esc(r.machine)}">${icon("x", 13)}</button>`}</span>`).join("")}</div>` : ""}
+        ${others.map((r) => `<span class="item"><span class="live ${r.online ? "on" : "off"}"></span>${esc(r.machine)} <span class="muted">${r.token ? "" : "admin token · "}${r.online ? "online" : "offline"}</span>${commitChip(r)}${behind(cfg, r)}${r.online ? "" : `<button class="icon-btn" data-action="forget-resumer" data-id="${esc(r.machine)}" title="Remove ${esc(r.machine)} from this list" aria-label="Remove ${esc(r.machine)}">${icon("x", 13)}</button>`}</span>`).join("")}</div>` : ""}
       ${cfg.auth ? `<div class="form-row" style="margin-top:12px"><button class="btn small ghost" data-action="copy-gui-link">${icon("link", 14)}Copy GUI sign-in link</button></div>
         <p class="hint">The sign-in link holds the admin token, which sees and manages every space. Give machines their own token instead.</p>`
         : `<p class="hint">Auth is off: anyone who can reach the server sees everything, and a token only picks the space new decisions go to. To accept other machines safely, run the server with <code>host = "0.0.0.0"</code> and a <code>token</code>; <code>decide server install --host 0.0.0.0</code> sets both.</p>`}
@@ -923,7 +941,7 @@ function sharedTokenSetting(cfg, resumers) {
       <pre class="install-cmd">${esc(installCommand(cfg, cfg.auth && S.token))}</pre>
       <div class="form-row" style="margin-top:10px"><button class="btn small" data-action="copy-install">${icon("copy", 14)}Copy command</button></div>
       <div class="status-row"><span class="muted">Resumers</span>
-        ${resumers.map((r) => `<span class="item"><span class="live ${r.online ? "on" : "off"}"></span>${esc(r.machine)} <span class="muted">${r.online ? "online" : "offline"}</span></span>`).join("") || `<span class="muted">None seen since the server started</span>`}</div>
+        ${resumers.map((r) => `<span class="item"><span class="live ${r.online ? "on" : "off"}"></span>${esc(r.machine)} <span class="muted">${r.online ? "online" : "offline"}</span>${commitChip(r)}</span>`).join("") || `<span class="muted">None seen since the server started</span>`}</div>
     </div>
   </section>`;
 }

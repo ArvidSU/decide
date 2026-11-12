@@ -2017,6 +2017,7 @@ class Store:
         with self.lock:
             self.resumers[machine] = {"name": actor, "pid": body.get("pid"), "machine": machine,
                                       "command": body.get("command"), "build": body.get("build"),
+                                      "commit": body.get("commit") if isinstance(body.get("commit"), dict) else None,
                                       "last_seen": time.time(),
                                       "token": scope.token}
             asks = bool(scope.token and self.conn.execute(
@@ -2026,7 +2027,8 @@ class Store:
 
     def _resumer_dict(self, r: dict) -> dict:
         return {"online": time.time() - r["last_seen"] < 90, "name": r["name"], "pid": r["pid"],
-                "machine": r["machine"], "command": r["command"], "build": r["build"], "token": r["token"],
+                "machine": r["machine"], "command": r["command"], "build": r["build"], "commit": r["commit"],
+                "token": r["token"],
                 "last_seen": datetime.fromtimestamp(r["last_seen"], timezone.utc).isoformat(timespec="seconds")
                 .replace("+00:00", "Z")}
 
