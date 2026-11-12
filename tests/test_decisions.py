@@ -1905,6 +1905,325 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(local.run("exit 3", check=False), 3)
 
 
+class ServerUpdateTest(unittest.TestCase):
+    """`decide server update`: a server installed as a service follows upstream. Upstream is a real git repository
+    of this code, and the server a real one, installed from a wheel into its own environment. Two stand-ins: `uv`,
+    which unpacks the wheel it's told to install, and launchctl / systemctl, which restarts the server."""
+
+    def setUp(self):
+        import shutil
+        import socket
+        from unittest import mock
+        from decisions import cli
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        path = lambda *parts: os.path.join(self.tmp, *parts)
+        self.upstream, self.out, self.db, self.conf = path("upstream"), path("out"), path("data", "decisions.db"), path("srv.toml")
+        bin_dir, home, venv = path("bin"), path("home"), path("venv")
+        for d in (self.out, bin_dir, home, os.path.dirname(self.db)):
+            os.makedirs(d)
+        # Upstream: this code, as its first commit.
+        shutil.copytree(os.path.join(ROOT, "decisions"), os.path.join(self.upstream, "decisions"),
+                        ignore=shutil.ignore_patterns("__pycache__", ".commit"))
+        for name in ("LICENSE", "pyproject.toml"):
+            shutil.copy(os.path.join(ROOT, name), self.upstream)
+        self.git("init", "-q", "-b", "main")
+        self.first = self.commit("one")
+        # The server's environment, with that commit installed from a wheel, the way uv would have.
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", venv], check=True)
+        self.python = os.path.join(venv, "bin", "python")
+        self.site = subprocess.run([self.python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                                   capture_output=True, text=True, check=True).stdout.strip()
+        open(os.path.join(venv, "uv-receipt.toml"), "w").close()
+        wheel = subprocess.run([sys.executable, "-c", "from decisions import dist; name, data = dist.wheel(); "
+                                "open(name, 'wb').write(data); print(name)"], cwd=self.upstream, capture_output=True,
+                               text=True, check=True, env=os.environ | {"PYTHONPATH": self.upstream}).stdout.strip()
+        zipfile.ZipFile(os.path.join(self.upstream, wheel)).extractall(self.site)
+        os.remove(os.path.join(self.upstream, wheel))
+        with open(os.path.join(bin_dir, "uv"), "w") as fh:
+            fh.write(f"#!{sys.executable}\nimport glob, os, shutil, sys, zipfile\n"
+                     "open(os.environ['OUT'] + '/uv', 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                     "site = os.environ['SITE']\n"
+                     "for old in [site + '/decisions'] + glob.glob(site + '/decisions-*.dist-info'):\n"
+                     "    shutil.rmtree(old)\n"
+                     "zipfile.ZipFile(sys.argv[-1]).extractall(site)\n")
+        restart = ('#!/bin/sh\necho "$*" >> "$OUT/service"\ncase "$*" in *kickstart*|*restart*)\n'
+                   '  if [ -f "$OUT/pid" ]; then kill "$(cat "$OUT/pid")" 2>/dev/null\n'
+                   '    while kill -0 "$(cat "$OUT/pid")" 2>/dev/null; do sleep 0.1; done; fi\n'
+                   '  "$PYTHON" -m decisions serve --config "$CONF" >> "$OUT/server.log" 2>&1 </dev/null &\n'
+                   '  echo $! > "$OUT/pid" ;;\nesac\n')
+        for name, text in (("launchctl", restart), ("systemctl", restart)):
+            with open(os.path.join(bin_dir, name), "w") as fh:
+                fh.write(text)
+        for name in os.listdir(bin_dir):
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self.base = f"http://127.0.0.1:{port}"
+        with open(self.conf, "w") as fh:
+            fh.write(f"port = {port}\ndb = {json.dumps(self.db)}\nupstream = {json.dumps(self.upstream)}\n"
+                     "update_timeout = 20\n")
+        self.env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH" and not k.startswith("DECISIONS_")} | {
+            "HOME": home, "PATH": bin_dir + os.pathsep + os.environ["PATH"], "OUT": self.out, "SITE": self.site,
+            "PYTHON": self.python, "CONF": self.conf, "DECISIONS_STATE_DIR": path("state"), "DECISIONS_URL": self.base,
+            "DECISIONS_CLIENT_CONFIG": path("client.toml")}
+        # The service `decide server install` would have installed. Nothing is loaded: the service manager is mocked.
+        with mock.patch.dict(os.environ, {"HOME": home}), mock.patch.object(cli.subprocess, "run"), \
+                mock.patch("builtins.print"):
+            cli._install_service(cli.SERVER_SERVICE, [self.python, "-m", "decisions", "serve", "--config", self.conf],
+                                 {}, path("server.log"))
+            self.service = cli._service_path(cli.SERVER_SERVICE)
+        subprocess.run(["launchctl", "kickstart"], env=self.env, cwd=self.tmp, check=True)
+        self.addCleanup(self.stop)
+        self.first_build = self.wait_for_server()
+        self.assertEqual(self.decide("create", "--title", "Keep me", "-o", "yes", "-q").stdout.strip(), "D-1")
+
+    def stop(self):
+        import signal
+        try:
+            os.kill(int(open(os.path.join(self.out, "pid")).read()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=self.upstream,
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, message, **appended):
+        """A commit on upstream's main that appends text to files (`markdown_py="# x"`: decisions/markdown.py).
+        Returns its hash."""
+        for name, text in appended.items():
+            file = name.replace("_", ".") if name == "README_md" else os.path.join("decisions", name.replace("_", "."))
+            with open(os.path.join(self.upstream, file), "a") as fh:
+                fh.write("\n" + text + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def decide(self, *args, **env):
+        return subprocess.run([self.python, "-m", "decisions", *args], cwd=self.tmp, env=self.env | env,
+                              capture_output=True, text=True)
+
+    def api(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=10) as r:
+            return json.loads(r.read())
+
+    def wait_for_server(self):
+        deadline = time.time() + 20
+        while True:
+            try:
+                return self.api("/api/config")["build"]
+            except OSError:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.1)
+
+    def said(self, name):
+        try:
+            return open(os.path.join(self.out, name)).read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def backups(self):
+        try:
+            return sorted(os.listdir(os.path.join(os.path.dirname(self.db), "backups")))
+        except FileNotFoundError:
+            return []
+
+    def status(self):
+        return json.load(open(os.path.join(self.env["DECISIONS_STATE_DIR"], "server-update.json")))
+
+    def test_follows_upstreams_releases_and_keeps_the_data(self):
+        self.assertIsNone(self.api("/api/config")["update"])  # no updater has run here
+        # No releases upstream: say so, and leave the server alone.
+        check = self.decide("server", "update", "--check")
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertIn("nothing to update to", check.stdout)
+        self.assertIn("has no releases yet", check.stdout)
+        none = self.decide("server", "update")
+        self.assertEqual(none.returncode, 0, none.stderr)
+        self.assertIn("waiting: ", none.stdout)
+        self.assertIn("--follow main", none.stdout)
+        # The release the server runs.
+        self.git("tag", "v0.1.0")
+        same = self.decide("server", "update")
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertIn(f"healthy: The server's code is v0.1.0 ({self.first[:7]})", same.stdout)
+        # A commit on main isn't a release, and neither is a tag that doesn't look like a version.
+        second = self.commit("two", markdown_py="# two", fixed_txt="fb-0000000001 two")
+        self.git("tag", "v0.2.0-rc1")
+        self.assertEqual(self.decide("server", "update", "--check").returncode, 0)
+        ahead = self.decide("server", "update", "--check", DECISIONS_FOLLOW="main")
+        self.assertEqual(ahead.returncode, 1)
+        self.assertIn(f"update available: main ({second[:7]}) is the head of main of {self.upstream}: two", ahead.stdout)
+        self.assertEqual(self.decide("server", "update", "--follow", "branches").returncode, 2)
+        self.assertEqual((self.said("uv"), self.said("service"), self.backups()), ([], ["kickstart"], []))
+
+        # A release: backup, trial upgrade of a copy, install, restart.
+        self.git("tag", "v0.2.0")
+        self.assertEqual(self.decide("server", "update", "--check").returncode, 1)
+        done = self.decide("server", "update")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("upgrading a copy of it with the new code", done.stdout)
+        self.assertIn(f"healthy: The server runs v0.2.0 ({second[:7]})", done.stdout)
+        cfg = self.api("/api/config")
+        self.assertNotEqual(cfg["build"], self.first_build)
+        self.assertEqual((cfg["commit"]["hash"], cfg["commit"]["subject"], cfg["commit"]["dirty"]), (second, "two", False))
+        self.assertEqual((cfg["update"]["state"], cfg["update"]["follow"]), ("healthy", "tags"))
+        self.assertEqual(self.api("/api/decisions/D-1")["title"], "Keep me")
+        self.assertTrue(self.api("/api/events/verify")["ok"])
+        self.assertRegex(self.said("uv")[0], rf"^tool install --force --python >=3\.11 \S+/decisions-0\.1\.0\+{cfg['build']}-py3-none-any\.whl$")
+        self.assertEqual(len(self.said("uv")), 1)
+        self.assertEqual(len(self.said("service")), 2)
+        (saved,) = self.backups()
+        self.assertRegex(saved, rf"^\d{{8}}-\d{{6}}-before-{second[:7]}\.db$")
+        conn = sqlite3.connect(os.path.join(os.path.dirname(self.db), "backups", saved))
+        self.assertEqual(conn.execute("SELECT title FROM decisions").fetchall(), [("Keep me",)])
+        conn.close()
+        again = self.decide("server", "update")
+        self.assertEqual(again.returncode, 0)
+        self.assertEqual((len(self.said("uv")), len(self.backups())), (1, 1))
+
+        # A release that leaves the code as it is: the server is that commit now, and isn't restarted.
+        third = self.commit("three", README_md="words")
+        self.git("tag", "v0.2.1")
+        quiet = self.decide("server", "update")
+        self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
+        self.assertIn("same code as before", quiet.stdout)
+        self.assertEqual(self.api("/api/config")["commit"]["hash"], third)
+        self.assertEqual((len(self.said("uv")), len(self.said("service")), len(self.backups())), (1, 2, 1))
+
+    def test_a_release_that_cant_upgrade_the_database_is_not_installed_or_tried_again(self):
+        self.git("tag", "v1")
+        bad = self.commit("a table without its migration", store_py='SCHEMA += "CREATE TABLE extra (id TEXT);"')
+        self.git("tag", "v2")
+        stuck = self.decide("server", "update")
+        self.assertEqual(stuck.returncode, 1)
+        self.assertIn(f"stuck: The server's database can't be upgraded to the schema of v2 ({bad[:7]})", stuck.stdout)
+        self.assertIn("extra", stuck.stdout)
+        self.assertIn("Nothing was installed or restarted", stuck.stdout)
+        # The server runs what it ran, on its database, and there's a backup anyway.
+        cfg = self.api("/api/config")
+        self.assertEqual((cfg["build"], cfg["commit"]["hash"], cfg["update"]["state"]), (self.first_build, self.first, "stuck"))
+        self.assertEqual(self.api("/api/decisions/D-1")["title"], "Keep me")
+        self.assertEqual((self.said("uv"), self.said("service"), len(self.backups())), ([], ["kickstart"], 1))
+        self.assertEqual(os.listdir(os.path.dirname(self.db) + "/backups"), self.backups())  # no trial copy left
+        # Not again by itself: every try is a backup.
+        again = self.decide("server", "update")
+        self.assertEqual(again.returncode, 1)
+        self.assertIn("Not trying v2", again.stdout)
+        self.assertEqual(len(self.backups()), 1)
+        time.sleep(1.1)  # backups are named by the second
+        self.assertEqual(self.decide("server", "update", "--retry").returncode, 1)
+        self.assertEqual(len(self.backups()), 2)
+        # The next release is tried.
+        fixed = self.commit("with its migration", markdown_py="# fixed", store_py=(
+            "SCHEMA_VERSION += 1\nMIGRATIONS[SCHEMA_VERSION] = lambda conn: conn.execute('CREATE TABLE extra (id TEXT)')"))
+        self.git("tag", "v3")
+        done = self.decide("server", "update")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.api("/api/config")["commit"]["hash"], fixed)
+        self.assertEqual(self.api("/api/decisions/D-1")["title"], "Keep me")
+        self.assertEqual(self.status()["state"], "healthy")
+
+    def test_a_release_the_server_doesnt_start_with_is_taken_back(self):
+        self.git("tag", "v1")
+        broken = self.commit("a server that doesn't start", server_py=(
+            "def serve(cfg, insecure=False):\n    raise SystemExit('error: broken')"))
+        self.git("tag", "v2")
+        stuck = self.decide("server", "update", DECISIONS_UPDATE_TIMEOUT="3")
+        self.assertEqual(stuck.returncode, 1)
+        self.assertIn(f"stuck: The server didn't come up with v2 ({broken[:7]})", stuck.stdout)
+        self.assertIn(f"The previous code (build {self.first_build}) was put back. The database wasn't changed", stuck.stdout)
+        cfg = self.api("/api/config")
+        self.assertEqual((cfg["build"], cfg["commit"]["hash"]), (self.first_build, self.first))
+        self.assertEqual(self.api("/api/decisions/D-1")["title"], "Keep me")
+        self.assertEqual((len(self.said("uv")), len(self.said("service"))), (2, 3))
+        self.assertEqual(self.decide("server", "update").returncode, 1)
+        self.assertEqual(len(self.said("uv")), 2)
+
+    def test_it_only_moves_forward_and_only_an_installed_server(self):
+        self.git("tag", "v1")
+        second = self.commit("two", markdown_py="# two")
+        # The server runs a commit the newest release doesn't contain: main's, or one from somewhere else.
+        for commit in (second, "f" * 40):
+            with open(os.path.join(self.site, "decisions", ".commit"), "w") as fh:
+                json.dump({"hash": commit, "date": "2026-01-02T03:04:05+00:00", "subject": "two"}, fh)
+            ahead = self.decide("server", "update")
+            self.assertEqual(ahead.returncode, 0, ahead.stderr)
+            self.assertIn(f"waiting: The server's code is {commit[:7]}, which v1 ({self.first[:7]})", ahead.stdout)
+            self.assertEqual(self.decide("server", "update", "--check").returncode, 0)
+        self.assertEqual((self.said("uv"), self.backups()), ([], []))
+        # A checkout is its developer's to update.
+        dev = subprocess.run([sys.executable, "-m", "decisions", "server", "update"], cwd=ROOT, env=self.env,
+                             capture_output=True, text=True)
+        self.assertNotEqual(dev.returncode, 0)
+        self.assertIn("runs from a checkout", dev.stderr)
+        # And a server that isn't a service here isn't this command's to restart.
+        os.remove(self.service)
+        none = self.decide("server", "update", "--config", self.conf)
+        self.assertNotEqual(none.returncode, 0)
+        self.assertIn("no server is installed as a service", none.stderr)
+
+    def test_the_job_that_updates_by_itself(self):
+        """Service managers are mocked: this checks what would be installed, without installing it."""
+        import plistlib
+        from unittest import mock
+        from decisions import cli, update
+        home = self.env["HOME"]
+        job = os.path.join(home, "Library/LaunchAgents/com.decisions.server-update.plist")
+        with mock.patch.dict(os.environ, {"HOME": home}), mock.patch.object(cli.sys, "platform", "darwin"), \
+                mock.patch.object(cli.subprocess, "run") as run, mock.patch("builtins.print"), \
+                mock.patch.object(cli, "_which_decide", return_value="/x/bin/decide"):
+            with self.assertRaises(SystemExit) as ctx:  # the tests run from a checkout
+                cli.main(["server", "install", "--config", self.conf, "--auto-update"])
+            self.assertIn("runs from a checkout", str(ctx.exception))
+            with mock.patch.object(update, "checkout", return_value=None):
+                cli.main(["server", "install", "--config", self.conf, "--auto-update", "--every", "600"])
+                plist = plistlib.load(open(job, "rb"))
+                self.assertEqual(plist["ProgramArguments"], ["/x/bin/decide", "server", "update", "--config", self.conf])
+                self.assertEqual((plist["StartInterval"], plist["RunAtLoad"], "KeepAlive" in plist), (600, True, False))
+                self.assertIn(os.path.dirname(update.shutil.which("git")), plist["EnvironmentVariables"]["PATH"].split(":"))
+                self.assertIn(["launchctl", "bootstrap", f"gui/{os.getuid()}", job], [c.args[0] for c in run.call_args_list])
+                # By hand, for a server that's installed already: what to follow is the job's.
+                cli.main(["server", "update", "--install", "--follow", "main"])
+                plist = plistlib.load(open(job, "rb"))
+                self.assertEqual(plist["ProgramArguments"], ["/x/bin/decide", "server", "update", "--follow", "main"])
+                self.assertEqual(plist["StartInterval"], 3600)
+                cli.main(["server", "update", "--uninstall"])
+                self.assertFalse(os.path.exists(job))
+                cli.main(["server", "install", "--config", self.conf, "--auto-update"])
+                cli.main(["server", "uninstall"])
+                self.assertEqual(os.listdir(os.path.dirname(job)), [])
+        # systemd: a oneshot service and the timer that starts it.
+        with mock.patch.dict(os.environ, {"HOME": home}), mock.patch.object(cli.sys, "platform", "linux"), \
+                mock.patch.object(cli.subprocess, "run") as run, mock.patch("builtins.print"):
+            cli._install_service(cli.UPDATE_SERVICE, ["/x/bin/decide", "server", "update"], {}, "/x/log", every=600)
+            units = os.path.join(home, ".config/systemd/user")
+            self.assertIn("Type=oneshot", open(os.path.join(units, "decisions-server-update.service")).read())
+            self.assertIn("OnUnitActiveSec=600", open(os.path.join(units, "decisions-server-update.timer")).read())
+            self.assertIn(["systemctl", "--user", "enable", "--now", "decisions-server-update.timer"],
+                          [c.args[0] for c in run.call_args_list])
+            self.assertEqual(cli._service_argv(cli.UPDATE_SERVICE), ["/x/bin/decide", "server", "update"])
+            cli._uninstall_service(cli.UPDATE_SERVICE)
+            self.assertEqual(os.listdir(units), [])
+
+    def test_the_code_is_replaced_by_what_installed_it(self):
+        from unittest import mock
+        from decisions import update
+        which = lambda name: {"uv": "/x/uv", "pipx": "/x/pipx"}.get(name)
+        with mock.patch.object(update.shutil, "which", which), mock.patch.object(update.sys, "prefix", self.tmp):
+            for marker, command in (("uv-receipt.toml", ["/x/uv", "tool", "install", "--force", "--python", ">=3.11", "a.whl"]),
+                                    ("pipx_metadata.json", ["/x/pipx", "install", "--force", "a.whl"])):
+                open(os.path.join(self.tmp, marker), "w").close()
+                self.assertEqual(update.installer("a.whl"), command)
+                os.remove(os.path.join(self.tmp, marker))
+            with mock.patch.object(update.importlib.util, "find_spec", return_value=object()):
+                self.assertEqual(update.installer("a.whl")[:4], [sys.executable, "-m", "pip", "install"])
+            with mock.patch.object(update.importlib.util, "find_spec", return_value=None):
+                self.assertEqual(update.installer("a.whl")[:5], ["/x/uv", "pip", "install", "--python", sys.executable])
+
+
 class SpacesTest(unittest.TestCase):
     """Spaces are hard boundaries: a space's token sees only that space; the admin token sees all."""
 

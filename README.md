@@ -192,10 +192,10 @@ Run the server on one always-on machine (a home server, a Mac mini, a VPS on you
 
 **On the server:**
 ```sh
-uv tool install /path/to/decisions          # or: git clone … && uv tool install .
-decide server install --host 0.0.0.0        # launchd (macOS) or systemd --user (Linux); generates a token
+uv tool install git+https://github.com/ArvidSU/decide     # or pipx install git+…, or from a clone: uv tool install .
+decide server install --host 0.0.0.0 --auto-update        # launchd (macOS) or systemd --user (Linux); generates a token
 ```
-This writes `~/.config/decisions/config.toml` (host, port, db, the admin token, `base_url`), starts the service, and prints a GUI link with the admin token (`http://server:8787/#token=…` logs the browser in once). Create spaces and connect machines from there. The server refuses to listen on a non-loopback address without a token (`--insecure` overrides). Traffic is plain HTTP, so keep it on a trusted network or a tailnet, or put it behind an HTTPS reverse proxy and set `base_url`.
+`--auto-update` keeps the server on upstream's releases by itself (see Upgrading); leave it out to upgrade by hand. This writes `~/.config/decisions/config.toml` (host, port, db, the admin token, `base_url`), starts the service, and prints a GUI link with the admin token (`http://server:8787/#token=…` logs the browser in once). Create spaces and connect machines from there. The server refuses to listen on a non-loopback address without a token (`--insecure` overrides). Traffic is plain HTTP, so keep it on a trusted network or a tailnet, or put it behind an HTTPS reverse proxy and set `base_url`.
 
 **Or with Docker** (the image is just the server; resumers run on the agent machines):
 ```sh
@@ -218,13 +218,27 @@ Flags: `--no-resumer`, `--no-skill`. The pieces are also served on their own: `/
 
 **Resuming happens on the machine where the session ran.** `decide create` records the machine (hostname, or `DECISIONS_MACHINE`) in the resume target. Each machine's resumer heartbeats under its own name and only resumes its own sessions. The decision page shows the status of the resumer on that decision's machine, and Settings lists every machine's resumer.
 
-**Upgrading:** install the new version and restart the server (with Docker: `docker compose build && docker compose up -d`). The database records its schema version, and the server upgrades an older database when it starts, keeping all of its data. If it can't, it leaves the database as it was and refuses to start, saying why. `decide migrate` does the upgrade without starting the server, e.g. to try it on a copy first: `decide migrate --db /path/to/copy.db`. Back the database file up before upgrading.
+**Upgrading:** `decide server update` does it for a server installed with `decide server install` (see below). By hand: install the new version and restart the server (with Docker: `docker compose build && docker compose up -d`). The database records its schema version, and the server upgrades an older database when it starts, keeping all of its data. If it can't, it leaves the database as it was and refuses to start, saying why. `decide migrate` does the upgrade without starting the server, e.g. to try it on a copy first: `decide migrate --db /path/to/copy.db`. Back the database file up before upgrading.
 
 **An upgrade closes the feedback it addresses.** `decisions/fixed.txt` lists the feedback the code addresses, one per line: its unique id (`fb-…`), then what was done. When the server starts, it marks its own open or reported feedback with a listed id `done`, with that text and the commit it runs as the note. Each piece once: if you open it again, it stays open. Because the id is the same everywhere and travels with an issue reported upstream, this works on every server that had the feedback, however it was installed.
 
 **The machines follow the server.** The server names the code it runs with a build (a hash of the package, in `GET /api/config` and in the name of the wheel it serves), and tells every resumer in the answer to its heartbeat. A resumer whose `decide` was installed from the server and is another build reruns the server's installer for `decide` and the skill, and then restarts itself with the new code, once no resume or proof is in flight. So within a minute of the server being upgraded, every machine with a resumer runs the same code as it, and you only ever upgrade the server. `decide update` does the same by hand, e.g. on a machine without a resumer (`--check` only says whether it's up to date, exit 1 if not). A `decide` that runs from a checkout (`uv tool install --editable .`) isn't touched: Settings → Machines marks it "other version". Settings also names the git commit (hash and message) the server runs and the one each machine's resumer runs (`commit` in `GET /api/config` and `GET /api/resumer`). A checkout asks git. Code without its git history reads `decisions/.commit` (JSON: `hash`, `date`, `subject`), which the server puts in the wheel it serves; write that file before `docker build` to have an image know its commit. The commit isn't part of the build, so a machine can name an older commit than the server and still run the same code. `decide resumer install --no-update` turns it off for a machine.
 
-**The server can follow the repository.** In this repository, `.dash-bored/scripts/remote.py deploy` upgrades a Docker server on another machine over ssh: backup, a trial upgrade of a copy of the backup, and only then a restart. `remote.py follow-setup` makes that machine do the same by itself whenever origin's `main` has new commits (a launchd job that pulls every 2 minutes; `--off` removes it). It only moves forward: a server running commits that aren't pushed yet is left on them until `main` contains them. A commit whose migration fails on the copy isn't deployed, and the server keeps running the previous one. Together with the above: push to `main`, and the server and every machine run it a few minutes later.
+**The server follows upstream.** `decide server update` upgrades a server installed with `decide server install` to the code of the repository it came from (`upstream`, by default this one), and keeps its data. It needs git on the server's machine. In order:
+1. It fetches upstream and picks the commit to run: its newest release, or the head of its `main` branch (`follow`, below).
+2. It unpacks that commit and backs the database up to `backups/` next to it (the last 10 are kept).
+3. It upgrades a copy of the backup with the new code's `decide migrate`. If that fails, it stops: nothing is installed or restarted, and the server keeps running the previous code on an untouched database.
+4. It installs the new code with what installed the old (uv, pipx or pip) and restarts the service, which upgrades the real database the same way. If the server then doesn't answer with the new code within `update_timeout` seconds and the database is still as it was, the previous code is put back and the server restarted with it.
+
+Choose what to follow with `follow` in the server's config (or `DECISIONS_FOLLOW`, or `--follow` for one run):
+- `tags` (the default): the newest release, i.e. the highest tag that looks like a version (`v1.2.0` or `1.2.0`; `v2.0.0-rc1` isn't one). While upstream has no such tag, there's nothing to follow: the command says so and leaves the server alone.
+- `main`: every commit on upstream's `main` branch, as it lands.
+
+It only moves forward: a server whose code the followed commit doesn't contain (it's ahead of the newest release, or from somewhere else) is left alone until upstream contains it. A version that can't be run here (step 3 or 4 fails) is not tried again; the next one is, and `--retry` tries it anyway. Any other failure (no network, the installer fails) is tried again after half an hour. A commit that leaves the code as it is restarts nothing. The code installed this way knows its commit (`decisions/.commit`), so Settings → Version names it.
+
+`decide server update --check` only says whether there's an update (exit 1 if so). `decide server install --auto-update`, or `decide server update --install` for a server that's installed already, adds a background job (launchd, or a systemd `--user` timer) that runs the update every hour (`--every SECONDS`); `decide server update --uninstall` removes it. Its log is `~/.local/state/decisions/server-update.log`, and Settings → Version shows what it last did (`update` in `GET /api/config`). A `decide` that runs from a checkout (`uv tool install --editable .`) is its developer's to update, and the command refuses. A Docker server can't rebuild its own image: upgrade it with `docker compose build && docker compose up -d`, or as below.
+
+**A Docker server can follow the repository.** In this repository, `.dash-bored/scripts/remote.py deploy` upgrades a Docker server on another machine over ssh: backup, a trial upgrade of a copy of the backup, and only then a restart. `remote.py follow-setup` makes that machine do the same by itself whenever origin's `main` has new commits (a launchd job that pulls every 2 minutes; `--off` removes it). It only moves forward: a server running commits that aren't pushed yet is left on them until `main` contains them. A commit whose migration fails on the copy isn't deployed, and the server keeps running the previous one. Together with the above: push to `main`, and the server and every machine run it a few minutes later.
 
 **What needs which direction:** `decide wait`, the resumer and the GUI only make outbound connections to the server. Webhooks (`decide watch`/`listen`, your own) need the server to reach the receiver. `decide watch` against a remote server listens on all interfaces and registers the local address it uses to reach the server; override with `--callback-url`.
 
@@ -242,6 +256,9 @@ owner = "me"               # actor name for GUI actions
 callback_host = ""         # how the server reaches its own machine for webhooks (Docker: host.docker.internal)
 deadline_days = 4          # undecided decisions expire this long after creation (0 = only if they set due_at)
 feedback_issues_url = "https://github.com/ArvidSU/decide/issues/new"   # where "Report upstream" opens an issue ("" = no button)
+upstream = "https://github.com/ArvidSU/decide"   # the git repository `decide server update` upgrades the server from
+follow = "tags"            # what it follows there: "tags" = the newest release (v1.2.0), "main" = the head of main
+update_timeout = 120       # seconds a restarted server gets to answer with the new code before the previous is put back
 
 [webhook]
 timeout = 10

@@ -783,6 +783,7 @@ async function renderSettings() {
       <dl class="kv" style="font-size:13.5px;gap:8px 24px;margin:0">
         <dt>Commit</dt><dd>${cfg.commit ? `${commitHtml(cfg.commit)}<div class="muted small">committed <span title="${esc(fullTime(cfg.commit.date))}">${ago(cfg.commit.date)}</span></div>` : `<span class="muted">Not recorded: this code came without its git history</span>`}</dd>
         <dt>Build</dt><dd><code>${esc(cfg.build)}</code> <span class="muted">· Decisions ${esc(cfg.version)}</span></dd>
+        ${cfg.update ? `<dt>Updates</dt><dd>Follows ${cfg.update.follow === "main" ? "the main branch" : "the releases"} of <code>${esc(cfg.update.upstream)}</code> <span class="muted">· ${esc(cfg.update.state)}, checked <span title="${esc(fullTime(cfg.update.checked))}">${ago(cfg.update.checked)}</span></span><div class="muted small" style="white-space:pre-line">${esc(cfg.update.detail)}</div></dd>` : ""}
       </dl>
     </section>
     <section class="setting">
