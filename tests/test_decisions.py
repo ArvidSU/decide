@@ -1072,9 +1072,21 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual((p["hash"], p["resume"], p["resume_state"]), (first, session, {"status": "armed"}))
         self.assertIn("claude --resume sess-1", p["resume_command"])
         self.assertEqual(self.call("GET", f"/api/goals/{gid}/events")["events"][-1]["type"], "proof.retargeted")
-        # Flagging ready from another session makes that one the target; leaving `resume` out keeps it.
+        # Agreeing is news for the session: pending against that event, until the resumer reports in.
         self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": first}, actor="me", expect=200)
+        agreed = self.call("GET", f"/api/goals/{gid}/events")["events"][-1]
+        self.assertEqual(state(), {"status": "pending", "trigger": "proof.agreed", "trigger_seq": agreed["seq"],
+                                   "since": agreed["ts"], "failures": 0, "max_failures": 3})
+        # Flagging ready from another session makes that one the target; leaving `resume` out keeps it. A session
+        # that flags the goal ready knows it was agreed on: nothing is left to tell it.
         self.call("POST", f"/api/goals/{gid}/proof/ready", {"resume": session | {"session_id": "sess-2"}}, expect=200)
+        self.assertEqual(state(), {"status": "armed"})
+        self.call("POST", f"/api/goals/{gid}/proof/ready", {"ready": False}, expect=200)
+        self.call("POST", f"/api/goals/{gid}/resume-events", {"status": "finished", "trigger_seq": agreed["seq"]},
+                  actor="resumer", expect=201)
+        self.assertEqual((state()["status"], state()["trigger"]), ("finished", "proof.agreed"))
+        self.call("POST", f"/api/goals/{gid}/proof/ready", {}, expect=200)
+        self.assertEqual(state()["status"], "finished")
         self.assertEqual(proof()["resume"]["session_id"], "sess-2")
         self.call("PUT", f"/api/goals/{gid}/proof", spec, expect=200)
         self.assertEqual(proof()["resume"]["session_id"], "sess-2")
@@ -1106,9 +1118,12 @@ class DecisionsTest(unittest.TestCase):
         resumed("finished")
         fail()
         self.assertEqual((state()["status"], state()["failures"]), ("capped", 4))
-        # Proposing the proof anew resets it; passing arms nothing further and achieves the goal.
+        # Proposing the proof anew resets it, and agreeing to that is news again; passing arms nothing further
+        # and achieves the goal.
         self.call("PUT", f"/api/goals/{gid}/proof", spec | {"command": "./prove2.sh"}, expect=200)
+        self.assertEqual(state(), {"status": "armed"})
         self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": proof()["hash"]}, actor="me", expect=200)
+        self.assertEqual((state()["status"], state()["trigger"]), ("pending", "proof.agreed"))
         fail()
         self.assertEqual((state()["status"], state()["failures"]), ("pending", 1))
         resumed("finished")
@@ -1204,7 +1219,28 @@ class DecisionsTest(unittest.TestCase):
         self.call("PUT", f"/api/goals/{other}/proof", {
             "success": "x", "command": "x", "machine": "ci", "cwd": "/w",
             "resume": {"session_id": "sess-e", "cwd": work, "agent": "claude-code", "machine": "mb"}}, expect=200)
+        # It's first woken when the user agrees to the proof, and told to do the work.
         agree(other)
+        self.assertTrue(settled(other))
+        self.assertEqual((goal(other)["proof"]["resume_state"]["status"], len(lines())), ("finished", 3))
+        self.assertTrue(lines()[2].startswith(f'sess-e|agreed|{other}|[decisions] {other} "Elsewhere": me agreed to '
+                                              f'its proof `x`. Do the work now.'), lines())
+        self.assertIn(f"decide goal ready {other}", lines()[2])
+        # Unless it's in `decide goal wait` for that: one waiting for something else is still woken.
+        for n, (on, status) in enumerate((("proof.agreed,proof.removed", "skipped"), ("proof.passed", "finished"))):
+            waited = self.goal(f"Waited for {n}")["id"]
+            self.call("PUT", f"/api/goals/{waited}/proof", {
+                "success": "x", "command": "x", "machine": "ci", "cwd": "/w",
+                "resume": {"session_id": "sess-w", "cwd": work, "agent": "claude-code", "machine": "mb"}}, expect=200)
+            waiter = subprocess.Popen([sys.executable, "-m", "decisions", "goal", "wait", waited, "--on", on,
+                                       "--timeout", "5"], env=env | {"DECISIONS_ACTOR": "claude-code"}, cwd=work,
+                                      stdout=subprocess.PIPE, text=True)
+            time.sleep(0.5)
+            agree(waited)
+            self.assertTrue(settled(waited))
+            self.assertEqual((goal(waited)["proof"]["resume_state"]["status"], len(lines())), (status, 3 + n))
+            waiter.kill(); waiter.wait(); waiter.stdout.close()
+        self.assertTrue(lines()[3].startswith("sess-w|agreed|"))
         for n in range(1, 5):
             self.call("POST", f"/api/goals/{other}/proof/ready", {}, expect=200)
             seq = self.call("POST", f"/api/goals/{other}/proof/run", actor="me", expect=201)["proof"]["run"]["seq"]
@@ -1212,7 +1248,7 @@ class DecisionsTest(unittest.TestCase):
                       actor="ci-resumer", expect=201)
             self.assertTrue(settled(other))
             self.assertEqual((goal(other)["proof"]["resume_state"]["status"], len(lines())),
-                             ("finished" if n <= 3 else "capped", 2 + min(n, 3)), n)
+                             ("finished" if n <= 3 else "capped", 4 + min(n, 3)), n)
         self.assertIn("failure 3 of 3 in a row. After this one you won't be resumed again", lines()[-1])
         self.assertTrue(lines()[-1].startswith("sess-e|failed|"))
 
@@ -1232,7 +1268,7 @@ class DecisionsTest(unittest.TestCase):
         resumer.terminate(); resumer.wait()
         self.assertEqual((goal(theirs)["proof"]["run"]["status"], goal(theirs)["proof"]["resume_state"]["status"]),
                          ("failed", "pending"))
-        self.assertEqual(len(lines()), 5)
+        self.assertEqual(len(lines()), 7)
 
     def test_cli_goals_map_and_insights(self):
         env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT}

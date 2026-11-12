@@ -266,8 +266,9 @@ GOAL_EVENTS = {"active": "goal.reactivated", "achieved": "goal.achieved", "aband
 # How a goal is proved achieved: a command the resumer runs on the agent's machine when the user asks for it.
 # These events report on a run, and put it in that state.
 PROOF_RUN_EVENTS = ("started", "passed", "failed")
-# A proof's result wakes the session that owns the goal (`proof.resume`), the way a resolution wakes a decision's.
-PROOF_RESUME_TRIGGERS = ("proof.passed", "proof.failed")
+# The user agreeing to a proof, and then its result, wake the session that owns the goal (`proof.resume`), the
+# way a resolution wakes a decision's.
+PROOF_RESUME_TRIGGERS = ("proof.agreed", "proof.passed", "proof.failed")
 # Loop guard: after this many `proof.failed` in a row the agent isn't resumed again, until the proof passes or
 # is proposed anew (`proof.proposed` / `proof.changed`), which reset the count.
 PROOF_RESUME_FAILURES = 3
@@ -1520,25 +1521,38 @@ class Store:
             (gid, gid)).fetchone()[0]
 
     def _proof_resume_state(self, gid: str, proof: dict, run: dict | None) -> dict | None:
-        """Where the owning session's resumption stands for the latest result of the current proof. Mirrors
-        `_resume_state`: `pending` until a `resume.*` event follows the result; `capped` when the proof has
-        failed too many times in a row for the agent to be woken again."""
+        """Where the owning session's resumption stands for the latest thing it should hear about the current
+        proof: that the user agreed to it, or how its latest run went. Mirrors `_resume_state`: `pending` until
+        a `resume.*` event follows the trigger; `capped` when the proof has failed too many times in a row for
+        the agent to be woken again."""
         if not proof.get("resume"):
             return None
-        trigger = run and f"proof.{run['status']}"
-        if trigger not in PROOF_RESUME_TRIGGERS or run["hash"] != proof["hash"]:
+        agreed = proof.get("agreed") and self.conn.execute(
+            "SELECT * FROM events WHERE goal_id=? AND type='proof.agreed' ORDER BY seq DESC LIMIT 1", (gid,)).fetchone()
+        if agreed and json.loads(agreed["data"])["hash"] != proof["hash"]:
+            agreed = None
+        if run and run["hash"] == proof["hash"] and not (agreed and agreed["seq"] > run["seq"]):
+            trigger, seq, since = f"proof.{run['status']}", run.get("event_seq"), run["since"]
+        elif agreed:
+            trigger, seq, since = "proof.agreed", agreed["seq"], agreed["ts"]
+        else:
+            trigger = None
+        if trigger not in PROOF_RESUME_TRIGGERS:
             return {"status": "armed"}
         failures = self._proof_failures(gid) if trigger == "proof.failed" else 0
-        state = {"status": "pending", "trigger": trigger, "trigger_seq": run["event_seq"], "since": run["since"],
+        state = {"status": "pending", "trigger": trigger, "trigger_seq": seq, "since": since,
                  "failures": failures, "max_failures": PROOF_RESUME_FAILURES}
         ev = self.conn.execute(
             "SELECT * FROM events WHERE goal_id=? AND type LIKE 'resume.%' AND seq>? ORDER BY seq DESC LIMIT 1",
-            (gid, run["event_seq"])).fetchone()
+            (gid, seq)).fetchone()
         if ev:
             state |= {"status": ev["type"].split(".", 1)[1], "since": ev["ts"], "actor": ev["actor"],
                       "detail": json.loads(ev["data"])}
         elif failures > PROOF_RESUME_FAILURES:
             state["status"] = "capped"
+        elif trigger == "proof.agreed" and proof.get("ready"):
+            # It flagged the goal ready, so it knows: there's nothing left to tell it until the result.
+            return {"status": "armed"}
         return state
 
     def _proof_view(self, gid: str, row) -> dict | None:
@@ -1906,7 +1920,8 @@ class Store:
             return self._decision_dict(did)
 
     def goal_resume_event(self, raw_id: str, body: dict, actor: str, scope: Scope = ALL) -> dict:
-        """The resumer's (or a person's) report on waking the session that owns a goal, after its proof's result."""
+        """The resumer's (or a person's) report on waking the session that owns a goal, after its proof was
+        agreed to or has run."""
         gid = norm_goal_id(raw_id)
         kind = body.get("status")
         if kind not in self.RESUME_EVENTS:

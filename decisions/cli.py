@@ -431,7 +431,7 @@ def cmd_goal_proof(args):
             sys.exit(f"error: can't read script {path}: {exc}")
     body = {"command": command, "success": success, "scripts": scripts, "cwd": cwd, "machine": machine_name(),
             "timeout": args.timeout or old.get("timeout")}
-    # Inside an agent session: that session hears how the proof went, through the resumer.
+    # Inside an agent session: that session hears that the proof was agreed to, and how it went, through the resumer.
     if target := _resume_target(args):
         body["resume"] = target
     g = c.call("PUT", f"/api/goals/{args.id}/proof", {k: v for k, v in body.items() if v is not None})
@@ -785,8 +785,16 @@ def _resume_prompt(d: dict) -> str:
 
 
 def _goal_resume_prompt(g: dict) -> str:
-    """What the session that owns a goal is told when its proof has run: what happened, and what to do now."""
+    """What the session that owns a goal is told when its proof was agreed to or has run: what happened, and
+    what to do now."""
     p, run, state = g["proof"], g["proof"]["run"], g["proof"]["resume_state"]
+    if state["trigger"] == "proof.agreed":
+        return (f'[decisions] {g["id"]} "{g["title"]}": {p["agreed"]["by"]} agreed to its proof `{p["command"]}`. '
+                f'Do the work now. If you have to change the command or a script, record it with `decide goal proof '
+                f'{g["id"]} …` and say why: the user has to agree to it again. When you believe the goal is achieved, '
+                f'run the command yourself, and when it passes run `decide goal ready {g["id"]} --note "what you '
+                f'did"` and end your turn: you\'ll be resumed with the result when the user asks for the proof. '
+                f'Don\'t run `decide goal wait`. Details: `decide goal get {g["id"]} --json`.')
     x = run["detail"]
     how = ", ".join(s for s in (f'exit {x["exit_code"]}' if x.get("exit_code") is not None else None,
                                 f'{x["duration_s"]}s' if x.get("duration_s") is not None else None) if s)
@@ -833,18 +841,18 @@ def _decision_wakeup(d: dict) -> dict:
 
 
 def _goal_wakeup(g: dict) -> dict:
-    """What `_resume_one` needs to wake the session behind a goal, after its proof's result."""
+    """What `_resume_one` needs to wake the session behind a goal, after its proof was agreed to or has run."""
     p, state = g["proof"], g["proof"]["resume_state"]
     payload = {"event": {"type": state["trigger"], "seq": state["trigger_seq"]}, "delivery": {"id": ""},
                "decision": None, "goal": g}
     env = _payload_env(payload, "") | {"GOAL_ID": g["id"], "GOAL_TITLE": g["title"], "GOAL_URL": g["url"],
-                                       "PROOF_HASH": p["hash"], "PROOF_RESULT": p["run"]["status"]}
+                                       "PROOF_HASH": p["hash"], "PROOF_RESULT": state["trigger"].split(".", 1)[1]}
     return {"id": g["id"], "path": f"/api/goals/{g['id']}", "resume": p["resume"], "state": state,
             "prompt": _goal_resume_prompt(g), "env": env}
 
 
 def _resume_one(client: Client, w: dict, command: str | None, log_dir: str):
-    """Run the agent's resume command for one wake-up (a decision's outcome or a goal's proof result), logging
+    """Run the agent's resume command for one wake-up (a decision's outcome, or a goal's proof agreed to or run), logging
     `resume.started` and then `resume.finished` / `resume.failed` against the event that triggered it."""
     seq = w["state"]["trigger_seq"]
     cwd = w["resume"].get("cwd") or os.path.expanduser("~")
@@ -928,12 +936,12 @@ def _skip_fill(client: Client, d: dict) -> str | None:
     return f"{', '.join(polling)} is waiting on it live" if polling else None
 
 
-def _skip_proof_result(client: Client, g: dict) -> str | None:
-    """Why not to wake a goal's session with its proof's result: it's still alive, in `decide goal wait`.
-    That wait wakes on the same event we're acting on, so one that just disconnected counts too; one that
-    heard an earlier result and ended its turn doesn't, however recently."""
+def _skip_proof_news(client: Client, g: dict, event_type: str) -> str | None:
+    """Why not to wake a goal's session with what happened to its proof: it's still alive, in a `decide goal
+    wait` for that event. That wait wakes on the same event we're acting on, so one that just disconnected
+    counts too; one that heard an earlier event and ended its turn doesn't, however recently."""
     polling = [x["actor"] for x in client.call("GET", f"/api/goals/{g['id']}/listeners")["listeners"]
-               if x["connected"] or x["idle"] < LIVE_WAIT_GRACE]
+               if (x["connected"] or x["idle"] < LIVE_WAIT_GRACE) and event_matches(x["events"], event_type)]
     return f"{', '.join(polling)} is waiting on it live" if polling else None
 
 
@@ -941,7 +949,7 @@ def cmd_resumer_run(args):
     """Long-running: resume the requesting agent session whenever a decision with a resume target
     is resolved, or expires undecided (unless --no-expired), and while it's open, when the user asks it to fill
     values in (unless --no-fill). Also runs a goal's proof when the user asks for it (unless --no-proofs), and
-    resumes the session that owns a goal when its proof has passed or failed. Pulls the event feed with a
+    resumes the session that owns a goal when the user agrees to its proof, and when it has passed or failed. Pulls the event feed with a
     persisted cursor, so nothing is missed while it (or the machine) is down; heartbeats so the GUI can warn
     you when it isn't running."""
     client = Client(actor=os.environ.get("DECISIONS_ACTOR") or "resumer")
@@ -994,11 +1002,12 @@ def cmd_resumer_run(args):
                     threading.Thread(target=_prove_one, args=(client, g, ev["seq"], log_dir), daemon=True).start()
             elif ev["type"] in PROOF_RESUME_TRIGGERS:
                 # The proof ran wherever its scripts live; the session is woken where it lives, by that
-                # machine's resumer. The state is `capped` after too many failures in a row: leave it be.
+                # machine's resumer. The state is `capped` after too many failures in a row: leave it be. It's
+                # `armed` again, with nothing to tell, when the proof has changed or moved on since the event.
                 g = client.call("GET", f"/api/goals/{ev['goal_id']}")
-                if (g["proof"] or {}).get("resume_state"):
+                if ((g["proof"] or {}).get("resume_state") or {}).get("trigger"):
                     wake = _goal_wakeup(g)
-                    skip = _skip_proof_result(client, g)
+                    skip = _skip_proof_news(client, g, ev["type"])
             else:
                 d = client.call("GET", f"/api/decisions/{ev['decision_id']}")
                 if d.get("resume_state"):
