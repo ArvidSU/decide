@@ -282,6 +282,7 @@ def roll_out(cfg: Config, t: dict, restart) -> str:
                     "so nothing was restarted.")
         saved = backup(cfg.db_path, t["hash"][:7])
         if saved:
+            prune(cfg.db_path)  # now, not at the end: an update that keeps failing takes a backup each try
             step(f"backed up the database to {saved}")
             step("upgrading a copy of it with the new code")
             failure = trial(staging, saved)
@@ -320,7 +321,6 @@ def roll_out(cfg: Config, t: dict, restart) -> str:
                         f"previous code (build {running}) was put back"
                         + ("" if back else ", but the server hasn't come up with it either") + ". The database "
                         "wasn't changed.")
-        prune(cfg.db_path)
         return (f"The server runs {_name(t)}, {_of(cfg)} (build {staged['build']})."
                 + (f" The database from before is in {saved}." if saved else ""))
 
