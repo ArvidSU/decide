@@ -198,6 +198,8 @@ class Handler(BaseHTTPRequestHandler):
         c = self.cfg
         spaces = self.store.list_spaces(self.scope)
         return {"base_url": c.public_url, "owner": c.owner, "auth": bool(c.token), "version": __version__,
+                # Names the code this server runs. A machine whose decide has another build updates itself.
+                "build": dist.fingerprint(),
                 "callback_host": c.callback_host or None, "deadline_days": c.deadline_days,
                 "install_url": self._server_url() + "/install.sh",
                 "default_webhook_events": DEFAULT_WEBHOOK_EVENTS, "cursor": self.store.cursor(),
@@ -305,7 +307,8 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", "/api/resumer/heartbeat")
     def resumer_heartbeat(self):
-        return self.store.resumer_heartbeat(self._body(), self.actor, self.scope)
+        # The answer carries the server's build, so a resumer notices new code within one heartbeat.
+        return self.store.resumer_heartbeat(self._body(), self.actor, self.scope) | {"server_build": dist.fingerprint()}
 
     @route("GET", "/api/resumer")
     def resumer(self):

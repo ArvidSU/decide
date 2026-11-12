@@ -800,6 +800,11 @@ function spacesSetting(spaces) {
   </section>`;
 }
 
+// A resumer on other code than the server's. One installed from the server updates itself within a minute of
+// the server changing, so this shows for longer only on a machine that runs decide from a checkout, or can't update.
+const behind = (cfg, r) => r.online && r.build && r.build !== cfg.build
+  ? ` <span class="muted" title="Its decide is build ${esc(r.build)}; this server runs ${esc(cfg.build)}. A machine installed from this server updates itself; on others, run decide update.">other version</span>` : "";
+
 function machinesSetting(cfg, tokens, resumers) {
   const spaces = cfg.spaces.map((s) => s.name);
   const tokenOf = new Set(tokens.map((t) => t.resumer?.machine).filter(Boolean));
@@ -811,7 +816,7 @@ function machinesSetting(cfg, tokens, resumers) {
         ${tokens.map((t) => `<tr><td><strong>${esc(t.name)}</strong><div class="muted small mono">${esc(t.id)}</div></td>
           ${multiSpace() ? `<td class="nowrap">${spaceDot(t.space)}${esc(t.space)}</td>` : ""}
           <td class="nowrap">${t.last_used_at ? `<span title="${esc(fullTime(t.last_used_at))}">${ago(t.last_used_at)}</span>` : `<span class="muted">Never</span>`}${t.rolled_at ? `<div class="muted small">rolled ${ago(t.rolled_at)}</div>` : ""}</td>
-          <td>${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span><span class="host">${esc(t.resumer.machine)}</span></span>` : `<span class="muted">Not seen</span>`}</td>
+          <td>${t.resumer ? `<span class="item"><span class="live ${t.resumer.online ? "on" : "off"}"></span><span class="host">${esc(t.resumer.machine)}</span>${behind(cfg, t.resumer)}</span>` : `<span class="muted">Not seen</span>`}</td>
           <td style="text-align:right;width:1%">${machineMenuHtml(t, spaces.length > 1)}</td></tr>`).join("")}</table></div>`
         : `<div class="muted small">No machine tokens yet. Connect one below.</div>`}
         <form class="form-row" id="add-token" style="margin-top:14px">
@@ -820,7 +825,7 @@ function machinesSetting(cfg, tokens, resumers) {
           <button class="btn primary">${icon("plus", 15)}Create token</button></form>
       </div>
       ${others.length ? `<div class="status-row"><span class="muted">Other resumers</span>
-        ${others.map((r) => `<span class="item"><span class="live ${r.online ? "on" : "off"}"></span>${esc(r.machine)} <span class="muted">${r.token ? "" : "admin token · "}${r.online ? "online" : "offline"}</span>${r.online ? "" : `<button class="icon-btn" data-action="forget-resumer" data-id="${esc(r.machine)}" title="Remove ${esc(r.machine)} from this list" aria-label="Remove ${esc(r.machine)}">${icon("x", 13)}</button>`}</span>`).join("")}</div>` : ""}
+        ${others.map((r) => `<span class="item"><span class="live ${r.online ? "on" : "off"}"></span>${esc(r.machine)} <span class="muted">${r.token ? "" : "admin token · "}${r.online ? "online" : "offline"}</span>${behind(cfg, r)}${r.online ? "" : `<button class="icon-btn" data-action="forget-resumer" data-id="${esc(r.machine)}" title="Remove ${esc(r.machine)} from this list" aria-label="Remove ${esc(r.machine)}">${icon("x", 13)}</button>`}</span>`).join("")}</div>` : ""}
       ${cfg.auth ? `<div class="form-row" style="margin-top:12px"><button class="btn small ghost" data-action="copy-gui-link">${icon("link", 14)}Copy GUI sign-in link</button></div>
         <p class="hint">The sign-in link holds the admin token, which sees and manages every space. Give machines their own token instead.</p>`
         : `<p class="hint">Auth is off: anyone who can reach the server sees everything, and a token only picks the space new decisions go to. To accept other machines safely, run the server with <code>host = "0.0.0.0"</code> and a <code>token</code>; <code>decide server install --host 0.0.0.0</code> sets both.</p>`}

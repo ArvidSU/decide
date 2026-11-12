@@ -201,7 +201,7 @@ Data lives in the `decisions-data` volume (`/data/decisions.db`). Both variables
 curl -fsSL http://server:8787/install.sh | sh -s -- --token dk_…
 ```
 `decide token create laptop --space work` prints the same command. Each machine gets its own token, so you can roll, move or revoke one without touching the others (`decide token roll/set/revoke`, or the buttons in Settings → Machines). Don't hand out the admin token: it sees every space. The installer:
-1. installs `decide` from a wheel the server builds from its own code (via uv, pipx or pip; uv can even fetch Python). Re-run it to update after you update the server.
+1. installs `decide` from a wheel the server builds from its own code (via uv, pipx or pip; uv can even fetch Python). From then on the machine follows the server's code by itself (see Upgrading).
 2. runs `decide connect <url> --token …`, which checks the token and saves both to `~/.config/decisions/client.toml` (mode 600).
 3. runs `decide skill install` (see above).
 4. runs `decide resumer install` if `claude` or `codex` is on PATH.
@@ -211,6 +211,10 @@ Flags: `--no-resumer`, `--no-skill`. The pieces are also served on their own: `/
 **Resuming happens on the machine where the session ran.** `decide create` records the machine (hostname, or `DECISIONS_MACHINE`) in the resume target. Each machine's resumer heartbeats under its own name and only resumes its own sessions. The decision page shows the status of the resumer on that decision's machine, and Settings lists every machine's resumer.
 
 **Upgrading:** install the new version and restart the server (with Docker: `docker compose build && docker compose up -d`). The database records its schema version, and the server upgrades an older database when it starts, keeping all of its data. If it can't, it leaves the database as it was and refuses to start, saying why. `decide migrate` does the upgrade without starting the server, e.g. to try it on a copy first: `decide migrate --db /path/to/copy.db`. Back the database file up before upgrading.
+
+**The machines follow the server.** The server names the code it runs with a build (a hash of the package, in `GET /api/config` and in the name of the wheel it serves), and tells every resumer in the answer to its heartbeat. A resumer whose `decide` was installed from the server and is another build reruns the server's installer for `decide` and the skill, and then restarts itself with the new code, once no resume or proof is in flight. So within a minute of the server being upgraded, every machine with a resumer runs the same code as it, and you only ever upgrade the server. `decide update` does the same by hand, e.g. on a machine without a resumer (`--check` only says whether it's up to date, exit 1 if not). A `decide` that runs from a checkout (`uv tool install --editable .`) isn't touched: Settings → Machines marks it "other version". `decide resumer install --no-update` turns it off for a machine.
+
+**The server can follow the repository.** In this repository, `.dash-bored/scripts/remote.py deploy` upgrades a Docker server on another machine over ssh: backup, a trial upgrade of a copy of the backup, and only then a restart. `remote.py follow-setup` makes that machine do the same by itself whenever origin's `main` has new commits (a launchd job that pulls every 2 minutes; `--off` removes it). It only moves forward: a server running commits that aren't pushed yet is left on them until `main` contains them. A commit whose migration fails on the copy isn't deployed, and the server keeps running the previous one. Together with the above: push to `main`, and the server and every machine run it a few minutes later.
 
 **What needs which direction:** `decide wait`, the resumer and the GUI only make outbound connections to the server. Webhooks (`decide watch`/`listen`, your own) need the server to reach the receiver. `decide watch` against a remote server listens on all interfaces and registers the local address it uses to reach the server; override with `--callback-url`.
 
@@ -245,7 +249,7 @@ Link the issue where a decision is acted on with `decide issue D-12 https://line
 
 Goals from the CLI: `decide goal list` (a tree), `decide goal create TITLE --serves G-1 --tag tech`, `decide goal get G-3`, `decide goal set G-3 --status abandoned --note …`, `decide create … --goal G-3`, `decide goal proof G-3 --command ./prove.sh --script prove.sh --success "…"` (run it again after editing a script to record the change; `--remove`), `decide goal ready G-3 --note …`, `decide goal wait G-3` (until it's agreed on, passes or fails), `decide map --focus D-12 --tag tech` and `decide insights --tag tech`.
 
-Client commands (`decide create/get/list/issue/wait/watch/fill/ack/verify/resumer/space/token/goal/map/insights`) find the server from `DECISIONS_URL` / `DECISIONS_TOKEN`, then `~/.config/decisions/client.toml` (written by `decide connect`), then `http://127.0.0.1:8787`. `DECISIONS_ACTOR` names who is acting; `DECISIONS_MACHINE` overrides the machine name.
+Client commands (`decide create/get/list/issue/wait/watch/fill/ack/verify/resumer/update/space/token/goal/map/insights`) find the server from `DECISIONS_URL` / `DECISIONS_TOKEN`, then `~/.config/decisions/client.toml` (written by `decide connect`), then `http://127.0.0.1:8787`. `DECISIONS_ACTOR` names who is acting; `DECISIONS_MACHINE` overrides the machine name.
 
 ## License
 

@@ -1937,13 +1937,14 @@ class Store:
         machine = str(body.get("machine") or body.get("host") or "default")
         with self.lock:
             self.resumers[machine] = {"name": actor, "pid": body.get("pid"), "machine": machine,
-                                      "command": body.get("command"), "last_seen": time.time(),
+                                      "command": body.get("command"), "build": body.get("build"),
+                                      "last_seen": time.time(),
                                       "token": scope.token}
         return self.resumer_status(machine)
 
     def _resumer_dict(self, r: dict) -> dict:
         return {"online": time.time() - r["last_seen"] < 90, "name": r["name"], "pid": r["pid"],
-                "machine": r["machine"], "command": r["command"], "token": r["token"],
+                "machine": r["machine"], "command": r["command"], "build": r["build"], "token": r["token"],
                 "last_seen": datetime.fromtimestamp(r["last_seen"], timezone.utc).isoformat(timespec="seconds")
                 .replace("+00:00", "Z")}
 

@@ -1424,6 +1424,92 @@ class RemoteTest(unittest.TestCase):
                              cwd=self.tmp, env=os.environ | {"PYTHONPATH": target}, check=True)
         self.assertEqual(ver.stdout.strip(), "decide 0.1.0")
 
+    def test_a_machine_follows_the_servers_build(self):
+        """The server names its build; a resumer installed from it reruns the installer when that changes, and
+        restarts once the code on disk isn't what it runs. `sh` is a stand-in: nothing is really installed."""
+        from unittest import mock
+        from decisions import dist
+        def api(method, path, body=None):
+            req = urllib.request.Request(self.base + path, method=method, data=json.dumps(body).encode() if body else None,
+                                         headers={"Authorization": "Bearer s3cret", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read())
+        name = self.get("/install.sh").decode().split('WHEEL="$SERVER/install/', 1)[1].split('"', 1)[0]
+        build = name.split("+")[1].split("-")[0]
+        self.assertEqual(api("GET", "/api/config")["build"], build)
+        self.assertEqual(dist.fingerprint(), build)
+        beat = api("POST", "/api/resumer/heartbeat", {"machine": "old-mb", "build": "0123456789"})
+        self.assertEqual((beat["build"], beat["server_build"]), ("0123456789", build))
+        self.assertEqual(api("GET", "/api/resumer?machine=old-mb")["build"], "0123456789")
+
+        # A machine set up from the server: its decide is the wheel, which records the build it is.
+        site, bin_dir, out = (os.path.join(self.tmp, d) for d in ("site", "bin", "out"))
+        whl = os.path.join(self.tmp, name)
+        with open(whl, "wb") as fh:
+            fh.write(self.get(f"/install/{name}"))
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--no-index", "--target", site, whl],
+                       check=True)
+        os.makedirs(bin_dir), os.makedirs(out)
+        with open(os.path.join(bin_dir, "sh"), "w") as fh:  # the "installer": records the call, changes the code
+            fh.write('#!/bin/sh\n/bin/cat > "$OUT/installer.sh"\necho "$*" > "$OUT/args"\n'
+                     'echo "$DECISIONS_TOKEN" > "$OUT/token"\necho "# newer" >> "$SITE/decisions/markdown.py"\n')
+        os.chmod(os.path.join(bin_dir, "sh"), 0o755)
+        env = {k: v for k, v in os.environ.items() if k != "DECISIONS_TOKEN"} | {
+            "PYTHONPATH": site, "DECISIONS_URL": self.base, "DECISIONS_CLIENT_CONFIG": os.path.join(self.tmp, "c.toml"),
+            "DECISIONS_STATE_DIR": os.path.join(self.tmp, "state"), "DECISIONS_MACHINE": "mb", "OUT": out, "SITE": site,
+            "HOME": os.path.join(self.tmp, "home"), "PATH": bin_dir + os.pathsep + os.environ["PATH"]}
+        decide = lambda *a, **kw: subprocess.run([sys.executable, "-m", "decisions", *a], cwd=self.tmp,
+                                                 capture_output=True, text=True, env=env | {"DECISIONS_TOKEN": "s3cret"} | kw)
+        same = decide("update")
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertIn(f"up to date: this decide is {build}", same.stdout)
+        self.assertFalse(os.listdir(out))
+
+        log = os.path.join(self.tmp, "resumer.log")
+        with mock.patch.object(dist, "fingerprint", return_value="feedfeed00"):  # the server was upgraded
+            check = decide("update", "--check")
+            self.assertEqual(check.returncode, 1)
+            self.assertIn(f"out of date: this decide is {build}, {self.base} serves feedfeed00", check.stdout)
+            # A checkout isn't the server's to replace.
+            dev = decide("update", PYTHONPATH=ROOT)
+            self.assertNotEqual(dev.returncode, 0)
+            self.assertIn("wasn't installed from a server", dev.stderr)
+            self.assertFalse(os.listdir(out))
+            # Opted out: it keeps running what it has.
+            with open(log, "w") as fh:
+                quiet = subprocess.Popen([sys.executable, "-m", "decisions", "resumer", "run", "--no-update"],
+                                         cwd=self.tmp, stdout=fh, stderr=subprocess.STDOUT,
+                                         env=env | {"DECISIONS_TOKEN": "s3cret", "DECISIONS_MACHINE": "quiet-mb"})
+            try:
+                deadline = time.time() + 20
+                while time.time() < deadline and not api("GET", "/api/resumer?machine=quiet-mb")["online"]:
+                    time.sleep(0.1)
+                self.assertEqual(api("GET", "/api/resumer?machine=quiet-mb")["build"], build)
+                self.assertFalse(os.listdir(out))
+            finally:
+                quiet.terminate()
+                quiet.wait()
+            with open(log, "w") as fh:
+                resumer = subprocess.Popen([sys.executable, "-m", "decisions", "resumer", "run"], cwd=self.tmp,
+                                           stdout=fh, stderr=subprocess.STDOUT, env=env | {"DECISIONS_TOKEN": "s3cret"})
+            try:
+                deadline = time.time() + 30
+                while time.time() < deadline and open(log).read().count("watching") < 2:
+                    time.sleep(0.1)
+                said = open(log).read()
+                self.assertIn(f"{self.base} runs build feedfeed00; updating decide and the skill", said)
+                self.assertIn(f"restarting with build", said)
+                self.assertEqual(said.count("watching"), 2, said)  # it came back, with the new code
+                self.assertEqual(said.count("updating decide"), 1, said)
+                self.assertNotEqual(api("GET", "/api/resumer?machine=mb")["build"], build)
+            finally:
+                resumer.terminate()
+                resumer.wait()
+        # The installer got the token in its environment, not on its command line, and left the resumer alone.
+        self.assertEqual(open(os.path.join(out, "args")).read().strip(), "-s -- --no-resumer --no-skill")
+        self.assertEqual(open(os.path.join(out, "token")).read().strip(), "s3cret")
+        self.assertIn(f'SERVER="{self.base}"', open(os.path.join(out, "installer.sh")).read())
+
     def test_connect_remembers_server_and_token(self):
         client_cfg = os.path.join(self.tmp, "client.toml")
         env = {k: v for k, v in os.environ.items() if k != "DECISIONS_URL"} | {
@@ -1471,6 +1557,112 @@ class RemoteTest(unittest.TestCase):
         self.assertIn(["launchctl", "bootstrap", f"gui/{os.getuid()}",
                        os.path.join(home, "Library/LaunchAgents/com.decisions.server.plist")],
                       [c.args[0] for c in run.call_args_list])
+
+
+class FollowTest(unittest.TestCase):
+    """.dash-bored/scripts/remote.py follow: the server's machine deploys origin's main when it moves, and only
+    forward. Docker is mocked (roll_out); git and rsync are real."""
+
+    def setUp(self):
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("remote", os.path.join(ROOT, ".dash-bored/scripts/remote.py"))
+        self.remote = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.remote)
+        self.tmp = tempfile.mkdtemp()
+        self.origin, self.clone, self.dir = (os.path.join(self.tmp, d) for d in ("origin", "clone", "server"))
+        os.makedirs(os.path.join(self.origin, "decisions"))
+        os.makedirs(self.dir)
+        self.git(self.origin, "init", "-q", "-b", "main")
+        self.first = self.push("one")
+        self.git(self.tmp, "clone", "-q", self.origin, self.clone)
+        self.remote.ROOT = self.clone
+        self.rolled = []
+        self.fail = None
+        def roll_out(target, head):
+            self.rolled.append(head)
+            if self.fail:
+                raise self.fail
+            with open(os.path.join(target.path, ".deployed"), "w") as fh:
+                fh.write(head + " now\n")
+        for patch in (mock.patch.object(self.remote, "roll_out", roll_out),
+                      mock.patch.object(self.remote.os, "execve"), mock.patch("builtins.print")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd,
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def push(self, text, repo=None):
+        """A commit on origin's main (or in `repo`). Returns its short hash."""
+        repo = repo or self.origin
+        for name in ("LICENSE", "decisions/code.py"):
+            with open(os.path.join(repo, name), "w") as fh:
+                fh.write(text)
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-q", "-m", text)
+        return self.git(repo, "rev-parse", "--short", "HEAD")
+
+    def follow(self):
+        import argparse
+        return self.remote.follow(argparse.Namespace(dir=self.dir, branch="main"))["state"]
+
+    def test_deploys_new_commits_and_only_forward(self):
+        self.assertEqual(self.follow(), "healthy")  # nothing ran yet: deploy what's there
+        self.assertEqual(self.rolled, [self.first])
+        self.assertEqual(self.follow(), "healthy")
+        self.assertEqual(self.rolled, [self.first])
+        second = self.push("two")
+        self.assertEqual(self.follow(), "healthy")
+        self.assertEqual(self.rolled, [self.first, second])
+        self.remote.os.execve.assert_called_once()  # it pulled, so it started over with the script it pulled
+        self.assertEqual(self.remote.os.execve.call_args.args[2]["FOLLOW_PULLED"], "1")
+        self.assertEqual(json.load(open(os.path.join(self.dir, ".follow/status.json")))["state"], "healthy")
+
+        # Someone deployed work that isn't pushed: leave the server on it, don't take it back to main.
+        elsewhere = os.path.join(self.tmp, "laptop")
+        self.git(self.tmp, "clone", "-q", self.origin, elsewhere)
+        unpushed = self.push("three, on the laptop", elsewhere)
+        with open(os.path.join(self.dir, ".deployed"), "w") as fh:
+            fh.write(unpushed + " now\n")
+        self.assertEqual(self.follow(), "waiting")
+        with open(os.path.join(self.origin, "README.md"), "w") as fh:
+            fh.write("unrelated")
+        self.git(self.origin, "add", "-A")
+        self.git(self.origin, "commit", "-q", "-m", "unrelated")
+        self.assertEqual(self.follow(), "waiting")
+        self.assertEqual(self.rolled, [self.first, second])
+        # Once main contains it, the server moves on from there.
+        self.git(self.origin, "pull", "-q", "--no-rebase", "--no-edit", elsewhere, "main")
+        merged = self.git(self.origin, "rev-parse", "--short", "HEAD")
+        self.assertEqual(self.follow(), "healthy")
+        self.assertEqual(self.rolled, [self.first, second, merged])
+
+    def test_a_commit_that_cant_upgrade_the_database_is_tried_once_and_other_failures_later(self):
+        self.fail = self.remote.CantUpgrade("no")
+        self.assertEqual(self.follow(), "stuck")
+        self.assertEqual(self.follow(), "stuck")
+        self.assertEqual(self.rolled, [self.first])
+        self.fail = SystemExit("docker isn't running")
+        fixed = self.push("fixed")
+        self.assertEqual(self.follow(), "error")
+        self.assertEqual(self.follow(), "error")
+        self.assertEqual(self.rolled, [self.first, fixed])
+        self.fail = None
+        self.remote.RETRY_AFTER = 0
+        self.assertEqual(self.follow(), "healthy")
+        self.assertEqual(self.rolled, [self.first, fixed, fixed])
+
+    def test_shipping_keeps_what_belongs_to_the_server(self):
+        for name, text in ((".env", "DECISIONS_BASE_URL=http://x:1\n"), (".deployed", "abc now\n"), ("stale.py", "")):
+            with open(os.path.join(self.dir, name), "w") as fh:
+                fh.write(text)
+        local = self.remote.Local(self.dir)
+        self.assertEqual(self.remote.ship(local), self.remote.fingerprint(self.clone))
+        self.assertEqual(sorted(os.listdir(self.dir)), [".deployed", ".env", "LICENSE", "decisions"])
+        self.assertEqual(local.env("DECISIONS_BASE_URL"), "http://x:1")
+        self.assertEqual(local.run("exit 3", check=False), 3)
 
 
 class SpacesTest(unittest.TestCase):
