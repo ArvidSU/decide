@@ -1460,7 +1460,8 @@ def cmd_server_install(args):
     if args.auto_update:
         _refuse_checkout()
     path = os.path.expanduser(args.config or os.environ.get("DECISIONS_CONFIG") or "~/.config/decisions/config.toml")
-    cfg = load_config(path if os.path.exists(path) else None, {"host": args.host, "port": args.port, "db": args.db})
+    cfg = load_config(path if os.path.exists(path) else None, {"host": args.host, "port": args.port, "db": args.db,
+                                                               "follow": args.follow, "upstream": args.upstream})
     if not os.path.exists(path):
         token = cfg.token or (secrets.token_urlsafe(24) if not is_loopback(cfg.host) else "")
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1468,21 +1469,29 @@ def cmd_server_install(args):
         with os.fdopen(fd, "w") as fh:
             fh.write(f"# written by `decide server install`\nhost = {json.dumps(cfg.host)}\nport = {cfg.port}\n"
                      f"db = {json.dumps(cfg.db)}\ntoken = {json.dumps(token)}\n"
-                     f"base_url = {json.dumps(args.base_url or '')}\n")
-        cfg.token = token
+                     f"base_url = {json.dumps(args.base_url or '')}\n"
+                     + "".join(f"{key} = {json.dumps(value)}\n" for key, value in
+                               (("follow", args.follow), ("upstream", args.upstream)) if value))
+        cfg.token, cfg.base_url = token, args.base_url or ""
         print(f"wrote {path}")
-    elif args.host or args.port or args.db or args.base_url:
-        sys.exit(f"error: {path} exists; edit host/port/db/base_url there instead of passing flags")
+    elif args.host or args.port or args.db or args.base_url or args.follow or args.upstream:
+        sys.exit(f"error: {path} exists; edit host/port/db/base_url/follow/upstream there instead of passing flags")
     if not is_loopback(cfg.host) and not cfg.token:
         sys.exit(f"error: {path} has host = {cfg.host!r} but no token; add `token = \"...\"` "
                  f"(e.g. {secrets.token_urlsafe(24)})")
     os.makedirs(STATE_DIR, exist_ok=True)
     _install_service(SERVER_SERVICE, [decide, "serve", "--config", path], _service_env(decide),
                      os.path.join(STATE_DIR, "server.log"))
+    if args.wait:
+        from . import dist, update
+        if not update.comes_up(update.local_url(cfg), dist.fingerprint(), args.wait):
+            sys.exit(f"error: the service is installed, but the server doesn't answer at {update.local_url(cfg)} "
+                     f"with this code after {args.wait:g} s. Its log says why (e.g. the port is taken): "
+                     f"{os.path.join(STATE_DIR, 'server.log')}")
     if args.auto_update:
         _install_updater(decide, cfg, ["--config", path], args.every)
     url = cfg.public_url
-    print(f"\nGUI: {url}" + (f"/#token={cfg.token}" if cfg.token else "") + "  (this link holds the admin token)")
+    print(f"\nGUI: {url}" + (f"/#token={cfg.token}  (this link holds the admin token)" if cfg.token else ""))
     if not is_loopback(cfg.host):
         print("set up another machine: in the GUI, Settings → Machines → Connect a machine. It creates a token for "
               "one space and the command that installs decide, the skill and the resumer with it.")
@@ -1687,6 +1696,13 @@ def _main(argv):
                    help="also keep it on upstream's code: run `decide server update` regularly")
     r.add_argument("--every", type=int, default=3600, metavar="SECONDS",
                    help="with --auto-update: how often (default 3600)")
+    r.add_argument("--follow", choices=["tags", "main"],
+                   help="what `decide server update` runs, written to a new config: upstream's newest release tag "
+                        "(the default), or the head of its main branch")
+    r.add_argument("--upstream", metavar="URL", help="the git repository it follows, written to a new config "
+                                                     "(default: https://github.com/ArvidSU/decide)")
+    r.add_argument("--wait", type=float, default=0, metavar="SECONDS",
+                   help="wait this long for the server to answer with this code, and fail if it doesn't")
     r.set_defaults(fn=cmd_server_install)
     r = ssub.add_parser("uninstall", help="stop and remove the service, and its updater")
     r.set_defaults(fn=cmd_server_uninstall)

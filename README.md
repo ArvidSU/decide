@@ -1,14 +1,42 @@
 # Decisions
 
+Where your coding agents ask you what to do. Instead of stopping to ask in chat, an agent (Claude Code, Codex, anything that can run a command) puts the question and its options to your Decisions server with the `decide` CLI; you compare the options and pick in a web GUI when you have time, and the agent hears the outcome, or its session is resumed if it has ended.
+
+It's for a developer who runs several agent sessions and doesn't want to sit and watch them. You host it yourself: one small server, no dependencies beyond Python and SQLite.
+
+![A decision in the GUI: an agent asks what to build next sprint, with seven options compared by effort, impact, risk and area, two of them selected](docs/screenshot.jpg)
+
+## Install
+
+On the machine that should run the server (macOS or Linux):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ArvidSU/decide/main/install.sh | sh
+```
+
+This installs `decide`, starts the server as a background service (launchd, or systemd `--user`) that updates itself, and prints the link to the GUI. Then connect your agents: in the GUI, Settings → Machines → Connect a machine shows the command to run on each machine whose agents should use it, the server's own included.
+
+By default the server only listens on that machine (`127.0.0.1`, no token). To reach it from other machines, add `--network`: it then listens on every interface and requires a token, which is generated and is in the link it prints.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ArvidSU/decide/main/install.sh | sh -s -- --network
+```
+
+Traffic is plain HTTP, so keep a networked server on a trusted network or a tailnet, or behind an HTTPS reverse proxy. [Running it on another machine](#running-it-on-another-machine) has the details, the installer's other flags, and Docker.
+
+## What it is
+
 A general-purpose decision log. Agents and external apps **create decisions over REST**; you **resolve them in a fast GUI** by filtering out what isn't viable and selecting one or more options; a **webhook fires** so the requester can act. Every change is recorded in an **immutable, hash-chained log** for provenance.
 
-It doesn't care what is being decided: a jacket to buy, the next feature to build, a database to use. Options carry arbitrary attributes; you can ask the requester for more attributes and it fills them in, best effort.
+It doesn't care what is being decided: a jacket to buy, the next feature to build, a database to use. Options carry arbitrary attributes; you can ask the requester for more attributes and it fills them in, best effort. Decisions are steps toward **goals**, and an agent can propose a **proof** that a goal is achieved, which you agree to and then run with one button.
 
 Zero dependencies: Python ≥ 3.11 stdlib + SQLite + a vanilla-JS GUI.
 
-Early development: ready for experimentation, with APIs and storage still subject to change.
+Early development: ready for experimentation, with APIs and storage still subject to change. Upgrades keep your data.
 
-Clone the repository and start the server (Python 3.11 or newer):
+### From a checkout
+
+To try it without installing anything, or to work on it, clone the repository and start the server (Python 3.11 or newer):
 
 ```sh
 git clone https://github.com/ArvidSU/decide.git
@@ -192,10 +220,21 @@ Run the server on one always-on machine (a home server, a Mac mini, a VPS on you
 
 **On the server:**
 ```sh
-uv tool install git+https://github.com/ArvidSU/decide     # or pipx install git+…, or from a clone: uv tool install .
-decide server install --host 0.0.0.0 --auto-update        # launchd (macOS) or systemd --user (Linux); generates a token
+curl -fsSL https://raw.githubusercontent.com/ArvidSU/decide/main/install.sh | sh -s -- --network
 ```
-`--auto-update` keeps the server on upstream's releases by itself (see Upgrading); leave it out to upgrade by hand. This writes `~/.config/decisions/config.toml` (host, port, db, the admin token, `base_url`), starts the service, and prints a GUI link with the admin token (`http://server:8787/#token=…` logs the browser in once). Create spaces and connect machines from there. The server refuses to listen on a non-loopback address without a token (`--insecure` overrides). Traffic is plain HTTP, so keep it on a trusted network or a tailnet, or put it behind an HTTPS reverse proxy and set `base_url`.
+This writes `~/.config/decisions/config.toml` (host, port, db, the admin token, `base_url`), starts the service, and prints a GUI link with the admin token (`http://server:8787/#token=…` logs the browser in once). Create spaces and connect machines from there. The server refuses to listen on a non-loopback address without a token (`--insecure` overrides). Traffic is plain HTTP, so keep it on a trusted network or a tailnet, or put it behind an HTTPS reverse proxy and set `base_url`.
+
+The installer (`install.sh` in this repository) needs git, and macOS or a Linux with systemd user services. In order:
+1. It picks the commit to install: upstream's newest release (a tag like `v1.2.0`), or the head of `main` with `--follow main`. While upstream has no release, it installs the head of `main` and the server moves to the first release when there is one.
+2. It fetches that commit and has the code build its own wheel, with the commit recorded in it, so Settings → Version names it and the updater knows what it runs.
+3. It installs `decide` with uv, else pipx, else pip (a python3 ≥ 3.11 whose pip may install for the user). With none of them it downloads uv, which brings its own Python; `--no-uv` refuses instead.
+4. It runs `decide server install --auto-update`: the service, and the job that runs `decide server update` every hour (see Upgrading), and waits for the server to answer.
+
+Flags: `--network` (listen on `0.0.0.0`, with a generated token), `--host ADDR`, `--port N`, `--base-url URL`, `--follow tags|main`, `--repo URL` (another repository to install from and follow), `--no-auto-update`, `--no-uv`. What they set is written to the config file.
+
+**Run it again to upgrade or repair an install.** When the config file exists, it and the database are kept: the installer follows what the config says (`follow`, `upstream`), backs the database up to `backups/` next to it, upgrades a copy of the backup with the new code, and only if that works installs the code and restarts the service. A flag that contradicts the config is refused before anything is touched: change `host`, `port`, `base_url`, `follow` or `upstream` in the file. A `decide` installed from a checkout (`uv tool install --editable .`) is left alone.
+
+The same by hand: `uv tool install git+https://github.com/ArvidSU/decide` (records no commit, so Settings → Version says "Not recorded" until the first update), then `decide server install --host 0.0.0.0 --auto-update`. `--follow` and `--upstream` are written to a new config, and `--wait SECONDS` fails if the server doesn't answer in that time.
 
 **Or with Docker** (the image is just the server; resumers run on the agent machines):
 ```sh
