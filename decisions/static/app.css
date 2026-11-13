@@ -262,6 +262,15 @@ a.chip:hover { border-color: var(--border-strong); color: var(--text); text-deco
 .proof .kv { margin-top: 12px; }
 .proof-script { margin-top: 10px; }
 .proof-script summary { cursor: pointer; font-size: 12.5px; width: fit-content; }
+.proof-changes { margin-top: 14px; }
+.proof-changes summary { cursor: pointer; font-size: 13.5px; width: fit-content; }
+.proof-change { margin-top: 10px; }
+.pc-what { font-size: 12.5px; color: var(--muted); }
+pre.diff { background: var(--sunken); border: 1px solid var(--border); padding: 6px 0; border-radius: 6px; max-height: 360px; overflow: auto; margin: 4px 0 0; font-size: 12.5px; }
+pre.diff span { display: block; padding: 0 10px; min-width: fit-content; }
+pre.diff .add { background: var(--good-soft); color: var(--good); }
+pre.diff .del { background: var(--bad-soft); color: var(--bad); }
+pre.diff .hunk { color: var(--faint); }
 .proof-script pre { background: var(--sunken); border: 1px solid var(--border); padding: 10px; border-radius: 6px; max-height: 360px; overflow: auto; margin: 6px 0 0; font-size: 12.5px; }
 .callout.slim { padding: 4px 6px 4px 12px; min-height: 42px; margin-top: 20px; }
 .callout.slim .btn.small { height: 28px; }

@@ -1024,6 +1024,47 @@ class DecisionsTest(unittest.TestCase):
         self.assertIsNone(g["proof"])
         self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
 
+    def test_changed_proof_shows_what_differs_from_the_version_agreed_on(self):
+        gid = self.goal("Fleet upgrades itself")["id"]
+        put = lambda spec: self.call("PUT", f"/api/goals/{gid}/proof", spec, expect=200)["proof"]
+        agree = lambda p: self.call("POST", f"/api/goals/{gid}/proof/agree", {"hash": p["hash"]}, actor="me", expect=200)["proof"]
+        spec = {"success": "Upgrades within 10 minutes\nof a release", "command": "./prove.sh", "machine": "mb",
+                "scripts": [{"path": "prove.sh", "content": "set -e\nrelease\nsleep 600\ncheck\n"},
+                            {"path": "old.sh", "content": "true\n"}]}
+        first = put(spec)
+        self.assertIsNone(first["changes"])  # nothing to compare the first version with
+        self.assertIsNone(agree(first)["changes"])
+
+        # Changed twice after it was agreed on: the diff is against what was agreed on, not the version between.
+        put(spec | {"command": "./prove.sh --fast"})
+        second = put(spec | {"timeout": 900, "scripts": [
+            {"path": "prove.sh", "content": "set -e\nrelease\nsleep 60\ncheck\n"}, {"path": "new.sh", "content": "true\n"}]})
+        c = second["changes"]
+        self.assertEqual((c["since"]["hash"], c["since"]["agreed"]["by"], c["since"]["proposed_by"]), (first["hash"], "me", "agent"))
+        self.assertEqual([(part["what"], part["change"]) for part in c["parts"]], [
+            ("timeout", "changed"), ("script prove.sh", "changed"), ("script old.sh", "removed"), ("script new.sh", "added")])
+        self.assertEqual(c["parts"][0]["diff"], "@@ -1 +1 @@\n-3600\n+900")
+        self.assertEqual(c["parts"][1]["diff"], "@@ -1,5 +1,5 @@\n set -e\n release\n-sleep 600\n+sleep 60\n check\n ")
+        self.assertNotIn("diff", c["parts"][2])
+        self.assertNotIn("changes", self.call("GET", "/api/goals?status=all")["goals"][0]["proof"])
+        # Back to what was agreed on: it still has to be agreed on again, and nothing differs.
+        self.assertEqual(put(spec)["changes"]["parts"], [])
+        # Agreed on, there's nothing left to compare; and the diff isn't stored with the proof.
+        self.assertIsNone(agree(put(spec | {"success": "Upgrades within 5 minutes\nof a release"}))["changes"])
+        with self.store.lock:
+            stored = json.loads(self.store.conn.execute("SELECT proof FROM goals WHERE id=?", (gid,)).fetchone()["proof"])
+        self.assertNotIn("changes", stored)
+
+        # Never agreed on: against the version proposed before it. A removed proof starts over.
+        self.call("DELETE", f"/api/goals/{gid}/proof", actor="me", expect=200)
+        again = put(spec)
+        self.assertIsNone(again["changes"])
+        c = put(spec | {"success": "Upgrades within 5 minutes\nof a release"})["changes"]
+        self.assertEqual((c["since"]["hash"], c["since"]["agreed"]), (again["hash"], None))
+        self.assertEqual(c["parts"], [{"what": "success", "change": "changed", "diff":
+                                       "@@ -1,2 +1,2 @@\n-Upgrades within 10 minutes\n+Upgrades within 5 minutes\n of a release"}])
+        self.assertTrue(self.call("GET", "/api/events/verify")["ok"])
+
     def test_resumer_runs_a_goals_proof_only_while_its_script_is_what_was_agreed_on(self):
         work = os.path.join(self.tmp, "work")
         os.makedirs(work)

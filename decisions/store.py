@@ -6,6 +6,7 @@ log is the provenance record of what changed, when, and by whom.
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import hmac
 import json
@@ -610,6 +611,26 @@ def proof_hash(proof: dict) -> str:
     return hashlib.sha256(canonical(
         {k: proof[k] for k in ("success", "command", "cwd", "machine", "timeout")}
         | {"scripts": [{"path": s["path"], "sha256": s["sha256"]} for s in proof["scripts"]]}).encode()).hexdigest()
+
+
+def _line_diff(was: str, now: str) -> str:
+    """What changed from `was` to `now` as a unified diff, without the file names."""
+    return "\n".join(list(difflib.unified_diff(was.split("\n"), now.split("\n"), lineterm=""))[2:])
+
+
+def proof_changes(was: dict, now: dict) -> list[dict]:
+    """What a proof's version `now` changed in `was`, part by part: [{what, change: changed / added / removed,
+    diff?}], with `what` named as in `proof.changed` events."""
+    parts = [{"what": k, "change": "changed", "diff": _line_diff(str(was[k]), str(now[k]))}
+             for k in ("success", "command", "cwd", "machine", "timeout") if was[k] != now[k]]
+    old, new = ({s["path"]: s for s in p["scripts"]} for p in (was, now))
+    for path in dict.fromkeys([*old, *new]):
+        if path not in old or path not in new:
+            parts.append({"what": f"script {path}", "change": "added" if path in new else "removed"})
+        elif old[path]["sha256"] != new[path]["sha256"]:
+            parts.append({"what": f"script {path}", "change": "changed",
+                          "diff": _line_diff(old[path]["content"], new[path]["content"])})
+    return parts
 
 
 def _proof(body: dict) -> dict:
@@ -1659,6 +1680,30 @@ class Store:
             return {"status": "armed"}
         return state
 
+    def _proof_changes(self, gid: str, proof: dict) -> dict | None:
+        """What a proof that isn't agreed on changed, for reading before agreeing: against the version last
+        agreed on, or else the one proposed before it. None when it's the first since the goal last had none."""
+        if proof["agreed"]:
+            return None
+        versions, agreed = [], None
+        for ev in self.conn.execute(
+                "SELECT * FROM events WHERE goal_id=? AND type IN ('proof.proposed', 'proof.changed', 'proof.agreed') "
+                "AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE goal_id=? AND type='proof.removed'), 0) "
+                "ORDER BY seq", (gid, gid)).fetchall():
+            if ev["type"] == "proof.agreed":
+                agreed = ev
+            else:
+                versions.append(ev)
+        was = agreed and next((v for v in reversed(versions) if v["seq"] < agreed["seq"]
+                               and json.loads(v["data"])["hash"] == json.loads(agreed["data"])["hash"]), None)
+        was = was or (versions[-2] if len(versions) > 1 else None)
+        if not was:
+            return None
+        then = json.loads(was["data"])["proof"]
+        return {"since": {"hash": then["hash"], "proposed_by": was["actor"], "proposed_at": was["ts"],
+                          "agreed": agreed and {"by": agreed["actor"], "at": agreed["ts"]}},
+                "parts": proof_changes(then, proof)}
+
     def _proof_view(self, gid: str, row) -> dict | None:
         if not row["proof"]:
             return None
@@ -1668,7 +1713,8 @@ class Store:
         # Asked for and not reported back yet. Past its timeout it's given up on: the resumer died or is offline.
         busy = bool(run and run["status"] in ("requested", "started") and waited <= proof["timeout"] + PROOF_GRACE)
         return proof | {"run": run, "busy": busy, "resume_command": manual_command(proof.get("resume")),
-                        "resume_state": self._proof_resume_state(gid, proof, run)}
+                        "resume_state": self._proof_resume_state(gid, proof, run),
+                        "changes": self._proof_changes(gid, proof)}
 
     def _proof_row(self, gid: str, scope: Scope) -> tuple:
         row = self._goal_row(gid, scope)
@@ -1678,7 +1724,7 @@ class Store:
         return row, view
 
     def _write_proof(self, gid: str, proof: dict | None):
-        stored = proof and {k: v for k, v in proof.items() if k not in ("run", "busy", "resume_command", "resume_state")}
+        stored = proof and {k: v for k, v in proof.items() if k not in ("run", "busy", "resume_command", "resume_state", "changes")}
         self.conn.execute("UPDATE goals SET proof=?, updated_at=? WHERE id=?",
                           (canonical(stored) if stored else None, now_iso(), gid))
 
@@ -1704,11 +1750,9 @@ class Store:
             self._write_proof(gid, proof | {"proposed_by": actor, "proposed_at": now_iso(), "agreed": None,
                                             "ready": old["ready"] if old else None})
             if old:
-                changed = [k for k in ("success", "command", "cwd", "machine", "timeout") if old[k] != proof[k]]
-                was, now = ({s["path"]: s["sha256"] for s in p["scripts"]} for p in (old, proof))
-                changed += [f"script {path}" for path in dict.fromkeys([*was, *now]) if was.get(path) != now.get(path)]
                 self._event(None, "proof.changed", actor, {
-                    "previous_hash": old["hash"], "hash": proof["hash"], "changed": changed,
+                    "previous_hash": old["hash"], "hash": proof["hash"],
+                    "changed": [part["what"] for part in proof_changes(old, proof)],
                     "was_agreed": bool(old["agreed"]), "proof": proof}, goal_id=gid)
             else:
                 self._event(None, "proof.proposed", actor, {"hash": proof["hash"], "proof": proof}, goal_id=gid)

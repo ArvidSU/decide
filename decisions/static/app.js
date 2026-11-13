@@ -2127,6 +2127,29 @@ function proofResumeHtml(p) {
   return `${text}${actions ? ` ${actions}` : ""}`;
 }
 
+// What a proof that waits to be agreed on changed, as diffs against the version last agreed on (or else the one
+// proposed before it), so a change is read on its own and not hunted for in the whole proof.
+const PROOF_PARTS = { success: "What success looks like", command: "Command", cwd: "Directory", machine: "Runs on", timeout: "Gives up after (seconds)" };
+function diffHtml(diff) {
+  return `<pre class="diff">${diff.split("\n").map((line, i) =>
+    line.startsWith("@@") ? (i === 0 && /^@@ -1[ ,]/.test(line) ? "" : `<span class="hunk">${esc(line)}</span>`)
+    : `<span class="${line[0] === "+" ? "add" : line[0] === "-" ? "del" : ""}">${esc(line) || " "}</span>`).join("")}</pre>`;
+}
+function proofChangesHtml(p) {
+  const c = p.changes;
+  if (!c) return "";
+  const since = c.since.agreed ? `the version ${esc(c.since.agreed.by)} agreed to <span title="${esc(fullTime(c.since.agreed.at))}">${ago(c.since.agreed.at)}</span>`
+    : `the version before it, proposed <span title="${esc(fullTime(c.since.proposed_at))}">${ago(c.since.proposed_at)}</span>`;
+  if (!c.parts.length) return `<p class="section-note proof-changes">Nothing differs from ${since}.</p>`;
+  return `<details class="proof-changes" open><summary><strong>What changed</strong> <span class="muted" title="${esc(c.since.hash)}">· since ${since} · sha256 ${esc(c.since.hash.slice(0, 12))}</span></summary>
+    ${c.parts.map((part) => {
+      const script = part.what.startsWith("script ") ? part.what.slice(7) : null;
+      const name = script != null ? `<code>${esc(script)}</code>` : PROOF_PARTS[part.what];
+      return `<div class="proof-change"><div class="pc-what">${name}${part.change === "changed" ? "" : ` <span class="muted">· ${part.change === "added" ? "new: read it below" : "removed: no longer part of the proof"}</span>`}</div>
+        ${part.diff != null ? diffHtml(part.diff) : ""}</div>`;
+    }).join("")}</details>`;
+}
+
 // How the goal is proved achieved: what was agreed on, where it stands, and the button that asks for it.
 // The button is always there, and only works once the proof is agreed on and the agent flagged the goal ready.
 function proofHtml(g) {
@@ -2145,7 +2168,7 @@ function proofHtml(g) {
     else { title = "Proving…"; text = `Running on ${esc(p.machine)} since ${ago(run.since)}.`; }
   } else if (!p.agreed) {
     cls = "waiting"; title = "Agree on what success looks like"; why = "Agree on it first";
-    text = last?.data.was_agreed ? `${esc(p.proposed_by)} changed it after you agreed (${esc(last.data.changed.join(", "))}). Read it again: it can't run before you agree.`
+    text = last?.data.was_agreed ? `${esc(p.proposed_by)} changed it after you agreed (${esc(last.data.changed.join(", "))}). Read what changed: it can't run before you agree.`
       : `${esc(p.proposed_by)} proposed this ${ago(p.proposed_at)}. Read it, then agree: it can't run before you do.`;
     action = `<button class="btn small primary" data-action="proof-agree">${icon("check", 14)}Agree</button>`;
   } else if (run?.status === "passed") {
@@ -2171,6 +2194,7 @@ function proofHtml(g) {
       <div class="callout-main"><div><strong class="c-title">${title}</strong> <span class="muted">· ${text}</span></div>
         ${run?.detail.output_tail ? `<details ${run.status === "failed" ? "open" : ""}><summary>Output</summary><pre class="small">${esc(run.detail.output_tail)}</pre></details>` : ""}</div>
       <div class="callout-actions">${action}</div></div>
+    ${proofChangesHtml(p)}
     <div class="context">${md(p.success)}</div>
     <dl class="kv">
       <dt>Command</dt><dd><code>${esc(p.command)}</code></dd>
