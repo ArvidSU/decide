@@ -121,6 +121,10 @@ def _summary(d: dict) -> str:
         lines.append(f"  expires {_until(d['due_at'])} ({d['due_at']}) unless decided")
     elif d["status"] == "expired":
         lines.append(f"  expired {_until(d['due_at']) if d.get('due_at') else ''}: nobody decided before the deadline")
+    if d.get("resume") and d["status"] == "open":
+        r = d["resume"]
+        lines.append(f"  resumes {r['agent']} session {r['session_id']} on {r['machine']}"
+                     + (f" in {r['cwd']}" if r.get("cwd") else "") + " when decided")
     if d.get("resolution"):
         r = d["resolution"]
         chosen = ", ".join(f"{s}: {by_id[s]['label']}" if s in by_id else s for s in r["selected"])
@@ -281,7 +285,16 @@ def _resume_target(args) -> dict | None:
         else agents.detect_session()
     if not detected or args.no_resume:
         return None
-    return {"session_id": detected[1], "cwd": os.getcwd(), "agent": detected[0], "machine": machine_name()}
+    return {"session_id": detected[1], "cwd": _resume_cwd(getattr(args, "cwd", None)), "agent": detected[0],
+            "machine": machine_name()}
+
+
+def _resume_cwd(raw: str | None) -> str:
+    """The directory a session is resumed in: --cwd, or the one this command runs in."""
+    cwd = os.path.abspath(raw) if raw else os.getcwd()
+    if not os.path.isdir(cwd):
+        sys.exit(f"error: --cwd {cwd} is not a directory on this machine")
+    return cwd
 
 
 def _parse_due(raw: str) -> str:
@@ -292,6 +305,34 @@ def _parse_due(raw: str) -> str:
     seconds = float(m.group(1)) * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
     return datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z")
+
+
+def cmd_edit(args):
+    """Change a decision that already exists: its title, context, deadline, or the session resumed when it's decided."""
+    c = Client()
+    path = f"/api/decisions/{args.id}"
+    body = {}
+    if args.title:
+        body["title"] = args.title
+    if args.context is not None:
+        body["context"] = args.context
+    if args.due:
+        body["due_at"] = _parse_due(args.due)
+    if args.no_resume:
+        body["resume"] = None
+    elif args.session:
+        body["resume"] = _resume_target(args)
+    elif args.cwd:
+        # Only the directory changes: the session that asked is still the one to resume, on its own machine.
+        target = c.call("GET", path).get("resume") or _resume_target(args)
+        if not target:
+            sys.exit(f"error: {args.id} has no session to resume; name one with --session (and --agent)")
+        if target["machine"] != machine_name():
+            sys.exit(f"error: {args.id} resumes a session on {target['machine']}; run this there")
+        body["resume"] = target | {"cwd": _resume_cwd(args.cwd)}
+    if not body:
+        sys.exit("error: nothing to change; give --title, --context, --due, --cwd, --session or --no-resume")
+    print(_summary(c.call("PATCH", path, body)))
 
 
 def cmd_get(args):
@@ -1767,7 +1808,20 @@ def _main(argv):
     s.add_argument("--json", help="read the request body from a file, or - for stdin")
     s.add_argument("--quiet", "-q", action="store_true", help="print only the decision id")
     _resume_flags(s, "when decided")
+    s.add_argument("--cwd", metavar="DIR", help="directory to resume the session in (default: the current one)")
     s.set_defaults(fn=cmd_create)
+
+    s = sub.add_parser("edit", help="change a decision's title, context, deadline or resume target")
+    s.add_argument("id")
+    s.add_argument("--title")
+    s.add_argument("--context")
+    s.add_argument("--due", help="new deadline: 36h, 2d, 1w from now, or an ISO timestamp")
+    s.add_argument("--cwd", metavar="DIR", help="directory to resume the session in")
+    s.add_argument("--no-resume", action="store_true", help="resume no session when it's decided")
+    s.add_argument("--session", help="agent session to resume when decided, instead of the one recorded")
+    s.add_argument("--agent", help=f"which agent --session belongs to ({', '.join(agents.AGENTS)}, or any name "
+                                   "the resumer has an --agent-command for)")
+    s.set_defaults(fn=cmd_edit)
 
     s = sub.add_parser("get", help="show a decision")
     s.add_argument("id")

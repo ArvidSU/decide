@@ -1398,6 +1398,36 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual([i["key"] for i in self.call("GET", f"/api/decisions/{did}")["issues"]], ["GH-4"])
         self.assertNotEqual(run("issue", did, "LIN-1", "--remove").returncode, 0)
 
+    def test_cli_edit(self):
+        env = os.environ | {"DECISIONS_URL": self.base, "PYTHONPATH": ROOT, "DECISIONS_SESSION_ID": "sess-1",
+                            "DECISIONS_AGENT": "claude", "DECISIONS_MACHINE": "mb"}
+        run = lambda *a, cwd=self.tmp: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=cwd,
+                                                      capture_output=True, text=True)
+        project, scratch = (os.path.realpath(tempfile.mkdtemp(dir=self.tmp)) for _ in range(2))
+        # Created from a scratch folder: --cwd says where the session's project is.
+        did = run("create", "--title", "Which?", "-o", "a", "-q", "--cwd", project, cwd=scratch).stdout.strip()
+        get = lambda: self.call("GET", f"/api/decisions/{did}")
+        self.assertEqual(get()["resume"]["cwd"], project)
+        # Without it, the folder the command ran in is recorded, and `decide edit --cwd` corrects that.
+        did = run("create", "--title", "Which?", "-o", "a", "-q", cwd=scratch).stdout.strip()
+        self.assertEqual(get()["resume"]["cwd"], scratch)
+        out = run("edit", did, "--cwd", project, "--due", "9d", "--title", "Which one?")
+        self.assertIn(f"resumes claude session sess-1 on mb in {project}", out.stdout, out.stderr)
+        d = get()
+        self.assertEqual((d["title"], d["resume"]["cwd"], d["resume"]["session_id"]), ("Which one?", project, "sess-1"))
+        self.assertGreater(d["due_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 8 * 86400)))
+        changed = [e for e in self.call("GET", f"/api/decisions/{did}/events")["events"] if e["type"] == "decision.updated"]
+        self.assertEqual(set(changed[-1]["data"]["changes"]), {"title", "due_at", "resume"})
+        # Another session takes it over, or nobody does.
+        run("edit", did, "--session", "sess-2", "--agent", "codex", cwd=project)
+        self.assertEqual(get()["resume"], {"session_id": "sess-2", "cwd": project, "agent": "codex", "machine": "mb"})
+        run("edit", did, "--no-resume")
+        self.assertIsNone(get()["resume"])
+        for bad in (["edit", did], ["edit", did, "--cwd", os.path.join(self.tmp, "missing")]):
+            out = run(*bad)
+            self.assertNotEqual(out.returncode, 0)
+            self.assertIn("error:", out.stderr)
+
     def test_issues_link_at_any_status(self):
         d = self.create()
         d = self.call("PATCH", f"/api/decisions/{d['id']}", {"issues": ["https://linear.app/a/issue/LIN-5"]})
@@ -1686,7 +1716,8 @@ class RemoteTest(unittest.TestCase):
             self.assertEqual(json.loads(r.read())["id"], "F-2")
         store.update_feedback(uid["F-3"].upper(), {"status": "dismissed", "note": "not ours"}, "me")
         store.update_feedback("F-4", {"status": "reported"}, "me")
-        self.assertEqual(dist.fixed(), {})  # nothing yet, and the comments in the file aren't ids
+        for listed in dist.fixed():  # the comments in the file aren't ids
+            self.assertRegex(listed, r"^fb-[0-9a-f]{10}$")
         self.assertIn("decisions/fixed.txt", zipfile.ZipFile(io.BytesIO(dist.wheel()[1])).namelist())
         listed = os.path.join(self.tmp, "fixed.txt")
         with open(listed, "w") as fh:

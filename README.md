@@ -182,7 +182,7 @@ decide watch D-12 --exec '…'      # …or runs a command (see below) and exits
 
 **3. Resume a session days later, after it has ended (the "walk away for the weekend" path):**
 
-Decisions can carry a **resume target**: `"resume": {"session_id", "agent", "machine", "cwd", "prompt"?}`. `decide create` fills it in automatically when it runs inside a supported agent, from the agent's session env var and the current directory (`--no-resume` to opt out). Agents don't need to start anything.
+Decisions can carry a **resume target**: `"resume": {"session_id", "agent", "machine", "cwd", "prompt"?}`. `decide create` fills it in automatically when it runs inside a supported agent, from the agent's session env var and the current directory (`--cwd DIR` for another directory, `--no-resume` to opt out). `decide edit D-12 --cwd DIR` changes the directory afterwards, `--session ID --agent NAME` hands the decision to another session, and `--no-resume` removes the target. Agents don't need to start anything.
 
 | Agent | Detected from | Resumed with |
 |---|---|---|
@@ -311,6 +311,8 @@ refire_interval = 300
 Spaces and machine tokens live in the database, not here: manage them in Settings or with `decide space` / `decide token` (admin token). A space can set its own `deadline_days` and `color`. Decision IDs stay global (D-12), so they never collide across spaces. With several spaces, the admin token has to name the `space` of what it creates (400 otherwise): in the body, or with `decide create --space` / `DECISIONS_SPACE` from the CLI. With one space, it goes there. A webhook created without a decision (`POST /api/webhooks`) covers the creating token's space. If the admin token creates one without a `space`, it covers every space. If there's no admin token, auth is off and anyone sees everything, but a machine token still routes new decisions to its space.
 
 Answer attribute requests from the CLI with `decide fill D-12 < patches.json` (`[{"id", "attributes"}]`).
+
+Change a decision after it's created with `decide edit D-12`: `--due 9d` (or an ISO timestamp) moves the deadline, `--title` and `--context` reword it, and `--cwd`, `--session` and `--no-resume` change its resume target.
 
 Link the issue where a decision is acted on with `decide issue D-12 https://linear.app/…/issue/LIN-42` (`--key` to name it, `--remove` to unlink), or `decide create … --issue URL`. For a goal: `decide goal issue G-3 URL` (same flags), or `decide goal create … --issue URL`.
 
