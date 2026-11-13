@@ -1544,7 +1544,8 @@ class Store:
                     "issues": json.loads(row["issues"]),
                     "serves": self._serves_ids(row["id"]),
                     "proof": (p := self._proof_view(row["id"], row)) and {
-                        "agreed": bool(p["agreed"]), "ready": bool(p["ready"]), "run": p["run"] and p["run"]["status"],
+                        "agreed": bool(p["agreed"]), "ready": bool(p["ready"]), "proposed_at": p["proposed_at"],
+                        "run": p["run"] and p["run"]["status"],
                         "resume": p["resume_state"] and p["resume_state"]["status"]},
                     "decisions": {"total": n["total"], "open": n["open"], "resolved": n["resolved"]}})
         return out

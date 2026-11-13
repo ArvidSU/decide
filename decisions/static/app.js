@@ -195,6 +195,9 @@ const byDeadline = (a, b) => (a.due_at || "9999").localeCompare(b.due_at || "999
 // Waiting on another open decision: it can't be decided, or expire, until that one is. Not your concern yet.
 const isWaiting = (d) => d.status === "open" && !!d.waiting_on?.length;
 const actionable = (d) => d.status === "open" && !isWaiting(d);
+// A goal whose proof you haven't agreed on (or that changed since you did): the agent waits for that, as for a decision.
+const proofToAgree = (g) => g.status === "active" && !!g.proof && !g.proof.agreed;
+const byProposed = (a, b) => a.proof.proposed_at.localeCompare(b.proof.proposed_at);
 
 // Errors stay until dismissed; actions are [{label, run}] (`undo` is shorthand for one "Undo" action).
 let toastTimer;
@@ -557,6 +560,8 @@ async function route() {
     if (path === "/feedback") return renderFeedback();
     const first = S.list.filter((d) => actionable(d) && inSpace(d)).sort(byDeadline)[0];
     if (first) return navigate(`/d/${first.id}`, true);
+    const proof = S.goals.filter((g) => proofToAgree(g) && inSpace(g)).sort(byProposed)[0];
+    if (proof) return navigate(`/g/${proof.id}`, true);
     renderEmpty();
   } catch (e) {
     renderError(e);
@@ -581,18 +586,20 @@ function renderSidebar() {
   const spaceTabs = $("#space-tabs");
   spaceTabs.hidden = !multiSpace();
   if (multiSpace()) {
-    const openIn = (s) => S.list.filter((d) => actionable(d) && (!s || d.space === s)).length;
+    const openIn = (s) => [...S.list.filter(actionable), ...S.goals.filter(proofToAgree)].filter((x) => !s || x.space === s).length;
     setHtml(spaceTabs, ["", ...spaces].map((s) => { const n = openIn(s);
       return `<button class="tab ${S.space === s ? "active" : ""} ${n ? "has-open" : ""}" data-space="${esc(s)}" ${s ? `data-accent="${esc(spaceColor(s))}"` : ""} aria-pressed="${S.space === s}">${s ? spaceDot(s) + esc(s) : "All spaces"}<span class="n">${n || ""}</span></button>`; }).join(""));
   }
   const list = S.list.filter(inSpace);
   S.counts = { open: 0, resolved: 0, expired: 0, cancelled: 0, all: list.length };
   for (const d of list) S.counts[d.status]++;
-  // The badge counts what you can act on; decisions waiting on another one come later.
+  // The badge counts what you can act on: decisions, and proofs to agree on. Decisions waiting on another one come later.
   const open = list.filter(actionable).sort(byDeadline);
+  const proofs = S.goals.filter((g) => inSpace(g) && proofToAgree(g)).sort(byProposed);
+  const waiting = open.length + proofs.length;
   const later = list.filter(isWaiting).length;
   setHtml($("#status-tabs"), Object.keys(STATUS_NAMES).map((t) =>
-    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && open.length ? "has-open" : ""}" data-status="${t}" aria-pressed="${S.status === t}" title="${S.counts[t]} ${STATUS_NAMES[t].toLowerCase()}${t === "open" && later ? `, ${later} waiting on another decision` : ""}">${STATUS_NAMES[t]}${t === "open" && open.length ? `<span class="n">${open.length}</span>` : ""}</button>`).join(""));
+    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && waiting ? "has-open" : ""}" data-status="${t}" aria-pressed="${S.status === t}" title="${S.counts[t]} ${STATUS_NAMES[t].toLowerCase()}${t === "open" && later ? `, ${later} waiting on another decision` : ""}${t === "open" && proofs.length ? `, ${proofs.length} proof${proofs.length === 1 ? "" : "s"} to agree on` : ""}">${STATUS_NAMES[t]}${t === "open" && waiting ? `<span class="n">${waiting}</span>` : ""}</button>`).join(""));
   $("#settings-btn").classList.toggle("active", location.pathname === "/settings");
   $("#map-btn").classList.toggle("active", location.pathname === "/map" || !!S.goal);
   const openFeedback = S.feedback.filter((f) => inSpace(f) && f.status === "open").length;
@@ -601,14 +608,19 @@ function renderSidebar() {
     btn.title = `Feedback from agents on Decisions${openFeedback ? `: ${openFeedback} open` : ""}`;
   }
   $("#feedback-btn").classList.toggle("active", location.pathname === "/feedback");
-  document.title = (open.length ? `(${open.length}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : S.goal ? `${S.goal.id} · ${S.goal.title}`
+  document.title = (waiting ? `(${waiting}) ` : "") + (S.d ? `${S.d.id} · ${S.d.title}` : S.goal ? `${S.goal.id} · ${S.goal.title}`
     : location.pathname === "/map" ? "Map" : location.pathname === "/feedback" ? "Feedback" : "Decisions");
-  setHtml($("#mb-title"), `Decisions${open.length ? `<span class="n" aria-label="${open.length} open">${open.length}</span>` : ""}`);
+  setHtml($("#mb-title"), `Decisions${waiting ? `<span class="n" aria-label="${waiting} waiting on you">${waiting}</span>` : ""}`);
   setHtml($("#attention"), open.length
     ? `<a href="/d/${open[0].id}" data-nav class="attention ${urgency(open[0])}" title="Undecided decisions expire at their deadline">
         <span class="att-ic">${icon(urgency(open[0]) ? "clock" : "inbox", 15)}</span>
-        <div><strong>${open.length} waiting on you</strong>
+        <div><strong>${waiting} waiting on you</strong>
         <span>${open[0].due_at ? `Next expires in ${until(open[0].due_at)} · ${esc(open[0].id)}` : `Oldest: ${esc(open[0].id)}`}</span></div></a>`
+    : proofs.length
+    ? `<a href="/g/${proofs[0].id}" data-nav class="attention" title="The agent starts once you agree on how the goal is proved">
+        <span class="att-ic">${icon("shield", 15)}</span>
+        <div><strong>${waiting} waiting on you</strong>
+        <span>Proof to agree on · ${esc(proofs[0].id)}</span></div></a>`
     : `<div class="attention clear"><span class="att-ic">${icon("check", 15)}</span><div><strong>All caught up</strong><span>${later ? `${later} more once others are decided` : "Nothing is waiting on you"}</span></div></div>`);
   const tagsOf = decisionTags();
   const goalTagged = S.goals.some((g) => inSpace(g) && g.tags.length);
@@ -625,7 +637,21 @@ function renderSidebar() {
   // Most urgent first: open decisions by deadline, then those waiting on another one, then everything else.
   items = [...items.filter(actionable).sort(byDeadline), ...items.filter(isWaiting), ...items.filter((d) => d.status !== "open")];
   const sep = `<span class="sep" aria-hidden="true">·</span>`;
-  setHtml($("#decision-list"), items.length ? items.map((d) => {
+  // Proofs to agree on are open too. They're on goals, so they filter by the goal's tags.
+  const proofItems = ["open", "all"].includes(S.status) ? proofs.filter((g) =>
+    (!S.listTags.length || g.tags.some((t) => S.listTags.includes(t))) &&
+    (!q || g.title.toLowerCase().includes(q) || g.id.toLowerCase().includes(q))) : [];
+  const proofRows = proofItems.map((g) => {
+    const current = S.goal?.id === g.id;
+    return `<a href="/g/${esc(g.id)}" data-nav class="dl-item proof ${current ? "active" : ""}" ${current ? `aria-current="page"` : ""}>
+      <span class="si proof" title="A goal's proof">${icon("shield", 14)}</span><span class="dl-title">${esc(g.title)}</span>
+      <div class="dl-meta"><span class="dl-id">${esc(g.id)}</span>
+        ${multiSpace() && !S.space ? `${sep}<span class="dl-space">${spaceDot(g.space)}${esc(g.space)}</span>` : ""}
+        ${sep}<span class="dl-source">proof to agree on</span>
+        <span class="dl-due" title="Proposed ${esc(fullTime(g.proof.proposed_at))}">${ago(g.proof.proposed_at)}</span>
+      </div></a>`;
+  }).join("");
+  setHtml($("#decision-list"), items.length || proofItems.length ? proofRows + items.map((d) => {
     const pending = Object.keys(d.pending_attribute_requests || {}).length;
     const due = actionable(d) && d.due_at;
     const live = d.option_count - d.excluded_count;

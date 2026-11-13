@@ -173,6 +173,7 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible { outlin
 .si.cancelled { color: var(--faint); }
 .si.expired { color: var(--bad); }
 .si.open.waiting { color: var(--faint); }
+.si.proof { color: var(--accent); display: grid; }
 .dl-item.waiting .dl-title { color: var(--muted); font-weight: 500; }
 
 /* ---------------------------------------------------------------- main */
