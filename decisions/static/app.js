@@ -195,9 +195,16 @@ const byDeadline = (a, b) => (a.due_at || "9999").localeCompare(b.due_at || "999
 // Waiting on another open decision: it can't be decided, or expire, until that one is. Not your concern yet.
 const isWaiting = (d) => d.status === "open" && !!d.waiting_on?.length;
 const actionable = (d) => d.status === "open" && !isWaiting(d);
-// A goal whose proof you haven't agreed on (or that changed since you did): the agent waits for that, as for a decision.
-const proofToAgree = (g) => g.status === "active" && !!g.proof && !g.proof.agreed;
-const byProposed = (a, b) => a.proof.proposed_at.localeCompare(b.proof.proposed_at);
+// What a goal's proof waits on you for, as a decision does: "agree" (you haven't agreed on it, or it changed since
+// you did), "prove" (agreed on, and the agent flagged the goal ready: "Prove it" works), or "" for nothing.
+function proofWaiting(g) {
+  const p = g.proof;
+  if (g.status !== "active" || !p) return "";
+  return !p.agreed ? "agree" : p.ready && !p.busy && !p.proved ? "prove" : "";
+}
+const proofSince = (g) => proofWaiting(g) === "agree" ? g.proof.proposed_at : g.proof.ready_at;
+const byProofSince = (a, b) => proofSince(a).localeCompare(proofSince(b));
+const PROOF_WAITING = { agree: "proof to agree on", prove: "ready to prove" };
 
 // Errors stay until dismissed; actions are [{label, run}] (`undo` is shorthand for one "Undo" action).
 let toastTimer;
@@ -560,7 +567,7 @@ async function route() {
     if (path === "/feedback") return renderFeedback();
     const first = S.list.filter((d) => actionable(d) && inSpace(d)).sort(byDeadline)[0];
     if (first) return navigate(`/d/${first.id}`, true);
-    const proof = S.goals.filter((g) => proofToAgree(g) && inSpace(g)).sort(byProposed)[0];
+    const proof = S.goals.filter((g) => proofWaiting(g) && inSpace(g)).sort(byProofSince)[0];
     if (proof) return navigate(`/g/${proof.id}`, true);
     renderEmpty();
   } catch (e) {
@@ -586,20 +593,20 @@ function renderSidebar() {
   const spaceTabs = $("#space-tabs");
   spaceTabs.hidden = !multiSpace();
   if (multiSpace()) {
-    const openIn = (s) => [...S.list.filter(actionable), ...S.goals.filter(proofToAgree)].filter((x) => !s || x.space === s).length;
+    const openIn = (s) => [...S.list.filter(actionable), ...S.goals.filter(proofWaiting)].filter((x) => !s || x.space === s).length;
     setHtml(spaceTabs, ["", ...spaces].map((s) => { const n = openIn(s);
       return `<button class="tab ${S.space === s ? "active" : ""} ${n ? "has-open" : ""}" data-space="${esc(s)}" ${s ? `data-accent="${esc(spaceColor(s))}"` : ""} aria-pressed="${S.space === s}">${s ? spaceDot(s) + esc(s) : "All spaces"}<span class="n">${n || ""}</span></button>`; }).join(""));
   }
   const list = S.list.filter(inSpace);
   S.counts = { open: 0, resolved: 0, expired: 0, cancelled: 0, all: list.length };
   for (const d of list) S.counts[d.status]++;
-  // The badge counts what you can act on: decisions, and proofs to agree on. Decisions waiting on another one come later.
+  // The badge counts what you can act on: decisions, and proofs to agree on or run. Decisions waiting on another one come later.
   const open = list.filter(actionable).sort(byDeadline);
-  const proofs = S.goals.filter((g) => inSpace(g) && proofToAgree(g)).sort(byProposed);
+  const proofs = S.goals.filter((g) => inSpace(g) && proofWaiting(g)).sort(byProofSince);
   const waiting = open.length + proofs.length;
   const later = list.filter(isWaiting).length;
   setHtml($("#status-tabs"), Object.keys(STATUS_NAMES).map((t) =>
-    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && waiting ? "has-open" : ""}" data-status="${t}" aria-pressed="${S.status === t}" title="${S.counts[t]} ${STATUS_NAMES[t].toLowerCase()}${t === "open" && later ? `, ${later} waiting on another decision` : ""}${t === "open" && proofs.length ? `, ${proofs.length} proof${proofs.length === 1 ? "" : "s"} to agree on` : ""}">${STATUS_NAMES[t]}${t === "open" && waiting ? `<span class="n">${waiting}</span>` : ""}</button>`).join(""));
+    `<button class="tab ${S.status === t ? "active" : ""} ${t === "open" && waiting ? "has-open" : ""}" data-status="${t}" aria-pressed="${S.status === t}" title="${S.counts[t]} ${STATUS_NAMES[t].toLowerCase()}${t === "open" && later ? `, ${later} waiting on another decision` : ""}${t === "open" && proofs.length ? `, ${proofs.length} proof${proofs.length === 1 ? "" : "s"} to agree on or run` : ""}">${STATUS_NAMES[t]}${t === "open" && waiting ? `<span class="n">${waiting}</span>` : ""}</button>`).join(""));
   $("#settings-btn").classList.toggle("active", location.pathname === "/settings");
   $("#map-btn").classList.toggle("active", location.pathname === "/map" || !!S.goal);
   const openFeedback = S.feedback.filter((f) => inSpace(f) && f.status === "open").length;
@@ -617,10 +624,10 @@ function renderSidebar() {
         <div><strong>${waiting} waiting on you</strong>
         <span>${open[0].due_at ? `Next expires in ${until(open[0].due_at)} · ${esc(open[0].id)}` : `Oldest: ${esc(open[0].id)}`}</span></div></a>`
     : proofs.length
-    ? `<a href="/g/${proofs[0].id}" data-nav class="attention" title="The agent starts once you agree on how the goal is proved">
+    ? `<a href="/g/${proofs[0].id}" data-nav class="attention" title="${proofWaiting(proofs[0]) === "agree" ? "The agent starts once you agree on how the goal is proved" : "The agent flagged the goal as achieved: run the proof"}">
         <span class="att-ic">${icon("shield", 15)}</span>
         <div><strong>${waiting} waiting on you</strong>
-        <span>Proof to agree on · ${esc(proofs[0].id)}</span></div></a>`
+        <span>${proofWaiting(proofs[0]) === "agree" ? "Proof to agree on" : "Ready to prove"} · ${esc(proofs[0].id)}</span></div></a>`
     : `<div class="attention clear"><span class="att-ic">${icon("check", 15)}</span><div><strong>All caught up</strong><span>${later ? `${later} more once others are decided` : "Nothing is waiting on you"}</span></div></div>`);
   const tagsOf = decisionTags();
   const goalTagged = S.goals.some((g) => inSpace(g) && g.tags.length);
@@ -637,7 +644,7 @@ function renderSidebar() {
   // Most urgent first: open decisions by deadline, then those waiting on another one, then everything else.
   items = [...items.filter(actionable).sort(byDeadline), ...items.filter(isWaiting), ...items.filter((d) => d.status !== "open")];
   const sep = `<span class="sep" aria-hidden="true">·</span>`;
-  // Proofs to agree on are open too. They're on goals, so they filter by the goal's tags.
+  // Proofs to agree on or run are open too. They're on goals, so they filter by the goal's tags.
   const proofItems = ["open", "all"].includes(S.status) ? proofs.filter((g) =>
     (!S.listTags.length || g.tags.some((t) => S.listTags.includes(t))) &&
     (!q || g.title.toLowerCase().includes(q) || g.id.toLowerCase().includes(q))) : [];
@@ -647,8 +654,8 @@ function renderSidebar() {
       <span class="si proof" title="A goal's proof">${icon("shield", 14)}</span><span class="dl-title">${esc(g.title)}</span>
       <div class="dl-meta"><span class="dl-id">${esc(g.id)}</span>
         ${multiSpace() && !S.space ? `${sep}<span class="dl-space">${spaceDot(g.space)}${esc(g.space)}</span>` : ""}
-        ${sep}<span class="dl-source">proof to agree on</span>
-        <span class="dl-due" title="Proposed ${esc(fullTime(g.proof.proposed_at))}">${ago(g.proof.proposed_at)}</span>
+        ${sep}<span class="dl-source">${PROOF_WAITING[proofWaiting(g)]}</span>
+        <span class="dl-due" title="${proofWaiting(g) === "agree" ? "Proposed" : "Flagged ready"} ${esc(fullTime(proofSince(g)))}">${ago(proofSince(g))}</span>
       </div></a>`;
   }).join("");
   setHtml($("#decision-list"), items.length || proofItems.length ? proofRows + items.map((d) => {

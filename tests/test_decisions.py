@@ -969,7 +969,8 @@ class DecisionsTest(unittest.TestCase):
         p = self.call("POST", f"/api/goals/{gid}/proof/ready", {"note": "released 1.4"}, expect=200)["proof"]
         self.assertEqual((p["ready"]["by"], p["ready"]["note"]), ("agent", "released 1.4"))
         self.assertEqual(self.call("GET", "/api/goals?status=all")["goals"][0]["proof"],
-                         {"agreed": True, "ready": True, "proposed_at": p["proposed_at"], "run": None, "resume": None})
+                         {"agreed": True, "ready": True, "proposed_at": p["proposed_at"], "ready_at": p["ready"]["at"],
+                          "busy": False, "proved": False, "run": None, "resume": None})
 
         run(actor="agent", expect=403)
         p = run(expect=201)["proof"]

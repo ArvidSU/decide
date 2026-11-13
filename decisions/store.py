@@ -1545,6 +1545,9 @@ class Store:
                     "serves": self._serves_ids(row["id"]),
                     "proof": (p := self._proof_view(row["id"], row)) and {
                         "agreed": bool(p["agreed"]), "ready": bool(p["ready"]), "proposed_at": p["proposed_at"],
+                        "ready_at": p["ready"] and p["ready"]["at"], "busy": p["busy"],
+                        # A run of an earlier version says nothing about this one.
+                        "proved": bool(p["run"] and p["run"]["status"] == "passed" and p["run"]["hash"] == p["hash"]),
                         "run": p["run"] and p["run"]["status"],
                         "resume": p["resume_state"] and p["resume_state"]["status"]},
                     "decisions": {"total": n["total"], "open": n["open"], "resolved": n["resolved"]}})
