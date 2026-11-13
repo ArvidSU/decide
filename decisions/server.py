@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__, dist, update
 from .config import Config, is_loopback
-from .markdown import decision_markdown
+from .markdown import decision_markdown, parse_include
 from .store import ALL, DEFAULT_WEBHOOK_EVENTS, SCHEMA_VERSION, ApiError, Scope, Store
 from .webhooks import Dispatcher
 
@@ -279,7 +279,12 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", "/api/decisions/([^/]+)/markdown")
     def markdown(self, did):
-        self._send(200, decision_markdown(self.store.get_decision(did, self.scope)), "text/markdown; charset=utf-8")
+        try:
+            include = parse_include(self.qs.get("include", [None])[0])
+        except ValueError as exc:
+            raise ApiError(400, str(exc)) from None
+        self._send(200, decision_markdown(self.store.get_decision(did, self.scope), include),
+                   "text/markdown; charset=utf-8")
 
     @route("POST", "/api/decisions/([^/]+)/resolve")
     def resolve(self, did):

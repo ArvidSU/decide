@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import agents
 from .config import STATE_DIR, load_config
+from .markdown import FIELDS
 from .store import FILL_TRIGGERS, PROOF_RESUME_TRIGGERS, SPACE_COLORS, event_matches, script_hash
 from .webhooks import verify
 
@@ -295,8 +296,9 @@ def _parse_due(raw: str) -> str:
 
 def cmd_get(args):
     c = Client()
-    if args.markdown:
-        print(c.call("GET", f"/api/decisions/{args.id}/markdown", raw=True), end="")
+    if args.markdown or args.include:
+        query = f"?include={urllib.parse.quote(args.include)}" if args.include else ""
+        print(c.call("GET", f"/api/decisions/{args.id}/markdown{query}", raw=True), end="")
     elif args.json:
         _print(c.call("GET", f"/api/decisions/{args.id}"))
     else:
@@ -1770,7 +1772,10 @@ def _main(argv):
     s = sub.add_parser("get", help="show a decision")
     s.add_argument("id")
     s.add_argument("--json", action="store_true")
-    s.add_argument("--markdown", action="store_true")
+    s.add_argument("--markdown", action="store_true", help="a markdown summary, to paste or send")
+    s.add_argument("--include", metavar="FIELDS",
+                   help="the markdown summary with only these parts, e.g. title,context,options. "
+                        f"Parts: {', '.join(FIELDS)}")
     s.set_defaults(fn=cmd_get)
 
     s = sub.add_parser("issue", help="link a decision to the issue where it's being acted on (Linear, Jira, GitHub, …)")

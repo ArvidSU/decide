@@ -277,6 +277,74 @@ async function copy(text, what) {
   catch { await ask({ title: `Copy ${what}`, field: "The browser blocked the clipboard. Copy it from here:", value: text, ok: "Done", cancel: "" }); }
 }
 
+// The parts of a decision's markdown summary (FIELDS in markdown.py), as the export dialog offers them.
+const EXPORT_FIELDS = [
+  ["ref", "ID and link to the app"],
+  ["title", "Title"],
+  ["status", "Status, source and dates"],
+  ["relations", "Goals and dependencies"],
+  ["context", "Context"],
+  ["outcome", "What was decided, and why"],
+  ["options", "Options table"],
+  ["descriptions", "Option descriptions"],
+  ["links", "Issues and links"],
+];
+
+// Pick the parts, see the markdown, then copy or download it. The choice is remembered for the next export.
+function exportDecision(d) {
+  const all = EXPORT_FIELDS.map(([key]) => key);
+  const saved = storage("export");
+  const on = new Set(saved === null ? all : saved.split(",").filter((k) => all.includes(k)));
+  const dlg = document.createElement("dialog");
+  dlg.className = "dialog wide";
+  dlg.setAttribute("aria-labelledby", "dlg-title");
+  dlg.innerHTML = `<form method="dialog">
+    <h3 id="dlg-title">Export ${esc(d.id)} as markdown</h3>
+    <div class="dialog-body"><p>Choose what goes in, e.g. for someone who can't open the app.</p></div>
+    <div class="export-fields">${EXPORT_FIELDS.map(([key, label]) =>
+      `<label class="check-label"><input type="checkbox" name="${key}" ${on.has(key) ? "checked" : ""}>${esc(label)}</label>`).join("")}</div>
+    <pre class="export-preview" aria-label="Preview" tabindex="0"></pre>
+    <div class="dialog-actions">
+      <button type="button" class="btn" data-close>Close</button>
+      <button type="button" class="btn" data-download>Download .md</button>
+      <button type="button" class="btn primary" data-copy>${icon("copy", 15)}Copy</button></div>
+  </form>`;
+  document.body.append(dlg);
+  const pre = dlg.querySelector("pre");
+  const buttons = dlg.querySelectorAll("[data-download], [data-copy]");
+  let text = "", latest = 0;
+  const refresh = async () => {
+    const include = all.filter((k) => dlg.querySelector(`[name="${k}"]`).checked);
+    storage("export", include.join(","));
+    const turn = ++latest;
+    buttons.forEach((b) => (b.disabled = true));
+    if (!include.length) { text = ""; pre.textContent = "Nothing chosen."; return; }
+    try {
+      const out = await api("GET", `/api/decisions/${d.id}/markdown?include=${include.join(",")}`);
+      if (turn !== latest) return;
+      text = out;
+      pre.textContent = text;
+      buttons.forEach((b) => (b.disabled = false));
+    } catch (err) { if (turn === latest) pre.textContent = err.message || String(err); }
+  };
+  dlg.querySelector(".export-fields").addEventListener("change", refresh);
+  dlg.querySelector("[data-close]").addEventListener("click", () => dlg.close());
+  dlg.querySelector("[data-copy]").addEventListener("click", async () => { dlg.close(); await copy(text, "markdown"); });
+  dlg.querySelector("[data-download]").addEventListener("click", () => {
+    const slug = d.title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-|-$/g, "").slice(0, 60);
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([text], { type: "text/markdown" }));
+    link.download = `${d.id}${slug ? "-" + slug : ""}.md`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    dlg.close();
+    toast(`Downloaded ${link.download}`);
+  });
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.showModal();
+  refresh();
+}
+
 function md(src) {
   if (!src) return "";
   const blocks = [];
@@ -1107,7 +1175,7 @@ function renderClosed(d) {
     <div id="resume-card">${resumeHtml(d)}</div>
     <div class="closed-actions">
       ${r ? `<button class="btn primary" data-action="copy-provenance" title="Copy the choice, reason and link, e.g. for a commit message or PR">${icon("copy", 15)}Copy decision record</button>` : ""}
-      <button class="btn" data-action="copy-md" title="Copy a markdown summary with the options table">Copy summary</button>
+      <button class="btn" data-action="export-md" title="Copy or download it as markdown, with the parts you choose">Export…</button>
       <button class="btn ${r ? "ghost" : "primary"}" data-action="reopen">${icon("rotate", 15)}Reopen</button>
       ${d.goals.length ? "" : `<button class="btn ghost" data-action="add-goal" title="Link it to the goal it was a step toward">${icon("target", 15)}Goal…</button>`}
       <span class="spacer"></span>
@@ -1243,7 +1311,7 @@ function headerHtml(d) {
   return `<div class="d-head">
       <div class="d-top"><h1 class="d-title">${esc(d.title)}</h1>
       <div class="d-actions">
-        <button class="btn small" data-action="copy-md" title="Copy a markdown summary with the options table">${icon("copy", 14)}Copy summary</button>
+        <button class="btn small" data-action="export-md" title="Copy or download it as markdown, with the parts you choose">${icon("copy", 14)}Export…</button>
         <button class="btn small ghost" data-action="edit">${icon("pencil", 14)}Edit</button>
         ${d.goals.length ? "" : `<button class="btn small ghost" data-action="add-goal" title="Link it to the goal it's a step toward">${icon("target", 14)}Goal…</button>`}
         <button class="btn small ghost" data-action="add-dep" title="Lock this until another decision is made">${icon("link", 14)}Depends on…</button>
@@ -2685,7 +2753,7 @@ document.addEventListener("click", async (e) => {
       return act(() => api("POST", `/api/decisions/${d.id}/resolve`, { selected: d.resolution.selected, note: d.resolution.note, silence }), "Confirmed");
     }
     case "copy-ref": return copy(`[${d.id}: ${d.title}](${d.url})`, "link");
-    case "copy-md": try { return copy(await api("GET", `/api/decisions/${d.id}/markdown`), "summary"); } catch (err) { return fail(err); }
+    case "export-md": return exportDecision(d);
     case "copy-provenance": {
       const r = d.resolution;
       const picked = d.selected_options.map((o) => o.label).join(", ") || "nothing";

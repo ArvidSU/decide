@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -153,6 +154,27 @@ class DecisionsTest(unittest.TestCase):
         md = self.call("GET", "/api/decisions/D-1/markdown")
         self.assertIn("[D-1]", md)
         self.assertIn("Rain shell", md)
+
+    def test_markdown_includes_only_the_chosen_fields(self):
+        d = self.create(source="agent-7", links=["https://linear.app/x/issue/ABC-1"], options=[
+            {"label": "Wool coat", "description": "Warm,\nbut heavy.", "attributes": {"price": 2400}},
+            {"label": "Rain shell", "attributes": {"price": 900}}])
+        self.call("POST", f"/api/decisions/{d['id']}/resolve", {"selected": ["1"], "note": "Warmest"}, actor="arvid")
+        path = f"/api/decisions/{d['id']}/markdown"
+        full = self.call("GET", path)
+        for part in ("### [D-1](", "**Status:** resolved", "For **autumn**.", "**Decided:** **Wool coat**",
+                     "| ✅ | Wool coat | 2400 |", "- **Wool coat**: Warm, but heavy.", "**Links:**"):
+            self.assertIn(part, full)
+        self.assertEqual(self.call("GET", path + "?include=title,context,options"), "\n".join([
+            "# Which jacket?", "", "For **autumn**.", "",
+            "|  | Option | price |", "|---|---|---|", "|  | Wool coat | 2400 |", "|  | Rain shell | 900 |", ""]))
+        # Written in the summary's order, whatever order they were asked for in.
+        self.assertEqual(self.call("GET", path + "?include=descriptions,%20ref"),
+                         f"### [D-1]({d['url']})\n\n- **Wool coat**: Warm, but heavy.\n")
+        self.assertIn("unknown field colour", self.call("GET", path + "?include=title,colour", expect=400)["error"])
+        from decisions.markdown import FIELDS
+        with open(os.path.join(ROOT, "decisions/static/app.js"), encoding="utf-8") as f:
+            self.assertEqual(tuple(re.findall(r'^  \["(\w+)", ', f.read(), re.M)), FIELDS)
 
     def test_idempotency_key(self):
         a = self.create(idempotency_key="k1")
