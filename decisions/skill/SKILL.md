@@ -1,11 +1,11 @@
 ---
 name: decisions
-description: Ask the user to make a decision through their Decisions app (REST API + GUI) instead of asking in chat, then act on the outcome. Use when you need the user to choose between options — what to build, which approach, which product to buy — especially when the choice can be made asynchronously, benefits from comparing attributes, or should be logged for provenance. Also use when the user mentions a decision ID like D-12.
+description: Ask the user to make a decision through their Decisions app (REST API + GUI) instead of asking in chat, then act on the outcome. Use when you need the user to choose between options — what to build, which approach, which product to buy — especially when the choice can be made asynchronously, benefits from comparing attributes, or should be logged for provenance. Also use when the user mentions a decision or goal like D-12 or G-7 or links to one, or hands you a goal to achieve or break into subgoals.
 ---
 
 # Decisions
 
-The user runs a decision log, possibly on another machine; `decide` already knows where (set up by `decide connect`, or `DECISIONS_URL`/`DECISIONS_TOKEN`). You create a decision with options. The user filters and picks in a GUI. You get woken up and act on the choice. Decisions are referenced as `D-<n>`, with a page at `<base>/d/D-<n>`.
+The user runs a decision log, possibly on another machine; `decide` already knows where (set up by `decide connect`, or `DECISIONS_URL`/`DECISIONS_TOKEN`). You create a decision with options. The user filters and picks in a GUI. You get woken up and act on the choice. Decisions are referenced as `D-<n>`, with a page at `<base>/d/D-<n>`, and goals as `G-<n>` at `<base>/g/G-<n>`. `decide` takes a page's link wherever it takes the ID.
 
 Use the `decide` CLI. The log records who did what: inside Claude Code or Codex, `decide` names you automatically (`claude-code`, `codex`). In any other agent, prefix commands with `DECISIONS_ACTOR=<your name>`, e.g. `DECISIONS_ACTOR=gemini decide …`. If `decide` isn't on PATH, the raw API equivalents are in the project README.
 
@@ -76,6 +76,22 @@ When you take on a goal whose outcome can be checked by a command, agree with th
 5. **You hear the result either way.** `decide goal proof` and `decide goal ready` record your session (as `decide create` does), so when the proof has run, the user's resumer resumes you with the result, the same way it does for a decision; a session in `decide goal wait` hears it there instead. `proof.passed` → the goal is marked achieved; continue with the next piece of work the user asked for, or end your turn. `proof.failed` → the output is printed: fix the work (not the proof, unless it was wrong, and then say so), run the command yourself, and `decide goal ready G-7` again. Then end your turn: you'll be resumed with the next result. You're resumed for at most 3 failures in a row (the prompt counts them); after that, until the proof passes or is proposed anew, the user has to come to you.
 
 The proof runs on this machine through the user's resumer, so check `decide resumer status`. Don't weaken a proof to make it pass.
+
+### Breaking a goal down
+
+When you're handed a goal to achieve (`G-7`, or its link) that is more than one piece of work and one proof can cover, break it into subgoals before doing any of it:
+
+1. **Find out where things stand.** Read the goal, what it serves, its subgoals and decisions (`decide goal get G-7`, `decide map --focus G-7`). Then measure the gap between now and achieved, from the code, the data or the system itself. A breakdown built on guesses about the gap splits the wrong things.
+2. **Write the parent's proof first.** It says what achieved means, end to end, and is the contract. The subgoals are your plan for meeting it, and all of them passing doesn't make the parent pass. Anything the proof compares against (a starting value, a count, a date) goes into the script or `--success`, so it's agreed with the proof and can't drift.
+3. **Split by how the parts add up to the goal**, and say which way in the parent's description. Different levels can split different ways.
+   - **Parts:** the goal is achieved when all of them are (a feature made of pieces, a migration of several services). Together they cover the goal, without overlapping.
+   - **Levers:** the goal is an outcome several things move, none of them enough alone (a metric, adoption, cost). Each subgoal is a bet: its description says how much you expect it to contribute and the evidence for that. Propose more than strictly needed, because some won't pay off.
+   - **Stages:** each builds on the one before (a pilot, then the rollout; the same result holding period after period). Goals have no order of their own, so say "after G-9" in the description. When a stage's proof depends on an earlier one's result, write that result (the value it measured, when it passed) into the stage's script, taken from the earlier proof's output, so the chain itself is agreed and checked.
+4. **Make each subgoal an outcome, not a task.** "Answers to the 5 most common questions are in the help center and linked from the ticket form" can be proved; "write help articles" can only be done. A good subgoal can be proved on its own, is small enough for one session to take on and prove, and says in its description why it serves the parent. Stop splitting there: the steps inside it are your work, not goals. What a command can't judge (how something looks, reads or feels to use) goes into `--success` as a demo for the user.
+5. **Let the user choose what's theirs.** When there's a real choice of split (which levers to pull, what's in scope, which stage comes first), make it a decision toward the parent goal: one option per candidate subgoal, `"max_select": null` to pick several, with attributes like expected contribution, effort and confidence. Create the subgoals they pick. When there's no real choice, just create them.
+6. **Create them and propose every proof together:** `decide goal create "…" --serves G-7 --tag … -q` for each, then `decide goal proof` on each and on the parent, each from the directory and machine where it should run. Then tell the user in one message: each subgoal, what its proof checks and why it serves the parent, with the links to agree. Research is fine meanwhile; work toward a subgoal waits for its proof to be agreed.
+7. **Find out before you split what you can't yet tell how to split.** When the breakdown hinges on something unknown, research, measure or prototype first. If the answer is the user's to give, it's a decision.
+8. **Revise the breakdown as you learn.** When a result shows the split was wrong (a bet didn't move the outcome, a part turned out unnecessary, a stage failed), say so: `decide goal set G-9 --status abandoned --note "why"`, and create what replaces it, with its own proof. Don't quietly drop or repurpose a goal: that record is what `decide insights` learns from.
 
 ### Decisions that depend on each other
 

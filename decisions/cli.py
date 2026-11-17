@@ -2077,7 +2077,19 @@ def _main(argv):
     r.set_defaults(fn=cmd_token_revoke)
 
     args = p.parse_args(argv)
+    for key in ("id", "focus", "goal", "serves"):
+        if isinstance(val := getattr(args, key, None), (str, list)):
+            setattr(args, key, [_from_link(v) for v in val] if isinstance(val, list) else _from_link(val))
     args.fn(args)
+
+
+def _from_link(ref: str) -> str:
+    """A link names what it shows (`https://…/g/G-7` → `G-7`, `…/feedback#F-3` → `F-3`), so it works wherever
+    the ID does."""
+    if "://" not in ref:
+        return ref
+    path, _, fragment = ref.partition("#")
+    return fragment or path.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
 
 
 if __name__ == "__main__":

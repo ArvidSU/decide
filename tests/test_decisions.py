@@ -1341,8 +1341,13 @@ class DecisionsTest(unittest.TestCase):
         run = lambda *a: subprocess.run([sys.executable, "-m", "decisions", *a], env=env, cwd=self.tmp,
                                         capture_output=True, text=True)
         vision = run("goal", "create", "Vision", "-q").stdout.strip()
-        sub = run("goal", "create", "Subgoal", "--serves", vision, "-q").stdout.strip()
-        did = run("create", "--title", "Which?", "-o", "a", "-o", "b", "--goal", sub, "-q", "--no-resume").stdout.strip()
+        # A page's link works wherever its ID does.
+        sub = run("goal", "create", "Subgoal", "--serves", f"{self.base}/g/{vision}", "-q").stdout.strip()
+        self.assertEqual(self.call("GET", f"/api/goals/{sub}")["serves"][0]["goal"], vision)
+        self.assertIn("Subgoal", run("goal", "get", f"{self.base}/g/{sub}/").stdout)
+        did = run("create", "--title", "Which?", "-o", "a", "-o", "b", "--goal", f"{self.base}/g/{sub}", "-q",
+                  "--no-resume").stdout.strip()
+        self.assertIn("Which?", run("get", f"{self.base}/d/{did}?x=1").stdout)
         self.assertEqual(self.call("GET", f"/api/decisions/{did}")["goals"][0]["goal"], sub)
         self.assertIn(f"toward {sub} [active] Subgoal", run("get", did).stdout)
         tree = run("goal", "list").stdout.splitlines()
